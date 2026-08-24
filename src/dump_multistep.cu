@@ -10,7 +10,8 @@
 // Dumps per step: 32 layer outputs + final model.norm output (33 rows of 4096 f32).
 // Prints greedy argmax token per step (teacher-forced steps + one generated step).
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 4) return 2;
+    if (argc < 4) return 2;
+    const size_t gen_extra = argc > 4 ? _wtoi(argv[4]) : 1;
     try {
         insignia::ModelFile m(argv[1]);
         std::vector<int> tokens;
@@ -33,7 +34,7 @@ int wmain(int argc, wchar_t** argv) {
             w.release(base);
         };
         int next = -1;
-        for (size_t step = 0; step <= tokens.size(); step++) {
+        for (size_t step = 0; step < tokens.size() + gen_extra; step++) {
             int tok = step < tokens.size() ? tokens[step] : next;
             w.embed(tok, x.hidden);
             d.set_position(step);
@@ -51,14 +52,20 @@ int wmain(int argc, wchar_t** argv) {
             fwrite(h.data(), 4, h.size(), f);
             mat("language_model.lm_head", x.norm, x.logits);
             int* dt = nullptr;
-            cudaMalloc(&dt, sizeof(int));
+            cudaMalloc(&dt, sizeof(int)); cudaMemset(dt, -1, sizeof(int));
             insignia::argmax_logits(x.logits, 248320, dt, x.stream);
             int got = -1;
             cudaMemcpyAsync(&got, dt, sizeof(int), cudaMemcpyDeviceToHost, x.stream);
             cudaStreamSynchronize(x.stream);
             cudaFree(dt);
             x.position++;
-            int draft = d.mtp_draft(tok);
+            d.set_mtp_position(step);
+            d.prime_spec(tok);
+            d.mtp_layer();
+            int draft = -1;
+            cudaMemcpyAsync(&draft, x.next_dev, sizeof(int), cudaMemcpyDeviceToHost, x.stream);
+            cudaStreamSynchronize(x.stream);
+            { cudaError_t err = cudaGetLastError(); if (err != cudaSuccess) printf("CUDA ERROR after mtp step %zu: %s\n", step, cudaGetErrorString(err)); }
             fflush(f);
             printf("step %zu token %d -> next %d draft %d\n", step, tok, got, draft);
             next = got;

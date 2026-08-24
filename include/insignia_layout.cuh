@@ -59,6 +59,13 @@ void mxfp4_gemv(const MxFp4Block *weights, const float *x, float *y, int rows, i
 void mxfp4_gemv_mlx(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, int warps_per_row = 4, cudaStream_t stream = nullptr);
 void mxfp4_gemv_v2(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream = nullptr);
 void mxfp4_gemm_mlx(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, int T, cudaStream_t stream = nullptr);
+void mxfp4_gemv2_v2(const uint32_t *weights, const uint8_t *scales, const float *x /*[2,cols]*/, float *y /*[2,rows]*/, int rows, int cols, cudaStream_t stream = nullptr);
+void quantize_x8(const float *x, uint32_t *xq, float *xs, int rows, int cols, cudaStream_t stream = nullptr);
+void mxfp4_gemv2_q8g(const uint32_t *weights, const uint8_t *scales, const uint32_t *xq, const float *xs, float *y, int rows, int cols, cudaStream_t stream = nullptr);
+void mxfp4_gemv_q8g(const uint32_t *weights, const uint8_t *scales, const uint32_t *xq, const float *xs, float *y, int rows, int cols, cudaStream_t stream = nullptr);
+void mxfp4_gemv_ab2_q8g(const uint32_t *wa, const uint8_t *sa, const uint32_t *wb, const uint8_t *sb, const uint32_t *xq, const float *xs, float *ya, float *yb, int cols, cudaStream_t stream = nullptr);
+void mxfp4_gemv_ab2_q8(const uint32_t *wa, const uint8_t *sa, const uint32_t *wb, const uint8_t *sb, const float *x, float *ya, float *yb, int cols, cudaStream_t stream = nullptr);
+void mxfp4_gemv2_q8(const uint32_t *weights, const uint8_t *scales, const float *x /*[2,cols]*/, float *y /*[2,rows]*/, int rows, int cols, cudaStream_t stream = nullptr);
 void mxfp4_get_row_mlx(const uint32_t *weights, const uint8_t *scales, float *out, const int *row_dev, int cols, cudaStream_t stream = nullptr);
 void quantize_q8_groups(const float *x, int8_t *qx, float *qscale, int cols, cudaStream_t stream = nullptr);
 void mxfp4_gemv_dp4a(const uint32_t *weights, const uint8_t *scales, const int8_t *qx, const float *qscale, float *y, int rows, int cols, int warps_per_row = 4, cudaStream_t stream = nullptr);

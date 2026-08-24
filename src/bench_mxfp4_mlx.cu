@@ -259,6 +259,97 @@ void gemv_e_launch(const uint32_t *w, const uint8_t *s, const float *x, float *y
     const int quads = (rows + 3) >> 2;
     gemv_e<<<(quads + 7) >> 3, 256, size_t(cols) * 4 + 64, nullptr>>>(w, s, x, y, rows, cols >> 5);
 }
+
+
+// F: pair dp4a - both activation rows quantized to per-group int8 once; weights decoded to
+// signed int8 (x2 E2M1 table, 0.5 folded into the group scale) through one 256-entry u64
+// broadcast table (LO nibble in low word, HI in high) and __byte_perm interleave. x lives
+// group-major so each row costs 2x LDS.128 per group. Assumes cols==4096 (groups==128).
+__global__ __launch_bounds__(256) void gemv_f(const uint32_t *__restrict__ weights, const uint8_t *__restrict__ scales, const float *__restrict__ x, float *__restrict__ y, int rows, int groups) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    extern __shared__ char smem[];
+    uint32_t *xq = reinterpret_cast<uint32_t *>(smem);                        // [2][groups][8]
+    float *xs = reinterpret_cast<float *>(smem + size_t(16) * groups * 4);    // [2][groups]
+    unsigned long long *btab = reinterpret_cast<unsigned long long *>(smem + size_t(16) * groups * 4 + 2 * groups * 4);  // [256]
+    const int r = threadIdx.x >> 7, g = threadIdx.x & 127;
+    {   // one thread quantizes one 32-wide group of one row to int8 + fp32 group scale
+        const float *xg = x + r * (groups * 32) + g * 32;
+        float v[32], m = 0.f;
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const float4 f4 = __ldg(reinterpret_cast<const float4 *>(xg) + q);
+            v[q * 4 + 0] = f4.x; v[q * 4 + 1] = f4.y; v[q * 4 + 2] = f4.z; v[q * 4 + 3] = f4.w;
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(f4.x), fabsf(f4.y)), fmaxf(fabsf(f4.z), fabsf(f4.w))));
+        }
+        const float scale = m * (1.f / 127.f);
+        xs[r * groups + g] = scale;
+        const float inv = m > 0.f ? 127.f / m : 0.f;
+        uint32_t *dst = xq + (r * groups + g) * 8;
+        #pragma unroll
+        for (int w = 0; w < 8; w++) {
+            uint32_t packed = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) packed |= uint32_t(uint8_t(__float2int_rn(v[w * 4 + j] * inv))) << (8 * j);
+            dst[w] = packed;
+        }
+    }
+    {   // btab[b] = { LO-nibble code broadcast x4 | HI-nibble code broadcast x4 }
+        static const signed char tbl[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+        const int b = threadIdx.x;
+        const int lo = b & 15, hi = b >> 4;
+        const uint32_t clo = uint32_t(uint8_t((lo & 8) ? -tbl[lo & 7] : tbl[lo & 7])) * 0x01010101u;
+        const uint32_t chi = uint32_t(uint8_t((hi & 8) ? -tbl[hi & 7] : tbl[hi & 7])) * 0x01010101u;
+        btab[threadIdx.x] = unsigned long long(clo) | (unsigned long long(chi) << 32);
+    }
+    __syncthreads();
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const uint32_t *row_w = weights + static_cast<size_t>(row) * groups * 4;
+    const uint8_t *row_s = scales + static_cast<size_t>(row) * groups;
+    float acc0 = 0.f, acc1 = 0.f;
+    #pragma unroll 4
+    for (int g0 = lane; g0 < groups; g0 += 32) {
+        const uint4 P = __ldcs(reinterpret_cast<const uint4 *>(row_w + static_cast<size_t>(g0) * 4));
+        const uint4 *x0 = reinterpret_cast<const uint4 *>(xq + g0 * 8);
+        const uint4 *x1 = reinterpret_cast<const uint4 *>(xq + (groups + g0) * 8);
+        int d0a = 0, d0b = 0, d1a = 0, d1b = 0;
+        const uint32_t pw[4] = {P.x, P.y, P.z, P.w};
+        #pragma unroll
+        for (int wi = 0; wi < 4; wi++) {
+            const uint32_t w_ = pw[wi];
+            const unsigned long long b0 = btab[w_ & 0xff], b1 = btab[(w_ >> 8) & 0xff];
+            const unsigned long long b2 = btab[(w_ >> 16) & 0xff], b3 = btab[w_ >> 24];
+            const uint32_t L0 = uint32_t(b0), H0 = uint32_t(b0 >> 32);
+            const uint32_t L1 = uint32_t(b1), H1 = uint32_t(b1 >> 32);
+            const uint32_t L2 = uint32_t(b2), H2 = uint32_t(b2 >> 32);
+            const uint32_t L3 = uint32_t(b3), H3 = uint32_t(b3 >> 32);
+            const uint32_t A = __byte_perm(L0, L1, 0xc480);       // [c0,0,c2,0]
+            const uint32_t B = __byte_perm(H0, H1, 0x4c80);       // [0,c1,0,c3]
+            const uint32_t w0 = __byte_perm(A, B, 0x6240);        // [c0,c1,c2,c3]
+            const uint32_t A2 = __byte_perm(L2, L3, 0xc480);
+            const uint32_t B2 = __byte_perm(H2, H3, 0x4c80);
+            const uint32_t w1 = __byte_perm(A2, B2, 0x6240);      // [c4,c5,c6,c7]
+            const uint32_t xx0 = reinterpret_cast<const uint32_t *>(x0)[wi * 2];
+            const uint32_t xx1 = reinterpret_cast<const uint32_t *>(x0)[wi * 2 + 1];
+            const uint32_t yy0 = reinterpret_cast<const uint32_t *>(x1)[wi * 2];
+            const uint32_t yy1 = reinterpret_cast<const uint32_t *>(x1)[wi * 2 + 1];
+            d0a = __dp4a(int(w0), int(xx0), d0a);
+            d1a = __dp4a(int(w0), int(yy0), d1a);
+            d0b = __dp4a(int(w1), int(xx1), d0b);
+            d1b = __dp4a(int(w1), int(yy1), d1b);
+        }
+        const float ws = __int_as_float(uint32_t(row_s[g0]) << 23) * 0.5f;
+        acc0 = fmaf(float(d0a + d0b), ws * xs[g0], acc0);
+        acc1 = fmaf(float(d1a + d1b), ws * xs[groups + g0], acc1);
+    }
+    #pragma unroll
+    for (int mask = 16; mask; mask >>= 1) { acc0 += __shfl_xor_sync(0xffffffff, acc0, mask); acc1 += __shfl_xor_sync(0xffffffff, acc1, mask); }
+    if (lane == 0) { y[row] = acc0; y[rows + row] = acc1; }
+}
+void gemv_f_launch(const uint32_t *w, const uint8_t *s, const float *x, float *y, int rows, int cols) {
+    const int groups = cols >> 5;
+    gemv_f<<<(rows + 7) >> 3, 256, size_t(16) * groups * 4 + 2 * groups * 4 + 2048, nullptr>>>(w, s, x, y, rows, cols >> 5);
+}
 }
 
 struct Shape { int rows, cols; };
@@ -327,6 +418,58 @@ int main() {
             bench_lambda("C-2grp", bench::gemv_c_launch);
             bench_lambda("D-2rows", bench::gemv_d_launch);
             bench_lambda("E-4rows", bench::gemv_e_launch);
+        }
+        {   // pair (2 activation rows) path used by speculative decode
+            float *dx2, *dy2;
+            CUDA_OK(cudaMalloc(&dx2, size_t(cols) * 2 * 4));
+            CUDA_OK(cudaMalloc(&dy2, size_t(rows) * 2 * 4));
+            CUDA_OK(cudaMemcpy(dx2, x.data(), cols * 4, cudaMemcpyHostToDevice));
+            CUDA_OK(cudaMemcpy(dx2 + cols, x.data(), cols * 4, cudaMemcpyHostToDevice));
+            auto timeit = [&](const char *name, auto &&run2) {
+                run2(); CUDA_OK(cudaDeviceSynchronize());
+                constexpr int iters = 100;
+                cudaEventRecord(a);
+                for (int i = iters; i; i--) run2();
+                cudaEventRecord(b); cudaEventSynchronize(b);
+                float ms; cudaEventElapsedTime(&ms, a, b); ms /= iters;
+                std::printf("%dx%d %-10s %.3f ms %.1f GiB/s weights\n", rows, cols, name, ms, (bytes / 1073741824.) / (ms / 1000.));
+            };
+            timeit("gemv2(2x)", [&] { insignia::mxfp4_gemv2_v2(dw, ds, dx2, dy2, rows, cols); });
+            {   // prequantized pair path with correctness check against ref
+                uint32_t *xq; float *xs;
+                CUDA_OK(cudaMalloc(&xq, size_t(2 * (cols >> 5)) * 8 * 4));
+                CUDA_OK(cudaMalloc(&xs, 2 * (cols >> 5) * 4));
+                auto runq = [&] { insignia::quantize_x8(dx2, xq, xs, 2, cols); insignia::mxfp4_gemv2_q8g(dw, ds, xq, xs, dy2, rows, cols); };
+                runq(); CUDA_OK(cudaDeviceSynchronize());
+                std::vector<float> y2(rows * 2);
+                CUDA_OK(cudaMemcpy(y2.data(), dy2, rows * 2 * 4, cudaMemcpyDeviceToHost));
+                float err = 0;
+                for (int r = 0; r < rows; r++) err = fmaxf(err, fabsf(y2[r] - ref[r]));  // bench uses the same x for both rows
+                std::printf("%dx%d q8g-pair   max_abs=%g ref0=%.1f\n", rows, cols, err, fabsf(ref[0]));
+                timeit("q8g(2x)", runq);
+            {   // fused a+b kernel check: A = rows 0..31, B = rows 32..63 of the same weights
+                uint32_t *xq; float *xs; float *ya, *yb;
+                CUDA_OK(cudaMalloc(&xq, size_t(2 * (cols >> 5)) * 8 * 4));
+                CUDA_OK(cudaMalloc(&xs, 2 * (cols >> 5) * 4));
+                CUDA_OK(cudaMalloc(&ya, 64 * 4)); CUDA_OK(cudaMalloc(&yb, 64 * 4));
+                insignia::quantize_x8(dx2, xq, xs, 2, cols);
+                insignia::mxfp4_gemv_ab2_q8g(dw, ds, dw + size_t(32) * groups * 4, ds + size_t(32) * groups, xq, xs, ya, yb, cols);
+                CUDA_OK(cudaDeviceSynchronize());
+                std::vector<float> ha(64), hb(64);
+                CUDA_OK(cudaMemcpy(ha.data(), ya, 64 * 4, cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(hb.data(), yb, 64 * 4, cudaMemcpyDeviceToHost));
+                float ea = 0, eb = 0;
+                for (int r = 0; r < 32; r++) { ea = fmaxf(ea, fabsf(ha[r] - ref[r]) / (fabsf(ref[r]) + 1e-3)); eb = fmaxf(eb, fabsf(hb[r] - ref[32 + r]) / (fabsf(ref[32 + r]) + 1e-3)); }
+                std::printf("%dx%d ab2q8g    a_max_rel=%g b_max_rel=%g\n", rows, cols, ea, eb);
+                cudaFree(xq); cudaFree(xs); cudaFree(ya); cudaFree(yb);
+            }
+                cudaFree(xq); cudaFree(xs);
+            }
+            if (cols == 4096) {
+                bench_lambda("F-dp4a2x", bench::gemv_f_launch);
+            }
+            timeit("v2 x2", [&] { insignia::mxfp4_gemv_v2(dw, ds, dx2, dy2, rows, cols); insignia::mxfp4_gemv_v2(dw, ds, dx2 + cols, dy2 + rows, rows, cols); });
+            cudaFree(dx2); cudaFree(dy2);
         }
         cudaFree(dw); cudaFree(ds); cudaFree(dx); cudaFree(dy);
         cudaEventDestroy(a); cudaEventDestroy(b);

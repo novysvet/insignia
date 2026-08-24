@@ -19,6 +19,48 @@ void store_kv(const float*k,const float*v,float*kc,float*vc,const int*pos_dev,in
 namespace insignia {
 __global__ void argmax_kernel(const float*x,int n,int*out){float best=-3.402823466e38F;int idx=0;for(int i=threadIdx.x;i<n;i+=blockDim.x){float v=x[i];if(v>best){best=v;idx=i;}}for(int m=16;m;m>>=1){float v=__shfl_xor_sync(0xffffffff,best,m);int j=__shfl_xor_sync(0xffffffff,idx,m);if(v>best){best=v;idx=j;}}__shared__ float bv[8];__shared__ int bi[8];int lane=threadIdx.x&31,warp=threadIdx.x>>5;if(!lane){bv[warp]=best;bi[warp]=idx;}__syncthreads();if(!warp){best=lane<8?bv[lane]:-3.402823466e38F;idx=lane<8?bi[lane]:0;for(int m=16;m;m>>=1){float v=__shfl_xor_sync(0xffffffff,best,m);int j=__shfl_xor_sync(0xffffffff,idx,m);if(v>best){best=v;idx=j;}}if(!lane)*out=idx;}}
 void argmax_logits(const float*x,int n,int*out,cudaStream_t s){argmax_kernel<<<1,256,0,s>>>(x,n,out);}
+
+// Two-stage argmax for the 248K-vocab lm_head: stage 1 reduces 512-wide blocks into one
+// monotonic u64 key (float order bits << 32 | index) via atomicMax, stage 2 unpacks.
+__global__ void argmax_stage1_kernel(const float *__restrict__ x, int n, unsigned long long *__restrict__ best) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    float best_v = -3.402823466e38F;
+    int best_i = 0;
+    for (int i = tid; i < n; i += gridDim.x * blockDim.x) {
+        const float v = __ldg(x + i);
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    for (int m = 16; m; m >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffff, best_v, m);
+        const int j = __shfl_xor_sync(0xffffffff, best_i, m);
+        if (v > best_v) { best_v = v; best_i = j; }
+    }
+    __shared__ float bv[16];
+    __shared__ int bi[16];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (!lane) { bv[warp] = best_v; bi[warp] = best_i; }
+    __syncthreads();
+    if (!warp) {
+        best_v = lane < 16 ? bv[lane] : -3.402823466e38F;
+        best_i = lane < 16 ? bi[lane] : 0;
+        for (int m = 16; m; m >>= 1) {
+            const float v = __shfl_xor_sync(0xffffffff, best_v, m);
+            const int j = __shfl_xor_sync(0xffffffff, best_i, m);
+            if (v > best_v) { best_v = v; best_i = j; }
+        }
+        if (!lane) {
+            uint32_t bits = __float_as_uint(best_v);
+            bits ^= (uint32_t(int32_t(bits) >> 31)) | 0x80000000u;  // total order for +/- floats
+            atomicMax(best, (unsigned long long(bits) << 32) | unsigned(best_i));
+        }
+    }
+}
+__global__ void argmax_stage2_kernel(const unsigned long long *__restrict__ best, int *__restrict__ out) { *out = int(*best & 0xffffffffu); }
+void argmax_fast(const float *x, int n, int *out, unsigned long long *scratch, cudaStream_t s) {
+    cudaMemsetAsync(scratch, 0, 8, s);
+    argmax_stage1_kernel<<<64, 512, 0, s>>>(x, n, scratch);
+    argmax_stage2_kernel<<<1, 1, 0, s>>>(scratch, out);
+}
 }
 
 namespace insignia {

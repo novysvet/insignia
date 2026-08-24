@@ -13,4 +13,5 @@ void store_kv(const float*k,const float*v,float*kc,float*vc,const int*pos_dev,in
 void bf16_gemv(const uint16_t*weight,const float*x,float*y,int rows,int cols,cudaStream_t stream=nullptr);
 void concat(const float*a,const float*b,float*out,int n,cudaStream_t stream=nullptr);
 void argmax_logits(const float*logits,int n,int*device_token,cudaStream_t stream=nullptr);
+void argmax_fast(const float *logits,int n,int *device_token,unsigned long long *scratch,cudaStream_t stream=nullptr);
 }

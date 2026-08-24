@@ -146,6 +146,12 @@ for step in range(len(tokens) + 1):
     cf = float(fn @ d / np.linalg.norm(fn) / np.linalg.norm(d))
     am = lm_head_argmax(fn)
     draft = mtp_draft(tok, x, step)
+    if step + 1 < len(tokens) + 1 and am is not None:
+        # shifted pairing probe: MTP(newly-decided token, current hidden) predicting t+2
+        try:
+            probe = mtp_draft(am, x, step)  # same MTP KV state will be reused; probe before real draft order matters not for argmax-only info
+        except Exception:
+            probe = None
     next_tok = am
     print(f'step {step} tok {tok}: worst_layer_cos={min(c for c, s, l2 in worst if s == step):.8f} final_cos={cf:.8f} ref_argmax={am} ref_draft={draft}')
 worst.sort()

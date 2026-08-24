@@ -1,0 +1,14 @@
+# Normalize text files, keep .bat with CRLF
+* text=auto
+*.bat text eol=crlf
+*.cu text eol=lf
+*.cuh text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+*.ps1 text eol=lf
+*.exe binary
+*.obj binary
+*.dll binary

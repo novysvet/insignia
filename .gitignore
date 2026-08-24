@@ -1,0 +1,42 @@
+# Reference clones - read-only, never committed
+/colibri/
+/exllamav3/
+/ggml/
+/llama.cpp/
+/_mlx/
+
+# Downloaded research/reference material
+/_ref_*
+/tools/_ref_*
+
+# Build output (keep the .bat build scripts)
+/build/*
+!/build/*.bat
+
+# Native MSVC/CUDA artifacts
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.exe
+*.cudafe1.cpp
+*.cudafe1.h
+*.dll
+
+# Model indexes and big payloads
+*.insignia-index
+*.safetensors
+*.gguf
+*.f32
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors/OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

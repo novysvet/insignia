@@ -1,0 +1,3 @@
+#include "insignia_decode.hpp"
+#include <cstdio>
+int wmain(int argc,wchar_t**argv){if(argc!=2)return 2;try{insignia::ModelFile m(argv[1]);insignia::Qwen35Weights w(m,6ull<<30);insignia::DecodeWorkspace x(128);insignia::Qwen35Decode d(w,x);int token=42;for(int i=0;i<3;i++){cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b);cudaEventRecord(a);int next=d.decode_token(token);cudaEventRecord(b);cudaEventSynchronize(b);float ms;cudaEventElapsedTime(&ms,a,b);printf("step=%d token=%d -> %d %.3f ms\n",i,token,next,ms);token=next;}return token>=0?0:1;}catch(const std::exception&e){fprintf(stderr,"%s\n",e.what());return 3;}}

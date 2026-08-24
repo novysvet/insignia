@@ -1,0 +1,3 @@
+#include "insignia_decode.hpp"
+#include <cstdio>
+int wmain(int argc,wchar_t**argv){if(argc!=2)return 2;try{insignia::ModelFile m(argv[1]);insignia::Qwen35Weights w(m,6ull<<30);insignia::DecodeWorkspace x(128);insignia::Qwen35Decode d(w,x);d.forward_token(248045);int target=d.logits_argmax();cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b);int cold=d.mtp_draft(target);cudaEventRecord(a);int draft=d.mtp_draft(target);cudaEventRecord(b);cudaEventSynchronize(b);float ms;cudaEventElapsedTime(&ms,a,b);printf("MTP draft input=%d cold_draft=%d draft=%d %.3fms resident=%lluMiB\n",target,cold,draft,ms,(unsigned long long)(w.storage().device_bytes()>>20));return draft>=0?0:1;}catch(const std::exception&e){fprintf(stderr,"%s\n",e.what());return 3;}}

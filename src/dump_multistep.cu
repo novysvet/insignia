@@ -53,8 +53,9 @@ int wmain(int argc, wchar_t** argv) {
             cudaMemcpy(&next, dt, sizeof(int), cudaMemcpyDeviceToHost);
             cudaFree(dt);
             x.position++;
+            int draft = d.mtp_draft(tok);
             fflush(f);
-            printf("step %zu token %d -> next %d\n", step, tok, next);
+            printf("step %zu token %d -> next %d draft %d\n", step, tok, next, draft);
         }
         fclose(f);
         return 0;

@@ -100,6 +100,35 @@ def lm_head_argmax(nrm):
         if lg[j] > best_v: best_v, best_i = float(lg[j]), i + j
     return best_i
 
+# MTP draft: given token embed + final raw hidden at position pos, propose the next token.
+mtp_kvc = np.zeros((64, 4, 256), np.float32); mtp_vcc = np.zeros((64, 4, 256), np.float32)
+def mtp_draft(tok, hidden, pos):
+    e = rms(embed_row(tok), get('language_model.mtp.pre_fc_norm_embedding.weight'))
+    h = rms(hidden, get('language_model.mtp.pre_fc_norm_hidden.weight'))
+    x = get('language_model.mtp.fc.weight') @ np.concatenate([e, h])
+    p = 'language_model.mtp.layers.0'; a = p + '.self_attn'
+    nrm = rms(x, get(p + '.input_layernorm.weight'))
+    raw = (dq(a + '.q_proj') @ nrm).reshape(16, 512)
+    q = raw[:, :256].copy(); gate = raw[:, 256:].copy()
+    k = (dq(a + '.k_proj') @ nrm).reshape(4, 256); v = (dq(a + '.v_proj') @ nrm).reshape(4, 256)
+    q = q / np.sqrt(np.mean(q * q, 1, keepdims=True) + 1e-6) * get(a + '.q_norm.weight')
+    k = k / np.sqrt(np.mean(k * k, 1, keepdims=True) + 1e-6) * get(a + '.k_norm.weight')
+    for hh in range(16): q[hh] = rope64(q[hh], pos)
+    for hh in range(4): k[hh] = rope64(k[hh], pos)
+    mtp_kvc[pos] = k; mtp_vcc[pos] = v
+    K = mtp_kvc[:pos + 1]; V = mtp_vcc[:pos + 1]
+    out = np.zeros((16, 256), np.float32)
+    for hh in range(16):
+        kvh = hh >> 2
+        s = (K[:, kvh, :] @ q[hh]) / 16.0
+        s = np.exp(s - s.max()); s /= s.sum()
+        out[hh] = s @ V[:, kvh, :]
+    out = out * (1 / (1 + np.exp(-gate)))
+    x = x + dq(a + '.o_proj') @ out.reshape(-1)
+    x = mlp(x, p)
+    fn = rms(x, get('language_model.mtp.norm.weight'))
+    return lm_head_argmax(fn)
+
 worst = []
 next_tok = None
 for step in range(len(tokens) + 1):
@@ -116,7 +145,8 @@ for step in range(len(tokens) + 1):
     d = native[step, 32]
     cf = float(fn @ d / np.linalg.norm(fn) / np.linalg.norm(d))
     am = lm_head_argmax(fn)
+    draft = mtp_draft(tok, x, step)
     next_tok = am
-    print(f'step {step} tok {tok}: worst_layer_cos={min(c for c, s, l2 in worst if s == step):.8f} final_cos={cf:.8f} ref_argmax={am}')
+    print(f'step {step} tok {tok}: worst_layer_cos={min(c for c, s, l2 in worst if s == step):.8f} final_cos={cf:.8f} ref_argmax={am} ref_draft={draft}')
 worst.sort()
 print('overall worst:', [(f'{c:.8f}', s, l) for c, s, l in worst[:5]])

@@ -4,6 +4,7 @@
 /ggml/
 /llama.cpp/
 /_mlx/
+/vllm/
 
 # Downloaded research/reference material
 /_ref_*

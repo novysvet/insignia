@@ -9,7 +9,7 @@ void deltanet_parameters(float*a,float*b,const float*A_log,const uint16_t*dt_bia
 void expand_gate_heads(const float*head_gate,float*gate256,cudaStream_t stream=nullptr);
 void sigmoid_mul(float*x,const float*gate,int n,cudaStream_t stream=nullptr);
 void split_q_gate(const float*interleaved,float*q,float*gate,cudaStream_t stream=nullptr);
-void store_kv(const float*k,const float*v,float*kc,float*vc,int position,cudaStream_t stream=nullptr);
+void store_kv(const float*k,const float*v,float*kc,float*vc,const int*pos_dev,int base,cudaStream_t stream=nullptr);
 void bf16_gemv(const uint16_t*weight,const float*x,float*y,int rows,int cols,cudaStream_t stream=nullptr);
 void concat(const float*a,const float*b,float*out,int n,cudaStream_t stream=nullptr);
 void argmax_logits(const float*logits,int n,int*device_token,cudaStream_t stream=nullptr);

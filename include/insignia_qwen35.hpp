@@ -11,10 +11,11 @@ public:
  Qwen35Weights(const ModelFile &model,uint64_t device_budget_bytes,cudaStream_t stream=nullptr);
  ~Qwen35Weights();
  void embed(int token,float *device_hidden);
+ void embed_dev(const int *token_dev,float *device_hidden,cudaStream_t stream=nullptr);
  QuantMatrix matrix(const std::string &base);
  void release(const std::string &base) noexcept;
  TieredStorage &storage() noexcept{return storage_;}
 private:
- TieredStorage storage_; cudaStream_t stream_{};
+ TieredStorage storage_; cudaStream_t stream_{}; int *scratch_int_{};
 };
 }

@@ -12,8 +12,8 @@ __global__ void sigmul(float*x,const float*g,int n){for(int i=blockIdx.x*256+thr
 }
 
 namespace insignia {
-__global__ void store_kv_kernel(const float*k,const float*v,float*kc,float*vc,int pos){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<1024){kc[pos*1024+i]=k[i];vc[pos*1024+i]=v[i];}}
-void store_kv(const float*k,const float*v,float*kc,float*vc,int pos,cudaStream_t s){store_kv_kernel<<<4,256,0,s>>>(k,v,kc,vc,pos);}
+__global__ void store_kv_kernel(const float*k,const float*v,float*kc,float*vc,const int*pos_dev,int base){int i=blockIdx.x*blockDim.x+threadIdx.x;const size_t pos=size_t(__ldg(pos_dev)+base);if(i<1024){kc[pos*1024+i]=k[i];vc[pos*1024+i]=v[i];}}
+void store_kv(const float*k,const float*v,float*kc,float*vc,const int*pos_dev,int base,cudaStream_t s){store_kv_kernel<<<4,256,0,s>>>(k,v,kc,vc,pos_dev,base);}
 }
 
 namespace insignia {

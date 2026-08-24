@@ -13,7 +13,6 @@ int wmain(int argc, wchar_t** argv) {
     if (argc != 4) return 2;
     try {
         insignia::ModelFile m(argv[1]);
-        insignia::Qwen35Weights w(m, 6ull << 30);
         std::vector<int> tokens;
         {
             char buf[1 << 16];
@@ -24,38 +23,45 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (tokens.empty()) return 2;
         insignia::DecodeWorkspace x(64);
+        insignia::Qwen35Weights w(m, 6ull << 30, x.stream);
         insignia::Qwen35Decode d(w, x);
         FILE* f = _wfopen(argv[3], L"wb");
         std::vector<float> h(4096);
         auto mat = [&](const char* base, const float* in, float* out) {
             auto z = w.matrix(base);
-            insignia::mxfp4_gemv_mlx((const uint32_t*)z.weight.data, (const uint8_t*)z.scales.data, in, out, z.rows, z.cols, 2);
+            insignia::mxfp4_gemv_v2((const uint32_t*)z.weight.data, (const uint8_t*)z.scales.data, in, out, z.rows, z.cols, x.stream);
             w.release(base);
         };
         int next = -1;
         for (size_t step = 0; step <= tokens.size(); step++) {
             int tok = step < tokens.size() ? tokens[step] : next;
             w.embed(tok, x.hidden);
+            d.set_position(step);
             for (int l = 0; l < 32; l++) {
                 d.layer(l);
-                cudaMemcpy(h.data(), x.hidden, 16384, cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(h.data(), x.hidden, 16384, cudaMemcpyDeviceToHost, x.stream);
+                cudaStreamSynchronize(x.stream);
                 fwrite(h.data(), 4, h.size(), f);
             }
             auto nw = w.storage().acquire("language_model.model.norm.weight");
             insignia::rmsnorm_bf16(x.hidden, (const uint16_t*)nw.data, x.norm, 1, 4096, false, x.stream);
             w.storage().release("language_model.model.norm.weight");
-            cudaMemcpy(h.data(), x.norm, 16384, cudaMemcpyDeviceToHost);
+            cudaMemcpyAsync(h.data(), x.norm, 16384, cudaMemcpyDeviceToHost, x.stream);
+            cudaStreamSynchronize(x.stream);
             fwrite(h.data(), 4, h.size(), f);
             mat("language_model.lm_head", x.norm, x.logits);
             int* dt = nullptr;
             cudaMalloc(&dt, sizeof(int));
             insignia::argmax_logits(x.logits, 248320, dt, x.stream);
-            cudaMemcpy(&next, dt, sizeof(int), cudaMemcpyDeviceToHost);
+            int got = -1;
+            cudaMemcpyAsync(&got, dt, sizeof(int), cudaMemcpyDeviceToHost, x.stream);
+            cudaStreamSynchronize(x.stream);
             cudaFree(dt);
             x.position++;
             int draft = d.mtp_draft(tok);
             fflush(f);
-            printf("step %zu token %d -> next %d draft %d\n", step, tok, next, draft);
+            printf("step %zu token %d -> next %d draft %d\n", step, tok, got, draft);
+            next = got;
         }
         fclose(f);
         return 0;

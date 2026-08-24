@@ -80,16 +80,6 @@ void mxfp4_gemv_mlx(const uint32_t *weights, const uint8_t *scales, const float 
 
 namespace insignia {
 
-// Branchless E2M1 decode of nibble j in word w: builds the float bits directly
-// (0/0.5 special-cased for zero exponent; sign xored into the exponent bit).
-__device__ __forceinline__ float decode4(uint32_t w, int j) {
-    const uint32_t n = (w >> (j * 4)) & 15u;
-    const uint32_t mag = n & 7u;
-    const uint32_t norm = mag >= 2u;
-    const uint32_t bits = norm ? (((126u + (mag >> 1)) << 23) | ((mag & 1u) << 22))
-                               : (mag ? 0x3f000000u : 0u);
-    return __uint_as_float(bits ^ ((n & 8u) << 28));
-}
 
 // Decode GEMV tuned for sm_89: one warp per row; each lane owns whole 32-weight groups via
 // uint4 loads (512B coalesced per warp per step). x is staged into shared memory transposed

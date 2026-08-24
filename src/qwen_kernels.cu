@@ -33,6 +33,6 @@ void split_q_gate(const float*s,float*q,float*g,cudaStream_t stream){split_q_gat
 }
 
 namespace insignia {
-__global__ void expand_gate_kernel(const float*g,float*out){int i=blockIdx.x*256+threadIdx.x;if(i<4096)out[i]=g[(i>>8)*256];}
+__global__ void expand_gate_kernel(const float*g,float*out){int i=blockIdx.x*256+threadIdx.x;if(i<4096)out[i]=g[i];}
 void expand_gate_heads(const float*g,float*out,cudaStream_t s){expand_gate_kernel<<<16,256,0,s>>>(g,out);}
 }

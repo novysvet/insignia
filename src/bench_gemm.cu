@@ -30,7 +30,7 @@ int main() {
         CUDA_OK(cudaMemcpy(dw, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
         CUDA_OK(cudaMemcpy(ds, s.data(), s.size(), cudaMemcpyHostToDevice));
         CUDA_OK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
-        insignia::mxfp4_gemm_mlx(dw, ds, dx, dy, rows, cols, T);
+        insignia::mxfp4_gemm_v2(dw, ds, dx, dy, rows, cols, T);
         CUDA_OK(cudaDeviceSynchronize());
         CUDA_OK(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
         // Host check on 8 sample rows across several t, normalized by the
@@ -55,7 +55,7 @@ int main() {
         cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
         const int iters = 30;
         cudaEventRecord(a);
-        for (int i = iters; i; i--) insignia::mxfp4_gemm_mlx(dw, ds, dx, dy, rows, cols, T);
+        for (int i = iters; i; i--) insignia::mxfp4_gemm_v2(dw, ds, dx, dy, rows, cols, T);
         cudaEventRecord(b); cudaEventSynchronize(b);
         float ms; cudaEventElapsedTime(&ms, a, b); ms /= iters;
         const double wbytes = double(w.size() * 4 + s.size());

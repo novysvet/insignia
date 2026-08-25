@@ -669,3 +669,4 @@ void mxfp4_gemv_ab2_q8(const uint32_t *wa, const uint8_t *sa, const uint32_t *wb
 }
 
 }
+// rebuild marker

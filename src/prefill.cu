@@ -21,6 +21,24 @@ void embed_gather(const uint32_t *w, const uint8_t *s, const int *tokens_dev, fl
     embed_gather_kernel<<<T, 128, 0, stream>>>(w, s, tokens_dev, out);
 }
 
+// INSIG4 embedding gather: fp16 super-group scales.
+__global__ void embed_gather_i4_kernel(const uint32_t *__restrict__ w, const uint16_t *__restrict__ s, const int *__restrict__ tokens, float *__restrict__ out) {
+    const int t = blockIdx.x, g = threadIdx.x;
+    const size_t row = __ldg(tokens + t);
+    const uint4 packed = reinterpret_cast<const uint4 *>(w + row * 512)[g];
+    const float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(s + row * 64 + (g >> 1)));
+    float *o = out + static_cast<size_t>(t) * 4096 + g * 32;
+    const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    #pragma unroll
+    for (int wi = 0; wi < 4; wi++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) o[wi * 8 + j] = decode4(words[wi], j) * scale;
+}
+void embed_gather_i4(const uint32_t *w, const uint16_t *s, const int *tokens_dev, float *out, int T, cudaStream_t stream) {
+    embed_gather_i4_kernel<<<T, 128, 0, stream>>>(w, s, tokens_dev, out);
+}
+
+
 __global__ void split_q_gate_batch_kernel(const float *__restrict__ src, float *__restrict__ q, float *__restrict__ gate) {
     const int t = blockIdx.x >> 4, h = blockIdx.x & 15, d = threadIdx.x;
     const size_t base = static_cast<size_t>(t) * 8192 + h * 512;

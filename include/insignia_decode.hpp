@@ -10,7 +10,7 @@ public:
  unsigned long long *am_scratch{};
  float *snap_delta{},*snap_conv{};  // speculative rollback snapshots
  float *pf_x{},*pf_n{},*pf_qkv{},*pf_scratch{},*pf_z{},*pf_q{},*pf_g{},*pf_k{},*pf_v{},*pf_core{},*pf_down{},*pf_gate{},*pf_up{},*pf_a{},*pf_b{};  // prefill chunk buffers
- unsigned *pf_xq8{};float *pf_xs8{};  // once-per-activation int8 group quantization (pair path + mtp)
+ unsigned *pf_xq8{};float *pf_xs8{};void *pf_bf16{};  // int8 pair staging + bf16 GEMM scratch (64 rows)
  int max_context{},position{};cudaStream_t stream{};
 };
 class Qwen35Decode final {

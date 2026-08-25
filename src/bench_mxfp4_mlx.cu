@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <random>
 #include <vector>
 #define CUDA_OK(call) do{cudaError_t e_=(call);if(e_!=cudaSuccess){std::fprintf(stderr,"%s\n",cudaGetErrorString(e_));return 2;}}while(0)
 
@@ -352,8 +354,106 @@ void gemv_f_launch(const uint32_t *w, const uint8_t *s, const float *x, float *y
 }
 }
 
+int run_gemm_bench() {
+
+    const int shapes[][2] = {{8192,4096},{12288,4096},{4096,12288},{248320,4096}};
+    int rc = 0;
+    for (auto &sh : shapes) {
+        const int rows = sh[0], cols = sh[1], groups = cols / 32, T = 64;
+        std::vector<uint32_t> w(size_t(rows) * groups * 4);
+        std::vector<uint8_t> s(size_t(rows) * groups);
+        std::vector<float> x(size_t(T) * cols), y(size_t(T) * rows);
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<float> fx(-1.5f, 1.5f);
+        for (auto &v : x) v = fx(rng);
+        for (int r = 0; r < rows; r++)
+            for (int g = 0; g < groups; g++) {
+                s[size_t(r) * groups + g] = uint8_t(120 + (r + g) % 9);
+                for (int lane = 0; lane < 32; lane++) {
+                    uint8_t q = uint8_t((r * 5 + g * 3 + lane * 7) & 15);
+                    w[(size_t(r) * groups + g) * 4 + (lane >> 3)] |= uint32_t(q) << ((lane & 7) * 4);
+                }
+            }
+        uint32_t *dw; uint8_t *ds; float *dx, *dy;
+        CUDA_OK(cudaMalloc(&dw, w.size() * 4)); CUDA_OK(cudaMalloc(&ds, s.size()));
+        CUDA_OK(cudaMalloc(&dx, x.size() * 4)); CUDA_OK(cudaMalloc(&dy, y.size() * 4));
+        CUDA_OK(cudaMemcpy(dw, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(ds, s.data(), s.size(), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        {   // v2.1 path: bf16 A scratch + cp.async pipeline
+            void *x16;
+            CUDA_OK(cudaMalloc(&x16, size_t(T) * cols * 2));
+            insignia::f32_to_bf16(dx, x16, T * cols, nullptr);
+            cudaEvent_t c, d; cudaEventCreate(&c); cudaEventCreate(&d);
+            insignia::mxfp4_gemm_v21(dw, ds, x16, dy, rows, cols, T);
+            CUDA_OK(cudaDeviceSynchronize());
+            CUDA_OK(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
+            float err2 = 0;
+            for (int si = 0; si < 8; si++) {
+                const int r = (si * 2654435761u) % rows;
+                for (int t = 0; t < T; t += 7) {
+                    double z = 0, mag = 0;
+                    for (int g = 0; g < groups; g++) {
+                        const float scale = insignia::e8m0(s[size_t(r) * groups + g]);
+                        for (int lane = 0; lane < 32; lane++) {
+                            const uint8_t q = uint8_t(w[(size_t(r) * groups + g) * 4 + (lane >> 3)] >> ((lane & 7) * 4));
+                            const double term = double(insignia::fp4_e2m1(q) * scale) * x[size_t(t) * cols + g * 32 + lane];
+                            z += term; mag += fabs(term);
+                        }
+                    }
+                    err2 = fmaxf(err2, float(fabs(z - y[size_t(t) * rows + r]) / (mag + 1e-6)));
+                }
+            }
+            cudaEventRecord(c);
+            for (int i = 20; i; i--) insignia::mxfp4_gemm_v21(dw, ds, x16, dy, rows, cols, T);
+            cudaEventRecord(d); cudaEventSynchronize(d);
+            float ms2; cudaEventElapsedTime(&ms2, c, d); ms2 /= 20;
+            std::printf("%dx%d T=%d v21 max_rel=%g %.3f ms | %.0f GiB/s | %.1f TFLOPS\n", rows, cols, T, err2, ms2, double(w.size() * 4 + s.size()) / 1073741824.0 / (ms2 / 1000.0), double(T) * rows * cols * 2 / 1e12 / (ms2 / 1000.0));
+            cudaFree(x16); cudaEventDestroy(c); cudaEventDestroy(d);
+        }
+        insignia::mxfp4_gemm_v2(dw, ds, dx, dy, rows, cols, T);
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
+        // Host check on 8 sample rows across several t, normalized by the
+        // cancellation-free magnitude (near-zero dots make plain relative error meaningless).
+        float err = 0;
+        for (int si = 0; si < 8; si++) {
+            const int r = (si * 2654435761u) % rows;
+            for (int t = 0; t < T; t += 7) {
+                double z = 0, mag = 0;
+                for (int g = 0; g < groups; g++) {
+                    const float scale = insignia::e8m0(s[size_t(r) * groups + g]);
+                    for (int lane = 0; lane < 32; lane++) {
+                        const uint8_t q = uint8_t(w[(size_t(r) * groups + g) * 4 + (lane >> 3)] >> ((lane & 7) * 4));
+                        const double term = double(insignia::fp4_e2m1(q) * scale) * x[size_t(t) * cols + g * 32 + lane];
+                        z += term;
+                        mag += fabs(term);
+                    }
+                }
+                err = fmaxf(err, float(fabs(z - y[size_t(t) * rows + r]) / (mag + 1e-6)));
+            }
+        }
+        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+        const int iters = 30;
+        cudaEventRecord(a);
+        for (int i = iters; i; i--) insignia::mxfp4_gemm_v2(dw, ds, dx, dy, rows, cols, T);
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        float ms; cudaEventElapsedTime(&ms, a, b); ms /= iters;
+        const double wbytes = double(w.size() * 4 + s.size());
+        const double flops = double(T) * rows * cols * 2;
+        (void)wbytes; (void)flops;
+        std::printf("%dx%d T=%d max_rel=%g %.3f ms | %.0f GiB/s weights | %.1f TFLOPS\n",
+                    rows, cols, T, err, ms, wbytes / 1073741824.0 / (ms / 1000.0), flops / 1e12 / (ms / 1000.0));
+        if (err > 2e-2) { std::printf("FAIL\n"); rc = 1; }
+        cudaFree(dw); cudaFree(ds); cudaFree(dx); cudaFree(dy);
+        cudaEventDestroy(a); cudaEventDestroy(b);
+    }
+    return rc;
+}
+
 struct Shape { int rows, cols; };
-int main() {
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "gemm") == 0) return run_gemm_bench();
     const Shape shapes[] = {{8192,4096},{4096,4096},{12288,4096},{4096,12288},{1024,4096},{248320,4096}};
     int rc = 0;
     for (const Shape &sh : shapes) {

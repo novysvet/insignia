@@ -4,6 +4,7 @@
 namespace insignia {
 // Batched prefill kernels (T tokens at once, base position read from pos_dev[0]).
 void embed_gather(const uint32_t *embed_w, const uint8_t *embed_s, const int *tokens_dev, float *out, int T, cudaStream_t stream = nullptr);
+void embed_gather_i4(const uint32_t *embed_w, const uint16_t *embed_s, const int *tokens_dev, float *out, int T, cudaStream_t stream = nullptr);
 void split_q_gate_batch(const float *src, float *q, float *gate, int T, cudaStream_t stream = nullptr);
 void qk_norm_rope_batch(float *q, float *k, const uint16_t *qw, const uint16_t *kw, const int *pos_dev, int T, cudaStream_t stream = nullptr);
 void store_kv_batch(const float *k, const float *v, float *kc, float *vc, const int *pos_dev, int T, int max_context, cudaStream_t stream = nullptr);

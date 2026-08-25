@@ -23,18 +23,26 @@ DecodeWorkspace::DecodeWorkspace(int ctx,cudaStream_t s):max_context(ctx),stream
  alloc(&pf_q,64*4096);alloc(&pf_g,64*4096);alloc(&pf_k,64*1024);alloc(&pf_v,64*1024);alloc(&pf_core,64*4096);
  alloc(&pf_down,64*4096);alloc(&pf_gate,64*12288);alloc(&pf_up,64*12288);alloc(&pf_a,64*32);alloc(&pf_b,64*32);
  alloc(&snap_delta,24*32*128*128);alloc(&snap_conv,24*8192*3);
- {auto e2=cudaMalloc(&pf_xq8,6144*sizeof(unsigned));if(e2)throw std::runtime_error(cudaGetErrorString(e2));e2=cudaMalloc(&pf_xs8,768*sizeof(float));if(e2)throw std::runtime_error(cudaGetErrorString(e2));}
+ {auto e2=cudaMalloc(&pf_xq8,6144*sizeof(unsigned));if(e2)throw std::runtime_error(cudaGetErrorString(e2));e2=cudaMalloc(&pf_xs8,768*sizeof(float));if(e2)throw std::runtime_error(cudaGetErrorString(e2));e2=cudaMalloc(&pf_bf16,size_t(64)*12288*2);if(e2)throw std::runtime_error(cudaGetErrorString(e2));}
  cudaMemsetAsync(pos_dev,0,16*sizeof(int),stream);cudaMemsetAsync(am_scratch,0,8,stream);cudaMemsetAsync(delta_state,0,24*32*128*128*4,stream);cudaMemsetAsync(conv_state,0,24*8192*3*4,stream);
 }
-DecodeWorkspace::~DecodeWorkspace(){cudaFree(hidden);cudaFree(norm);cudaFree(qkv);cudaFree(attn_gate);cudaFree(key);cudaFree(value);cudaFree(z);cudaFree(a);cudaFree(b);cudaFree(core);cudaFree(gate);cudaFree(up);cudaFree(down);cudaFree(logits);cudaFree(delta_state);cudaFree(conv_state);cudaFree(kv_keys);cudaFree(kv_values);cudaFree(mtp_keys);cudaFree(mtp_values);cudaFree(pos_dev);cudaFreeHost(next_host);cudaFreeHost(pos_host);cudaFree(host_committed);cudaFree(am_scratch);cudaFree(committed);cudaFree(snap_delta);cudaFree(snap_conv);cudaFree(pf_tokens);cudaFree(pf_x);cudaFree(pf_n);cudaFree(pf_qkv);cudaFree(pf_scratch);cudaFree(pf_z);cudaFree(pf_q);cudaFree(pf_g);cudaFree(pf_k);cudaFree(pf_v);cudaFree(pf_core);cudaFree(pf_down);cudaFree(pf_gate);cudaFree(pf_up);cudaFree(pf_a);cudaFree(pf_b);cudaFree(pf_xq8);cudaFree(pf_xs8);}
+DecodeWorkspace::~DecodeWorkspace(){cudaFree(hidden);cudaFree(norm);cudaFree(qkv);cudaFree(attn_gate);cudaFree(key);cudaFree(value);cudaFree(z);cudaFree(a);cudaFree(b);cudaFree(core);cudaFree(gate);cudaFree(up);cudaFree(down);cudaFree(logits);cudaFree(delta_state);cudaFree(conv_state);cudaFree(kv_keys);cudaFree(kv_values);cudaFree(mtp_keys);cudaFree(mtp_values);cudaFree(pos_dev);cudaFreeHost(next_host);cudaFreeHost(pos_host);cudaFree(host_committed);cudaFree(am_scratch);cudaFree(committed);cudaFree(snap_delta);cudaFree(snap_conv);cudaFree(pf_tokens);cudaFree(pf_x);cudaFree(pf_n);cudaFree(pf_qkv);cudaFree(pf_scratch);cudaFree(pf_z);cudaFree(pf_q);cudaFree(pf_g);cudaFree(pf_k);cudaFree(pf_v);cudaFree(pf_core);cudaFree(pf_down);cudaFree(pf_gate);cudaFree(pf_up);cudaFree(pf_a);cudaFree(pf_b);cudaFree(pf_xq8);cudaFree(pf_xs8);cudaFree(pf_bf16);}
 DeviceView Qwen35Decode::tensor(const std::string&name){return w_.storage().acquire(name);}
-void Qwen35Decode::linear(const std::string&base,const float*in,float*out){auto m=w_.matrix(base);mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);w_.release(base);}
-void Qwen35Decode::linear2(const std::string&base,const float*in,float*out){auto m=w_.matrix(base);mxfp4_gemv2_q8((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);w_.release(base);}
-void Qwen35Decode::linear_batch(const std::string&base,const float*in,float*out,int T){auto m=w_.matrix(base);mxfp4_gemm_mlx((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,in,out,m.rows,m.cols,T,x_.stream);w_.release(base);}
+void Qwen35Decode::linear(const std::string&base,const float*in,float*out){auto m=w_.matrix(base);if(m.insig4)mxfp4_gemv_v2_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);else mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);w_.release(base);}
+void Qwen35Decode::linear2(const std::string&base,const float*in,float*out){auto m=w_.matrix(base);if(m.insig4)mxfp4_gemv2_q8_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);else mxfp4_gemv2_q8((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);w_.release(base);}
+void Qwen35Decode::linear_batch(const std::string&base,const float*in,float*out,int T){
+ auto m=w_.matrix(base);
+ if(m.insig4){mxfp4_gemm_mlx_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,in,out,m.rows,m.cols,T,x_.stream);}
+ else{  // pipelined GEMM: A staged as zero-padded bf16
+  if(T<64)cudaMemsetAsync((char*)x_.pf_bf16+size_t(T)*m.cols*2,0,size_t(64-T)*m.cols*2,x_.stream);  // tail rows must read as zero
+  f32_to_bf16(in,x_.pf_bf16,size_t(T)*m.cols,x_.stream);
+  mxfp4_gemm_v21((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_bf16,out,m.rows,m.cols,T,x_.stream);
+ }
+ w_.release(base);}
 void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) {
  if(T<=0||T>64)throw std::runtime_error("prefill chunk must be 1..64 tokens");
  if(x_.position+T>x_.max_context)throw std::runtime_error("KV cache full");
- {const std::string base="language_model.model.embed_tokens";auto m=w_.matrix(base);embed_gather((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,tokens_dev,x_.pf_x,T,x_.stream);w_.release(base);}
+ {const std::string base="language_model.model.embed_tokens";auto m=w_.matrix(base);if(m.insig4)embed_gather_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,tokens_dev,x_.pf_x,T,x_.stream);else embed_gather((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,tokens_dev,x_.pf_x,T,x_.stream);w_.release(base);}
  for(int l=0;l<32;l++){
   const std::string p="language_model.model.layers."+std::to_string(l);
   auto inw=tensor(p+".input_layernorm.weight");rmsnorm_bf16(x_.pf_x,(const uint16_t*)inw.data,x_.pf_n,T,4096,false,x_.stream);w_.storage().release(p+".input_layernorm.weight");
@@ -56,7 +64,8 @@ void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) {
    const std::string a=p+".linear_attn";
    if(pair){linear2(a+".in_proj_qkv",x_.pf_n,x_.pf_qkv);linear2(a+".in_proj_z",x_.pf_n,x_.pf_z);
     auto ma=w_.matrix(a+".in_proj_a"),mb=w_.matrix(a+".in_proj_b");
-    mxfp4_gemv_ab2_q8((const uint32_t*)ma.weight.data,(const uint8_t*)ma.scales.data,(const uint32_t*)mb.weight.data,(const uint8_t*)mb.scales.data,x_.pf_n,x_.pf_a,x_.pf_b,ma.cols,x_.stream);
+    if(ma.insig4)mxfp4_gemv_ab2_q8_i4((const uint32_t*)ma.weight.data,(const uint16_t*)ma.scales.data,(const uint32_t*)mb.weight.data,(const uint16_t*)mb.scales.data,x_.pf_n,x_.pf_a,x_.pf_b,ma.cols,x_.stream);
+    else mxfp4_gemv_ab2_q8((const uint32_t*)ma.weight.data,(const uint8_t*)ma.scales.data,(const uint32_t*)mb.weight.data,(const uint8_t*)mb.scales.data,x_.pf_n,x_.pf_a,x_.pf_b,ma.cols,x_.stream);
     w_.release(a+".in_proj_a");w_.release(a+".in_proj_b");}
    else{linear_batch(a+".in_proj_qkv",x_.pf_n,x_.pf_qkv,T);linear_batch(a+".in_proj_z",x_.pf_n,x_.pf_z,T);
     {auto m=w_.matrix(a+".in_proj_a");for(int t=0;t<T;t++)mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n+size_t(t)*4096,x_.pf_a+size_t(t)*32,m.rows,m.cols,x_.stream);w_.release(a+".in_proj_a");}
@@ -81,10 +90,12 @@ void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) {
  auto nw=tensor("language_model.model.norm.weight");rmsnorm_bf16(x_.pf_x,(const uint16_t*)nw.data,x_.pf_n,T,4096,false,x_.stream);w_.storage().release("language_model.model.norm.weight");
  {auto m=w_.matrix("language_model.lm_head");
   if(T==2){  // both rows through one lm_head weight pass; argmax each
-   mxfp4_gemv2_q8((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n,x_.logits,m.rows,m.cols,x_.stream);
+   if(m.insig4)mxfp4_gemv2_q8_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,x_.pf_n,x_.logits,m.rows,m.cols,x_.stream);
+   else mxfp4_gemv2_q8((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n,x_.logits,m.rows,m.cols,x_.stream);
    argmax_fast(x_.logits,Qwen35Shape::vocab,x_.next2_dev,x_.am_scratch,x_.stream);
    argmax_fast(x_.logits+Qwen35Shape::vocab,Qwen35Shape::vocab,x_.next_dev,x_.am_scratch,x_.stream);
-  } else {mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n+size_t(T-1)*4096,x_.logits,m.rows,m.cols,x_.stream);argmax_fast(x_.logits,Qwen35Shape::vocab,x_.next_dev,x_.am_scratch,x_.stream);}
+  } else if(m.insig4){mxfp4_gemv_v2_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,x_.pf_n+size_t(T-1)*4096,x_.logits,m.rows,m.cols,x_.stream);argmax_fast(x_.logits,Qwen35Shape::vocab,x_.next_dev,x_.am_scratch,x_.stream);}
+  else {mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n+size_t(T-1)*4096,x_.logits,m.rows,m.cols,x_.stream);argmax_fast(x_.logits,Qwen35Shape::vocab,x_.next_dev,x_.am_scratch,x_.stream);}
   w_.release("language_model.lm_head");}
  cudaMemcpyAsync(x_.hidden,x_.pf_x+size_t(T-1)*4096,4096*4,cudaMemcpyDeviceToDevice,x_.stream);
  addi_kernel_launch(x_.pos_dev,T,x_.stream);

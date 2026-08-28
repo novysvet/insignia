@@ -1681,12 +1681,12 @@ public:
         early_route_prefetch_ = std::getenv("INSIGNIA_GLM53_EARLY_PREFETCH") != nullptr;
         early_route_on_ = early_route_on_ || early_route_prefetch_;
         if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_PREFETCH_N"))
-            early_route_prefetch_n_ = std::clamp(std::atoi(count), 1, moe_topk_);
+            early_route_prefetch_n_ = std::clamp(std::atoi(count), 1, 8);
         early_multi_route_on_ = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_ROUTE") != nullptr;
         early_multi_prefetch_ = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_PREFETCH") != nullptr;
         early_multi_route_on_ = early_multi_route_on_ || early_multi_prefetch_;
         if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_N"))
-            early_multi_n_ = std::clamp(std::atoi(count), 1, moe_topk_);
+            early_multi_n_ = std::clamp(std::atoi(count), 1, 8);
         if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_MAX"))
             early_multi_max_ = std::max(1, std::atoi(count));
         if (const char *path = std::getenv("INSIGNIA_GLM53_EARLY_ROUTE_TRACE")) {

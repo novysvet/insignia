@@ -1456,7 +1456,8 @@ public:
         const size_t latent_stride = size_t(kMaxContext) * kv_a_rows_;
         mla_latent_u8_.reset(kv_fp8_ ? size_t(mla_layers_) * latent_stride : 0);
         mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
-        mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext);
+        mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext *
+                                insignia::glm53::kMlaLatentGroups);
         mla_partial_.reset(size_t(mla_heads_) * (kMaxContext / 512) * (size_t(kv_a_rows_) + 2));
         absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
         w_uk_.reset(absorb_per_layer_ * mla_layers_);
@@ -1994,7 +1995,8 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
     const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
     check(insignia::glm53::mla_decode_latent(mla_query_.get(), small_b_.get(),
         kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr,
-        mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+        mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+            insignia::glm53::kMlaLatentGroups,
         kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride,
         w_uk_.get() + size_t(slot) * absorb_per_layer_,
         w_uv_.get() + size_t(slot) * absorb_per_layer_,
@@ -2018,8 +2020,9 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
                  kv_fp8_ ? (const void *)(mla_latent_u8_.get() + size_t(slot) * size_t(kMaxContext) * kv_a_rows_)
                          : (const void *)(mla_latent_f32_.get() + size_t(slot) * size_t(kMaxContext) * kv_a_rows_),
                  size_t(position + 1) * kv_a_rows_ * (kv_fp8_ ? 1 : 4));
-        save_dev(tag + "scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext,
-                 size_t(position + 1) * sizeof(float));
+        save_dev(tag + "scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+                     insignia::glm53::kMlaLatentGroups,
+                 size_t(position + 1) * insignia::glm53::kMlaLatentGroups * sizeof(float));
     }
     linear(stem + "o_proj.weight", mla_output_, output, hidden_, q_b_rows_);
 }
@@ -2588,13 +2591,15 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
             check(insignia::glm53::mla_decode_latent(
                   c_mlaq_.get() + size_t(token) * q_b_rows_,
                   c_small_.get() + size_t(token) * kv_a_rows_,
-                  cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+                  cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+                      insignia::glm53::kMlaLatentGroups,
                   cache_f32, w_uk, w_uv, mla_partial_.get(),
                   c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
                   mla_heads_, mla_head_dim_, kv_a_rows_), "scalar MLA attention (prefill)");
     } else {
         check(insignia::glm53::mla_prefill_latent(c_mlaq_.get(), c_small_.get(),
-              cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+              cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+                  insignia::glm53::kMlaLatentGroups,
               cache_f32, w_uk, w_uv, c_mlao_, tokens,
               position_base, mla_heads_, mla_head_dim_, kv_a_rows_), "MLA latent prefill");
     }
@@ -2617,7 +2622,9 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
             save_dev("out.bin", c_mlao_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
             save_dev("cache.bin", kv_fp8_ ? (const void *)cache_u8 : (const void *)cache_f32,
                      size_t(tokens) * kv_a_rows_ * (kv_fp8_ ? 1 : 4));
-            save_dev("scales.bin", mla_latent_scale_.get(), size_t(tokens) * sizeof(float));
+            save_dev("scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+                         insignia::glm53::kMlaLatentGroups,
+                     size_t(tokens) * insignia::glm53::kMlaLatentGroups * sizeof(float));
             save_dev("wuk.bin", w_uk, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(uint16_t));
             save_dev("wuv.bin", w_uv, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(uint16_t));
             std::fprintf(stderr, "mla dump written to %s\n", dir.string().c_str());

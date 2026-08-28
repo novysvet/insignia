@@ -779,24 +779,25 @@ __global__ __launch_bounds__(512) void mla_store_latent_kernel(
     const int dim = threadIdx.x;
     const float value = latent[size_t(token) * latent_dim + dim];
     __shared__ float partial[16];
-    __shared__ float scale_shared;
+    __shared__ float scale_shared[kMlaLatentGroups];
     const int lane = dim & 31;
     const int warp = dim >> 5;
     float magnitude = warp_max(fabsf(value));
     if (!lane) partial[warp] = magnitude;
     __syncthreads();
-    if (!dim) {
-        float peak = 0.0f;
-        for (int index = 0; index < (latent_dim >> 5); ++index) peak = fmaxf(peak, partial[index]);
-        scale_shared = fmaxf(peak / 448.0f, 1e-30f);
-        if (scales) scales[position_base + token] = scale_shared;
+    if (dim < kMlaLatentGroups) {
+        const float peak = fmaxf(partial[2 * dim], partial[2 * dim + 1]);
+        scale_shared[dim] = fmaxf(peak / 448.0f, 1e-30f);
+        if (scales)
+            scales[size_t(position_base + token) * kMlaLatentGroups + dim] =
+                scale_shared[dim];
     }
     __syncthreads();
     if (cache_f32) {
         cache_f32[size_t(position_base + token) * latent_dim + dim] = value;
     } else {
         cache[size_t(position_base + token) * latent_dim + dim] =
-            float_to_fp8(value / scale_shared);
+            float_to_fp8(value / scale_shared[dim / kMlaLatentGroupSize]);
     }
 }
 
@@ -823,7 +824,7 @@ __global__ __launch_bounds__(256) void mla_decode_latent_partial_kernel(
     __shared__ float q_shared[256];
     __shared__ float partial_sum[8];
     __shared__ float broadcast;
-    __shared__ float scale_shared;
+    __shared__ float scale_shared[kMlaLatentGroups];
 
     q_shared[element] = query[head * 256 + element];
     __syncthreads();
@@ -846,11 +847,13 @@ __global__ __launch_bounds__(256) void mla_decode_latent_partial_kernel(
             k0 = cache_f32[size_t(key) * latent_dim + element];
             k1 = cache_f32[size_t(key) * latent_dim + element + 256];
         } else {
-            if (!element) scale_shared = scales[key];
+            if (element < kMlaLatentGroups)
+                scale_shared[element] = scales[size_t(key) * kMlaLatentGroups + element];
             __syncthreads();
-            const float dequant = scale_shared;
-            k0 = fp8_to_float(cache[size_t(key) * latent_dim + element]) * dequant;
-            k1 = fp8_to_float(cache[size_t(key) * latent_dim + element + 256]) * dequant;
+            k0 = fp8_to_float(cache[size_t(key) * latent_dim + element]) *
+                 scale_shared[element / kMlaLatentGroupSize];
+            k1 = fp8_to_float(cache[size_t(key) * latent_dim + element + 256]) *
+                 scale_shared[(element + 256) / kMlaLatentGroupSize];
         }
         const float dot = warp_sum(qe0 * k0 + qe1 * k1);
         if (!lane) partial_sum[warp] = dot;
@@ -943,7 +946,7 @@ __global__ __launch_bounds__(256) void mla_prefill_latent_kernel(
     __shared__ float partial_sum[8][8];
     __shared__ float scores[8];
     __shared__ float acc_shared[512];
-    __shared__ float scale_shared;
+    __shared__ float scale_shared[kMlaLatentGroups];
 
     float qe[8][2];
 #pragma unroll
@@ -979,11 +982,13 @@ __global__ __launch_bounds__(256) void mla_prefill_latent_kernel(
             k0 = cache_f32[size_t(key) * latent_dim + element];
             k1 = cache_f32[size_t(key) * latent_dim + element + 256];
         } else {
-            if (!element) scale_shared = scales[key];
+            if (element < kMlaLatentGroups)
+                scale_shared[element] = scales[size_t(key) * kMlaLatentGroups + element];
             __syncthreads();
-            const float dequant = scale_shared;
-            k0 = fp8_to_float(cache[size_t(key) * latent_dim + element]) * dequant;
-            k1 = fp8_to_float(cache[size_t(key) * latent_dim + element + 256]) * dequant;
+            k0 = fp8_to_float(cache[size_t(key) * latent_dim + element]) *
+                 scale_shared[element / kMlaLatentGroupSize];
+            k1 = fp8_to_float(cache[size_t(key) * latent_dim + element + 256]) *
+                 scale_shared[(element + 256) / kMlaLatentGroupSize];
         }
 #pragma unroll
         for (int slot = 0; slot < 8; ++slot) {

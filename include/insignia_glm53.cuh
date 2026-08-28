@@ -101,6 +101,8 @@ constexpr int kKdaHeadDim = 128;
 constexpr int kMlaHeadDim = 256;
 constexpr int kMlaMaxContext = 8192;
 constexpr int kMlaLatentDim = 512;
+constexpr int kMlaLatentGroupSize = 64;
+constexpr int kMlaLatentGroups = kMlaLatentDim / kMlaLatentGroupSize;
 
 // Scratch for the mHC dot-product and RMS partials.
 size_t mhc_workspace_bytes();
@@ -218,10 +220,10 @@ cudaError_t mla_flash2_prefill(
 // row-major (j-major) per-head blocks of the kv_b_proj K and V halves.
 // When cache_f32 is non-null the cache is FP32 and scales are ignored
 // (INSIGNIA_GLM53_KV_FP8=0 A/B path); otherwise cache is e4m3 with one
-// FP32 absmax/448 scale per position.
+// FP32 absmax/448 scale per 64-wide group, matching the dense FP8 path.
 
 // Appends `tokens` latents [tokens,latent_dim] at positions
-// position_base..; writes e4m3 bytes into cache and scales into scales
+// position_base..; writes e4m3 bytes into cache and [tokens,8] scales
 // (or FP32 into cache_f32 when it is non-null).
 cudaError_t mla_store_latent(
     const float *latent,

@@ -32,14 +32,15 @@ void Qwen35Decode::linear(const std::string&base,const float*in,float*out){auto 
 void Qwen35Decode::linear2(const std::string&base,const float*in,float*out){auto m=w_.matrix(base);if(m.insig4)mxfp4_gemv2_q8_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);else mxfp4_gemv2_q8((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,in,out,m.rows,m.cols,x_.stream);w_.release(base);}
 void Qwen35Decode::linear_batch(const std::string&base,const float*in,float*out,int T){
  auto m=w_.matrix(base);
- if(m.insig4){mxfp4_gemm_mlx_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,in,out,m.rows,m.cols,T,x_.stream);}
- else{  // pipelined GEMM: A staged as zero-padded bf16
-  if(T<64)cudaMemsetAsync((char*)x_.pf_bf16+size_t(T)*m.cols*2,0,size_t(64-T)*m.cols*2,x_.stream);  // tail rows must read as zero
-  f32_to_bf16(in,x_.pf_bf16,size_t(T)*m.cols,x_.stream);
-  mxfp4_gemm_v21((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_bf16,out,m.rows,m.cols,T,x_.stream);
- }
+ auto stage_a=[&](int cols){  // zero-padded bf16 A staging shared by both GEMM arms
+  if(T<64)cudaMemsetAsync((char*)x_.pf_bf16+size_t(T)*cols*2,0,size_t(64-T)*cols*2,x_.stream);  // tail rows must read as zero
+  f32_to_bf16(in,x_.pf_bf16,size_t(T)*cols,x_.stream);
+ };
+ if(m.insig4){stage_a(m.cols);mxfp4_gemm_v21_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,x_.pf_bf16,out,m.rows,m.cols,T,x_.stream);}
+ else{stage_a(m.cols);mxfp4_gemm_v21((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_bf16,out,m.rows,m.cols,T,x_.stream);}
  w_.release(base);}
-void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) {
+void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) { prefill_chunk_device(tokens_dev, T, nullptr, nullptr); }
+void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T, void (*seam)(int, const float *, int, void *), void *user) {
  if(T<=0||T>64)throw std::runtime_error("prefill chunk must be 1..64 tokens");
  if(x_.position+T>x_.max_context)throw std::runtime_error("KV cache full");
  {const std::string base="language_model.model.embed_tokens";auto m=w_.matrix(base);if(m.insig4)embed_gather_i4((const uint32_t*)m.weight.data,(const uint16_t*)m.scales.data,tokens_dev,x_.pf_x,T,x_.stream);else embed_gather((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,tokens_dev,x_.pf_x,T,x_.stream);w_.release(base);}
@@ -68,8 +69,12 @@ void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) {
     else mxfp4_gemv_ab2_q8((const uint32_t*)ma.weight.data,(const uint8_t*)ma.scales.data,(const uint32_t*)mb.weight.data,(const uint8_t*)mb.scales.data,x_.pf_n,x_.pf_a,x_.pf_b,ma.cols,x_.stream);
     w_.release(a+".in_proj_a");w_.release(a+".in_proj_b");}
    else{linear_batch(a+".in_proj_qkv",x_.pf_n,x_.pf_qkv,T);linear_batch(a+".in_proj_z",x_.pf_n,x_.pf_z,T);
-    {auto m=w_.matrix(a+".in_proj_a");for(int t=0;t<T;t++)mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n+size_t(t)*4096,x_.pf_a+size_t(t)*32,m.rows,m.cols,x_.stream);w_.release(a+".in_proj_a");}
-    {auto m=w_.matrix(a+".in_proj_b");for(int t=0;t<T;t++)mxfp4_gemv_v2((const uint32_t*)m.weight.data,(const uint8_t*)m.scales.data,x_.pf_n+size_t(t)*4096,x_.pf_b+size_t(t)*32,m.rows,m.cols,x_.stream);w_.release(a+".in_proj_b");}}
+    {auto ma=w_.matrix(a+".in_proj_a"),mb=w_.matrix(a+".in_proj_b");
+     if(T<64)cudaMemsetAsync((char*)x_.pf_bf16+size_t(T)*ma.cols*2,0,size_t(64-T)*ma.cols*2,x_.stream);
+     f32_to_bf16(x_.pf_n,x_.pf_bf16,size_t(T)*ma.cols,x_.stream);
+     if(ma.insig4)mxfp4_gemm_ab_i4((const uint32_t*)ma.weight.data,(const uint16_t*)ma.scales.data,(const uint32_t*)mb.weight.data,(const uint16_t*)mb.scales.data,x_.pf_bf16,x_.pf_a,x_.pf_b,T,ma.cols,x_.stream);  // BOTH tensors, one launch (was T x 2 GEMVs)
+     else{mxfp4_gemm_v21((const uint32_t*)ma.weight.data,(const uint8_t*)ma.scales.data,x_.pf_bf16,x_.pf_a,ma.rows,ma.cols,T,x_.stream);mxfp4_gemm_v21((const uint32_t*)mb.weight.data,(const uint8_t*)mb.scales.data,x_.pf_bf16,x_.pf_b,mb.rows,mb.cols,T,x_.stream);}
+     w_.release(a+".in_proj_a");w_.release(a+".in_proj_b");}}
    auto cw=tensor(a+".conv1d.weight");const int di=l-l/4;
    conv_prefill_silu(x_.pf_qkv,x_.pf_scratch,x_.conv_state+size_t(di)*8192*3,(const uint16_t*)cw.data,T,x_.stream,x_.snap_conv+size_t(di)*8192*3);
    w_.storage().release(a+".conv1d.weight");
@@ -86,6 +91,7 @@ void Qwen35Decode::prefill_chunk_device(const int *tokens_dev, int T) {
   silu_mul(x_.pf_gate,x_.pf_up,x_.pf_gate,size_t(T)*12288,x_.stream);
   if(pair)linear2(p+".mlp.down_proj",x_.pf_gate,x_.pf_down);else linear_batch(p+".mlp.down_proj",x_.pf_gate,x_.pf_down,T);
   residual_add(x_.pf_x,x_.pf_down,size_t(T)*4096,x_.stream);
+  if(seam){cudaStreamSynchronize(x_.stream);seam(l,x_.pf_x,T,user);}
  }
  auto nw=tensor("language_model.model.norm.weight");rmsnorm_bf16(x_.pf_x,(const uint16_t*)nw.data,x_.pf_n,T,4096,false,x_.stream);w_.storage().release("language_model.model.norm.weight");
  {auto m=w_.matrix("language_model.lm_head");
@@ -108,6 +114,11 @@ int Qwen35Decode::prefill_chunk(const int*tokens,int T){
  cudaStreamSynchronize(x_.stream);
  return *x_.next_host;
 }
+void Qwen35Decode::prefill_chunk_seam(const int*tokens,int T,void(*seam)(int,const float*,int,void*),void*user){
+ cudaMemcpyAsync(x_.pf_tokens,tokens,sizeof(int)*T,cudaMemcpyHostToDevice,x_.stream);
+ prefill_chunk_device(x_.pf_tokens,T,seam,user);
+ cudaStreamSynchronize(x_.stream);
+}
 __global__ void copyi_kernel(int*dst,const int*src){*dst=*src;}
 __global__ void bumpi_kernel(int*p){(*p)++;}
 void Qwen35Decode::set_position(int pos){*x_.pos_host=pos;cudaMemcpyAsync(x_.pos_dev,x_.pos_host,sizeof(int),cudaMemcpyHostToDevice,x_.stream);}
@@ -127,7 +138,8 @@ void Qwen35Decode::mtp_layer() {
     {   // embed the pending token (device side) and rms-norm both inputs
         const std::string base = "language_model.model.embed_tokens";
         auto m = w_.matrix(base);
-        embed_gather((const uint32_t *) m.weight.data, (const uint8_t *) m.scales.data, x_.token_dev, x_.down, 1, x_.stream);
+        if (m.insig4) embed_gather_i4((const uint32_t *) m.weight.data, (const uint16_t *) m.scales.data, x_.token_dev, x_.down, 1, x_.stream);
+        else embed_gather((const uint32_t *) m.weight.data, (const uint8_t *) m.scales.data, x_.token_dev, x_.down, 1, x_.stream);
         w_.release(base);
     }
     auto ew = tensor("language_model.mtp.pre_fc_norm_embedding.weight");
@@ -137,9 +149,12 @@ void Qwen35Decode::mtp_layer() {
     w_.storage().release("language_model.mtp.pre_fc_norm_embedding.weight");
     w_.storage().release("language_model.mtp.pre_fc_norm_hidden.weight");
     concat(x_.up, x_.norm, x_.qkv, 4096, x_.stream);
-    auto fc = tensor("language_model.mtp.fc.weight");
-    bf16_gemv((const uint16_t *) fc.data, x_.qkv, x_.hidden, 4096, 8192, x_.stream);
-    w_.storage().release("language_model.mtp.fc.weight");
+    {
+        auto fc = w_.matrix("language_model.mtp.fc");
+        if (fc.insig4) mxfp4_gemv_v2_i4((const uint32_t *)fc.weight.data, (const uint16_t *)fc.scales.data, x_.qkv, x_.hidden, 4096, 8192, x_.stream);
+        else bf16_gemv((const uint16_t *)fc.weight.data, x_.qkv, x_.hidden, 4096, 8192, x_.stream);
+        w_.release("language_model.mtp.fc");
+    }
     // the MTP layer attends at position-1 (slot 7); the main layers keep pos_dev[0]
     const std::string p = "language_model.mtp.layers.0";
     const std::string a = p + ".self_attn";
@@ -190,9 +205,11 @@ void Qwen35Decode::append_committed_host(const int *ids, int n) {
     cudaMemcpyAsync(x_.count_dev, x_.host_committed + 16383, sizeof(int), cudaMemcpyHostToDevice, x_.stream);
 }
 int Qwen35Decode::committed_count() {
-    int c;
+    int c, pos;
     cudaMemcpyAsync(&c, x_.count_dev, sizeof(int), cudaMemcpyDeviceToHost, x_.stream);
+    cudaMemcpyAsync(&pos, x_.pos_dev, sizeof(int), cudaMemcpyDeviceToHost, x_.stream);
     cudaStreamSynchronize(x_.stream);
+    x_.position = pos;  // graph replay's +=2 guess is corrected here from device truth (rejects rewind by 1)
     return c;
 }
 void Qwen35Decode::read_committed(int *host_dst, int n) {

@@ -1,11 +1,15 @@
+#include <stdexcept>
+#include <string>
 #include "insignia_layout.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 namespace insignia {
 
 // ---- INSIG4: E2M1 codes + fp16 scale shared per 64-element super-group ----
 // Scale bytes identical to MXFP4 (1B/group-equivalent); +5.9dB SQNR (tools/quant_study.py).
+// Scales are F16 on disk (quantize_insig4.py) — read as __half, never bf16.
 __device__ __forceinline__ float i4_scale(const uint16_t *s, int g) {
-    return __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(s + (g >> 1)));
+    return __half2float(*reinterpret_cast<const __half *>(s + (g >> 1)));
 }
 
 // Single-row decode GEMV (INSIG4).
@@ -63,7 +67,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv_v2_i4_kernel(const uint32_t *_
     if (lane == 0) y[row] = sum;
 }
 void mxfp4_gemv_v2_i4(const uint32_t *weights, const uint16_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 1023)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 1023)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     static const bool configured = [] { return cudaFuncSetAttribute(mxfp4_gemv_v2_i4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024) == cudaSuccess; }();
     (void)configured;
     const int groups = cols >> 5;
@@ -144,7 +148,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv2_q8_i4_kernel(const uint32_t *
     if (lane == 0) { y[row] = acc0; y[rows + row] = acc1; }
 }
 void mxfp4_gemv2_q8_i4(const uint32_t *weights, const uint16_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     const int groups = cols >> 5;
     mxfp4_gemv2_q8_i4_kernel<<<(rows + 7) >> 3, 256, size_t(16) * groups * 4 + 2 * groups * 4 + 2048, stream>>>(weights, scales, x, y, rows, groups);
 }
@@ -231,6 +235,8 @@ __global__ __launch_bounds__(256) void mxfp4_gemv_ab2_q8_i4_kernel(const uint32_
     }
 }
 void mxfp4_gemv_ab2_q8_i4(const uint32_t *wa, const uint16_t *sa, const uint32_t *wb, const uint16_t *sb, const float *x, float *ya, float *yb, int cols, cudaStream_t stream) {
+    // staging hardcodes 128 groups (hidden 4096) and 32+32 a/b rows — 9B-only by design
+    if (cols != 4096) throw std::runtime_error("insignia: ab2_i4 pair kernel is 9B-specialized (cols must be 4096), got cols=" + std::to_string(cols));
     const int groups = cols >> 5;
     mxfp4_gemv_ab2_q8_i4_kernel<<<1, 256, size_t(16) * groups * 4 + 2 * groups * 4 + 2048, stream>>>(wa, sa, wb, sb, x, ya, yb, groups);
 }

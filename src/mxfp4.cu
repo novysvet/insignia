@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include "insignia_layout.cuh"
 
 namespace insignia {
@@ -30,7 +32,7 @@ __global__ __launch_bounds__(256, 4) void mxfp4_gemv_kernel(const MxFp4Block *__
 }
 
 void mxfp4_gemv(const MxFp4Block *weights, const float *x, float *y, int rows, int cols, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     mxfp4_gemv_kernel<<<rows, 256, 0, stream>>>(weights, x, y, cols >> 5);
 }
 
@@ -66,7 +68,7 @@ __global__ void mxfp4_gemv_mlx_kernel(const uint32_t *__restrict__ weights, cons
 }
 
 void mxfp4_gemv_mlx(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, int warps_per_row, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     const int groups = cols >> 5;
     switch (warps_per_row) {
         case 1: mxfp4_gemv_mlx_kernel<1><<<rows,32,0,stream>>>(weights,scales,x,y,groups); break;
@@ -142,7 +144,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv_v2_kernel(const uint32_t *__re
 }
 
 void mxfp4_gemv_v2(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     if (cols & 1023) { mxfp4_gemv_mlx(weights, scales, x, y, rows, cols, 2, stream); return; }
     static const bool configured = [] {
         return cudaFuncSetAttribute(mxfp4_gemv_v2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024) == cudaSuccess;
@@ -210,7 +212,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv2_v2_kernel(const uint32_t *__r
     if (lane == 0) { y[row] = a0; y[rows + row] = b0; }
 }
 void mxfp4_gemv2_v2(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 1023)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 1023)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     static const bool configured = [] {
         return cudaFuncSetAttribute(mxfp4_gemv2_v2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024) == cudaSuccess;
     }();
@@ -363,7 +365,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv2_q8_kernel(const uint32_t *__r
     if (lane == 0) { y[row] = acc0; y[rows + row] = acc1; }
 }
 void mxfp4_gemv2_q8(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     const int groups = cols >> 5;
     mxfp4_gemv2_q8_kernel<<<(rows + 7) >> 3, 256, size_t(16) * groups * 4 + 2 * groups * 4 + 2048, stream>>>(weights, scales, x, y, rows, groups);
 }
@@ -573,6 +575,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv_ab2_q8g_kernel(const uint32_t 
     }
 }
 void mxfp4_gemv_ab2_q8g(const uint32_t *wa, const uint8_t *sa, const uint32_t *wb, const uint8_t *sb, const uint32_t *xq, const float *xs, float *ya, float *yb, int cols, cudaStream_t stream) {
+    if (cols != 4096) throw std::runtime_error("insignia: ab2 pair kernel is 9B-specialized (cols must be 4096), got cols=" + std::to_string(cols));
     mxfp4_gemv_ab2_q8g_kernel<<<1, 256, 0, stream>>>(wa, sa, wb, sb, xq, xs, ya, yb, cols >> 5);
 }
 
@@ -664,6 +667,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemv_ab2_q8_kernel(const uint32_t *
     }
 }
 void mxfp4_gemv_ab2_q8(const uint32_t *wa, const uint8_t *sa, const uint32_t *wb, const uint8_t *sb, const float *x, float *ya, float *yb, int cols, cudaStream_t stream) {
+    if (cols != 4096) throw std::runtime_error("insignia: ab2 pair kernel is 9B-specialized (cols must be 4096), got cols=" + std::to_string(cols));
     const int groups = cols >> 5;
     mxfp4_gemv_ab2_q8_kernel<<<1, 256, size_t(16) * groups * 4 + 2 * groups * 4 + 2048, stream>>>(wa, sa, wb, sb, x, ya, yb, groups);
 }

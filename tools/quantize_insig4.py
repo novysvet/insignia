@@ -37,16 +37,41 @@ def optimal_scale(w64, iters=10):
         hi = np.where(e1 < e2, m2, hi)
     return ((lo + hi) / 2).astype(np.float16)
 
-def quantize_tensor(w):
-    """w: 2D float32 [rows, cols] -> (packed u32 [rows, cols/8], scales f16 [rows*cols/64])."""
+def assign_codes(w64, s):
+    """Nearest E2M1 assignment at scale s: returns (code_idx [G,64], dequantized [G,64])."""
+    q = w64 / s[:, None]
+    mag = np.abs(q)
+    idx = np.abs(mag[..., None] - E2M1[None, None, :]).argmin(-1)
+    dq = np.sign(q) * E2M1[idx]
+    return idx, dq
+
+def weighted_lloyd(w64, h64, iters=3):
+    """Hessian-weighted scale fit (audits/w4/insig4-evolution.md): minimize sum_j h_j (w_j - s*g_j)^2.
+    With assignments fixed the optimal scale is closed-form s* = sum(h*w*g)/sum(h*g*g);
+    iterate assign->update (Lloyd). Init from the unweighted MSE fit. h64: [G,64] per-column
+    activation second moments. Returns fp16 scales."""
+    s = optimal_scale(w64).astype(np.float32)
+    s = np.maximum(s, 1e-30)
+    for _ in range(iters):
+        _, g = assign_codes(w64, s)
+        num = (h64 * w64 * g).sum(1)
+        den = (h64 * g * g).sum(1)
+        s2 = np.where(den > 0, num / np.maximum(den, 1e-30), s)
+        s = np.where((s2 > 0) & np.isfinite(s2), s2, s)   # keep last good scale on degenerate groups
+    return s.astype(np.float16)
+
+def quantize_tensor(w, h=None):
+    """w: 2D float32 [rows, cols], h: optional [cols] activation second moments ->
+    (packed u32 [rows, cols/8], scales f16 [rows*cols/64])."""
     rows, cols = w.shape
     assert cols % 64 == 0
     g64 = w.reshape(rows * cols // 64, 64)
-    # chunked scale search to bound temporaries
+    h64 = np.tile(h.reshape(1, cols), (rows, 1)).reshape(-1, 64).astype(np.float32) if h is not None else None
     CH = 200000
     sparts = []
     for i in range(0, g64.shape[0], CH):
-        sparts.append(optimal_scale(g64[i:i+CH]).astype(np.float32))
+        sparts.append((weighted_lloyd(g64[i:i + CH], h64[i:i + CH]) if h64 is not None
+                       else optimal_scale(g64[i:i + CH])).astype(np.float32))
     s = np.concatenate(sparts)
     codes_parts = []
     for i in range(0, g64.shape[0], CH):
@@ -64,9 +89,22 @@ def quantize_tensor(w):
     scales = s.reshape(rows, cols // 64)
     return packed, scales
 
+def f32_to_bf16_bytes(a):
+    """Round f32 -> bf16 (RNE) as little-endian u16 bytes (real BF16, not fp16!)."""
+    bits = a.astype(np.float32).view(np.uint32).copy()
+    bits += np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
+    return (bits >> np.uint32(16)).astype('<u2').tobytes()
+
 def main():
-    snap = pathlib.Path(sys.argv[1])
-    out_path = pathlib.Path(sys.argv[2])
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('snapshot'); ap.add_argument('out')
+    ap.add_argument('--hessian', default=None, help='npz from tools/collect_hessian.py: weighted scale fit')
+    args = ap.parse_args()
+    snap = pathlib.Path(args.snapshot)
+    out_path = pathlib.Path(args.out)
+    H = {k: v for k, v in np.load(args.hessian).items()} if args.hessian else {}
+    if args.hessian: print(f"hessian fit ON: {len(H)} tensors")
     idx = json.loads((snap / 'model.safetensors.index.json').read_text())
     files = sorted(set(snap / v for v in idx['weight_map'].values()))
     hdrs = []
@@ -94,6 +132,11 @@ def main():
         out_hdr[name] = {"dtype": dt, "shape": list(arr.shape), "data_offsets": [off, off + arr.nbytes]}
         blobs.append(arr.tobytes())
         off += arr.nbytes
+    def emit_raw(name, raw, dt, shape):
+        nonlocal off
+        out_hdr[name] = {"dtype": dt, "shape": shape, "data_offsets": [off, off + len(raw)]}
+        blobs.append(raw)
+        off += len(raw)
 
     names = sorted(idx['weight_map'].keys())
     def engine_name(n):
@@ -113,12 +156,19 @@ def main():
         eng = engine_name(name)
         base = eng[:-len('.weight')] if eng.endswith('.weight') else eng
         if w.ndim == 2 and w.shape[1] % 64 == 0 and ('proj' in name or 'fc.weight' in name or name.endswith('lm_head.weight') or 'embed_tokens' in name):
-            packed, scales = quantize_tensor(w)
+            packed, scales = quantize_tensor(w, H.get(base))
             emit(base + '.weight', packed, 'U32')
             emit(base + '.scales', scales.astype(np.float16), 'F16')
-            print(f"{eng}: {w.shape} -> INSIG4", flush=True)
+            tag = f" h-fit" if base in H else ""
+            print(f"{eng}: {w.shape} -> INSIG4{tag}", flush=True)
+        elif eng.endswith('.A_log'):
+            emit_raw(eng, w.astype('<f4').tobytes(), 'F32', list(w.shape))  # deltanet kernel reads A_log as float32
         else:
-            emit(eng, w.astype(np.float16), 'BF16')
+            # HF Qwen3_5RMSNorm weights are zero-centered (engine multiplies raw) — shift +1
+            # on the way out. linear_attn.norm is one-centered even in HF and stays as-is.
+            if 'norm' in name and not name.endswith('.linear_attn.norm.weight'):
+                w = w + np.float32(1.0)
+            emit_raw(eng, f32_to_bf16_bytes(w.reshape(-1)), 'BF16', list(w.shape))
     header = json.dumps(out_hdr, separators=(',', ':')).encode()
     with out_path.open('wb') as f:
         f.write(len(header).to_bytes(8, 'little'))

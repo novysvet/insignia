@@ -5,6 +5,9 @@
 /llama.cpp/
 /_mlx/
 /vllm/
+/TensorRT-LLM/
+/references-glm5/
+/.zcode/
 
 # Downloaded research/reference material
 /_ref_*
@@ -13,6 +16,7 @@
 # Build output (keep the .bat build scripts)
 /build/*
 !/build/*.bat
+!/build/*.sh
 
 # Native MSVC/CUDA artifacts
 *.obj
@@ -30,6 +34,7 @@
 *.safetensors
 *.gguf
 *.f32
+/GLM-5.3-Flash-*/
 
 # Python
 __pycache__/

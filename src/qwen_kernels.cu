@@ -7,7 +7,7 @@ void rmsnorm_bf16(const float*x,const uint16_t*w,float*y,int r,int c,bool z,cuda
 __global__ void conv4(float*x,float*state,const uint16_t*w,int n){for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=blockDim.x*gridDim.x){float z=fmaf(state[i*3],bf(w+i*4),fmaf(state[i*3+1],bf(w+i*4+1),fmaf(state[i*3+2],bf(w+i*4+2),x[i]*bf(w+i*4+3))));state[i*3]=state[i*3+1];state[i*3+1]=state[i*3+2];state[i*3+2]=x[i];x[i]=z/(1+__expf(-z));}}
 void causal_conv4_silu(float*x,float*st,const uint16_t*w,int n,cudaStream_t s){conv4<<<(n+255)/256,256,0,s>>>(x,st,w,n);}
 __global__ void params(float*a,float*b,const float*A,const uint16_t*dt,int n){int i=threadIdx.x;if(i<n){b[i]=1/(1+__expf(-b[i]));float z=a[i]+bf(dt+i);float soft=z>20?z:log1pf(__expf(z));a[i]=-__expf(A[i])*soft;}}
-void deltanet_parameters(float*a,float*b,const float*A,const uint16_t*dt,int n,cudaStream_t s){params<<<1,32,0,s>>>(a,b,A,dt,n);}
+void deltanet_parameters(float*a,float*b,const float*A,const uint16_t*dt,int n,cudaStream_t s){params<<<1,64,0,s>>>(a,b,A,dt,n);}
 __global__ void sigmul(float*x,const float*g,int n){for(int i=blockIdx.x*256+threadIdx.x;i<n;i+=gridDim.x*256)x[i]*=1/(1+__expf(-g[i]));}void sigmoid_mul(float*x,const float*g,int n,cudaStream_t s){sigmul<<<(n+255)/256,256,0,s>>>(x,g,n);}
 }
 

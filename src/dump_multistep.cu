@@ -30,7 +30,8 @@ int wmain(int argc, wchar_t** argv) {
         std::vector<float> h(4096);
         auto mat = [&](const char* base, const float* in, float* out) {
             auto z = w.matrix(base);
-            insignia::mxfp4_gemv_v2((const uint32_t*)z.weight.data, (const uint8_t*)z.scales.data, in, out, z.rows, z.cols, x.stream);
+            if (z.insig4) insignia::mxfp4_gemv_v2_i4((const uint32_t*)z.weight.data, (const uint16_t*)z.scales.data, in, out, z.rows, z.cols, x.stream);
+            else insignia::mxfp4_gemv_v2((const uint32_t*)z.weight.data, (const uint8_t*)z.scales.data, in, out, z.rows, z.cols, x.stream);
             w.release(base);
         };
         int next = -1;

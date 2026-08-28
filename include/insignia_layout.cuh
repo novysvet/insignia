@@ -65,6 +65,8 @@ void mxfp4_gemm_v21(const uint32_t *weights, const uint8_t *scales, const void *
 void mxfp4_gemm_v2(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, int T, cudaStream_t stream = nullptr);
 // INSIG4 twins: E2M1 codes + fp16 scale per 64-element super-group.
 void mxfp4_gemm_mlx_i4(const uint32_t *weights, const uint16_t *scales, const float *x, float *y, int rows, int cols, int T, cudaStream_t stream = nullptr);
+void mxfp4_gemm_v21_i4(const uint32_t *weights, const uint16_t *scales, const void *x16, float *y, int rows, int cols, int T, cudaStream_t stream = nullptr);
+void mxfp4_gemm_ab_i4(const uint32_t *wa, const uint16_t *sa, const uint32_t *wb, const uint16_t *sb, const void *x16, float *ya, float *yb, int T, int cols, cudaStream_t stream = nullptr);
 void mxfp4_gemv_v2_i4(const uint32_t *weights, const uint16_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream = nullptr);
 void mxfp4_gemv2_q8_i4(const uint32_t *weights, const uint16_t *scales, const float *x, float *y, int rows, int cols, cudaStream_t stream = nullptr);
 void mxfp4_gemv_ab2_q8_i4(const uint32_t *wa, const uint16_t *sa, const uint32_t *wb, const uint16_t *sb, const float *x, float *ya, float *yb, int cols, cudaStream_t stream = nullptr);

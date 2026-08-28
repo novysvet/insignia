@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 // argv: index tokens(comma-separated) [chunk=64]
 // Teacher-forced NLL / perplexity over the token stream: prefill chunks of T through
@@ -20,10 +21,10 @@ __global__ void row_logp_kernel(const float *__restrict__ logits, const int *__r
     if (threadIdx.x < 32) {
         best = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -3.402823466e+38F;
         for (int m = 16; m; m >>= 1) best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, m));
-        if (!threadIdx.x) red[0] = best;
+        if (!threadIdx.x) red[8] = best;
     }
     __syncthreads();
-    const float mx = red[0];
+    const float mx = red[8];
     float s = 0;
     for (int i = threadIdx.x; i < vocab; i += blockDim.x) s += __expf(__ldg(l + i) - mx);
     for (int m = 16; m; m >>= 1) s += __shfl_xor_sync(0xffffffff, s, m);
@@ -32,12 +33,12 @@ __global__ void row_logp_kernel(const float *__restrict__ logits, const int *__r
     if (threadIdx.x < 32) {
         s = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
         for (int m = 16; m; m >>= 1) s += __shfl_xor_sync(0xffffffff, s, m);
-        if (!threadIdx.x) red[0] = s;
+        if (!threadIdx.x) red[9] = s;
     }
     __syncthreads();
     if (!threadIdx.x) {
         const float tgt = __ldg(l + __ldg(targets + row));
-        logp[row] = tgt - mx - __logf(red[0]);
+        logp[row] = tgt - mx - __logf(red[9]);
     }
 }
 int wmain(int argc, wchar_t **argv) {
@@ -74,9 +75,10 @@ int wmain(int argc, wchar_t **argv) {
             std::vector<int> tgt(tokens.begin() + done + 1, tokens.begin() + done + 1 + T);
             cudaMemcpyAsync(targets, tgt.data(), T * 4, cudaMemcpyHostToDevice, x.stream);
             {   // all-positions lm_head GEMM straight from the chunk's normalized activations
-                auto lh = w.matrix("language_model.lm_head");
-                insignia::mxfp4_gemm_mlx((const uint32_t *)lh.weight.data, (const uint8_t *)lh.scales.data, x.pf_n, logitsT, lh.rows, lh.cols, T, x.stream);
-                w.release("language_model.lm_head");
+            auto lh = w.matrix("language_model.lm_head");
+            if (lh.insig4) insignia::mxfp4_gemm_mlx_i4((const uint32_t *)lh.weight.data, (const uint16_t *)lh.scales.data, x.pf_n, logitsT, lh.rows, lh.cols, T, x.stream);
+            else insignia::mxfp4_gemm_mlx((const uint32_t *)lh.weight.data, (const uint8_t *)lh.scales.data, x.pf_n, logitsT, lh.rows, lh.cols, T, x.stream);
+            w.release("language_model.lm_head");
             }
             row_logp_kernel<<<T, 256, 0, x.stream>>>(logitsT, targets, logp, vocab);
             std::vector<float> lp(T);

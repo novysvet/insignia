@@ -2,6 +2,7 @@
 #include "insignia_layout.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 namespace insignia {
 
 // Gather T embedding rows (MXFP4 dequant) selected by device token ids.
@@ -26,7 +27,7 @@ __global__ void embed_gather_i4_kernel(const uint32_t *__restrict__ w, const uin
     const int t = blockIdx.x, g = threadIdx.x;
     const size_t row = __ldg(tokens + t);
     const uint4 packed = reinterpret_cast<const uint4 *>(w + row * 512)[g];
-    const float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(s + row * 64 + (g >> 1)));
+    const float scale = __half2float(*reinterpret_cast<const __half *>(s + row * 64 + (g >> 1)));
     float *o = out + static_cast<size_t>(t) * 4096 + g * 32;
     const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
     #pragma unroll
@@ -58,16 +59,17 @@ __global__ void qk_norm_rope_batch_kernel(float *__restrict__ q, float *__restri
     float v = p[tid], ss = v * v;
     for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
     __shared__ float mem[64];
+    __shared__ float nsc;  // norm scale lives apart: mem[0..63] is later clobbered by the roped staging
     int lane = tid & 31, warp = tid >> 5;
     if (lane == 0) mem[warp] = ss;
     __syncthreads();
     if (warp == 0) {
         ss = lane < 8 ? mem[lane] : 0;
         for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, m);
-        if (lane == 0) mem[0] = rsqrtf(ss / 256 + 1e-6f);
+        if (lane == 0) nsc = rsqrtf(ss / 256 + 1e-6f);
     }
     __syncthreads();
-    v *= mem[0] * __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(w + tid));
+    v *= nsc * __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(w + tid));
     const int pos = __ldg(pos_dev) + t;
     if (pos != 0 && tid < 64) mem[tid] = v;
     __syncthreads();
@@ -102,7 +104,7 @@ __global__ __launch_bounds__(256, 2) void gqa_prefill_kernel(const float *__rest
     const int tokens = __ldg(pos_dev) + t + 1;
     __shared__ float qs[256];
     __shared__ float score[4096];
-    __shared__ float red[8];
+    __shared__ float red[8], smx, sden;
     __shared__ float part[8][256];
     const float *qrow = q + (static_cast<size_t>(t) * 16 + head) * 256;
     qs[tid] = qrow[tid];
@@ -123,10 +125,10 @@ __global__ __launch_bounds__(256, 2) void gqa_prefill_kernel(const float *__rest
     if (warp == 0) {
         mx = lane < 8 ? red[lane] : -3.402823466e+38F;
         for (int m = 16; m; m >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, m));
-        if (lane == 0) red[0] = mx;
+        if (lane == 0) smx = mx;
     }
     __syncthreads();
-    mx = red[0];
+    mx = smx;
     float den = 0;
     for (int j = warp; j < tokens; j += 8) {
         float e = __expf(score[j] - mx);
@@ -138,10 +140,10 @@ __global__ __launch_bounds__(256, 2) void gqa_prefill_kernel(const float *__rest
     if (warp == 0) {
         den = lane < 8 ? red[lane] : 0;
         for (int m = 16; m; m >>= 1) den += __shfl_xor_sync(0xffffffff, den, m);
-        if (lane == 0) red[0] = 1.f / den;
+        if (lane == 0) sden = 1.f / den;
     }
     __syncthreads();
-    const float inv_den = red[0];
+    const float inv_den = sden;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int j = warp; j < tokens; j += 8) {
         const float p = score[j] * inv_den;
@@ -198,17 +200,20 @@ void conv_prefill_silu(float *x, float *scratch, float *state, const uint16_t *w
 }
 
 // Per-token decay/beta: a[t][h] = -exp(A_log)*softplus(a+dt), b[t][h] = sigmoid(b).
-__global__ void params_batch_kernel(float *__restrict__ a, float *__restrict__ b, const float *__restrict__ A_log, const uint16_t *__restrict__ dt, int T) {
+__global__ void params_batch_kernel(float *__restrict__ a, float *__restrict__ b, const float *__restrict__ A_log, const uint16_t *__restrict__ dt, int T, int H) {
     const int t = blockIdx.x, h = threadIdx.x;
-    if (h >= 32) return;
-    float *ar = a + static_cast<size_t>(t) * 32, *br = b + static_cast<size_t>(t) * 32;
+    if (h >= H) return;
+    float *ar = a + static_cast<size_t>(t) * H, *br = b + static_cast<size_t>(t) * H;
     br[h] = 1.f / (1.f + __expf(-br[h]));
     const float z = ar[h] + __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(dt + h));
     const float soft = z > 20 ? z : log1pf(__expf(z));
     ar[h] = -__expf(A_log[h]) * soft;
 }
 void deltanet_params_batch(float *a, float *b, const float *A_log, const uint16_t *dt_bias, int T, cudaStream_t stream) {
-    params_batch_kernel<<<T, 32, 0, stream>>>(a, b, A_log, dt_bias, T);
+    params_batch_kernel<<<T, 64, 0, stream>>>(a, b, A_log, dt_bias, T, 32);   // 9B head count; 27B callers pass their own H below
+}
+void deltanet_params_batch_h(float *a, float *b, const float *A_log, const uint16_t *dt_bias, int T, int H, cudaStream_t stream) {
+    params_batch_kernel<<<T, 64, 0, stream>>>(a, b, A_log, dt_bias, T, H);
 }
 
 // Sequential gated DeltaNet over T tokens; one block per value head, state in shared.
@@ -305,7 +310,7 @@ __global__ void spec_rollback_kernel(const float *__restrict__ snap_delta, const
     const int n = 24 * 32 * 128 * 128;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) delta_state[i] = snap_delta[i];
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 24 * 8192 * 3; i += gridDim.x * blockDim.x) conv_state[i] = snap_conv[i];
-    if (blockIdx.x == 0 && threadIdx.x < 4096) hidden[threadIdx.x] = pf_x[threadIdx.x];  // row0's hidden
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 4096; i += gridDim.x * blockDim.x) hidden[i] = pf_x[i];  // row0's hidden
 }
 void spec_rollback(const float *snap_delta, const float *snap_conv, float *delta_state, float *conv_state, const float *pf_x, float *hidden, const int *pos, cudaStream_t stream) {
     spec_rollback_kernel<<<512, 256, 0, stream>>>(snap_delta, snap_conv, delta_state, conv_state, pf_x, hidden, pos);

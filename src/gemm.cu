@@ -1,5 +1,8 @@
+#include <stdexcept>
+#include <string>
 #include "insignia_layout.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <mma.h>
 namespace insignia {
 using namespace nvcuda;
@@ -72,7 +75,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemm_mlx_kernel(const uint32_t *__r
 }
 
 void mxfp4_gemm_mlx(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, int T, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31) || T <= 0 || (rows & 63)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31) || T <= 0 || (rows & 63)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     const int blocks = rows >> 6;
     mxfp4_gemm_mlx_kernel<<<blocks, 256, 0, stream>>>(weights, scales, x, y, rows, cols, T);
 }
@@ -176,7 +179,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemm_v2_kernel(const uint32_t *__re
 }
 
 void mxfp4_gemm_v2(const uint32_t *weights, const uint8_t *scales, const float *x, float *y, int rows, int cols, int T, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 63) || T <= 0 || (rows & 63)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 63) || T <= 0 || (rows & 63)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     mxfp4_gemm_v2_kernel<<<rows >> 6, 256, 0, stream>>>(weights, scales, x, y, rows, cols, T);
 }
 }
@@ -269,7 +272,8 @@ __global__ __launch_bounds__(256) void mxfp4_gemm_v21_kernel(const uint32_t *__r
     for (int kb = 0; kb < ksteps; kb++) {
         const int buf = kb & 1;
         if (kb + 1 < ksteps) { prefetch(kb + 1, buf ^ 1); cp_async_commit(); }
-        cp_async_wait_prev();   // current buf's loads complete (one group back)
+        if (kb + 2 < ksteps) cp_async_wait_prev();   // current buf's loads complete (one group back)
+        else cp_async_wait_all();                    // tail: no group was committed this step
         __syncthreads();
         dequant(kb, buf);       // Bs[buf] ready after this sync
         __syncthreads();
@@ -287,7 +291,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemm_v21_kernel(const uint32_t *__r
 }
 
 void mxfp4_gemm_v21(const uint32_t *weights, const uint8_t *scales, const void *x16, float *y, int rows, int cols, int T, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 63) || T <= 0 || (rows & 31)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 63) || T <= 0 || (rows & 31)) throw std::runtime_error("insignia: bad GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     mxfp4_gemm_v21_kernel<<<rows >> 5, 256, 0, stream>>>(weights, scales, (const __nv_bfloat16 *)x16, y, rows, cols, T);
 }
 }
@@ -323,7 +327,7 @@ __global__ __launch_bounds__(256) void mxfp4_gemm_mlx_i4_kernel(const uint32_t *
         {
             const int n = tid >> 2, w = tid & 3;
             const uint32_t word = weights[static_cast<size_t>(n0 + n) * groups * 4 + (k0 >> 3) + w];
-            const float scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(sg_scales + static_cast<size_t>(n0 + n) * (groups >> 1) + ((k0 >> 5) >> 1)));
+            const float scale = __half2float(*reinterpret_cast<const __half *>(sg_scales + static_cast<size_t>(n0 + n) * (groups >> 1) + ((k0 >> 5) >> 1)));
             alignas(16) __nv_bfloat16 outv[8];
             #pragma unroll
             for (int j = 0; j < 8; j++) outv[j] = __float2bfloat16(decode4(word, j) * scale);
@@ -348,7 +352,196 @@ __global__ __launch_bounds__(256) void mxfp4_gemm_mlx_i4_kernel(const uint32_t *
     wmma::store_matrix_sync(y + static_cast<size_t>(warp_m << 4) * rows + n0 + (warp_n << 5) + 16, acc1, rows, wmma::mem_row_major);
 }
 void mxfp4_gemm_mlx_i4(const uint32_t *weights, const uint16_t *scales, const float *x, float *y, int rows, int cols, int T, cudaStream_t stream) {
-    if (rows <= 0 || cols <= 0 || (cols & 31) || T <= 0 || (rows & 63)) return;
+    if (rows <= 0 || cols <= 0 || (cols & 31) || T <= 0 || (rows & 63)) throw std::runtime_error("insignia: bad GEMV/GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
     mxfp4_gemm_mlx_i4_kernel<<<rows >> 6, 256, 0, stream>>>(weights, scales, x, y, rows, cols, T);
+}
+}
+namespace insignia {
+using namespace nvcuda;
+
+// Pipelined INSIG4 prefill GEMM v2.1: Y[T,rows] = X16[T,cols] * W[rows,cols]^T, X16 bf16.
+// Identical pipeline to mxfp4_gemm_v21 (64x32 tile, 256 threads, KT=64, cp.async double
+// buffer, wmma 16x16x16 bf16 / f32 acc, 256-entry pair-LUT dequant). Only the scale path
+// differs: INSIG4 has ONE fp16 scale per 64-element super-group per row, and a KT=64 step
+// covers exactly one super-group -> scale index = kb (e8m0 needed kb*2 + half).
+// B nibble packing is identical to MLX MXFP4 (4 u32 per 32-elt group), so the prefetch
+// geometry is v21 verbatim. Requires rows%32==0, cols%1024==0, 1<=T<=64, X16 zero-padded
+// to 64 rows. Store is guarded: only A-tiles with wm*16 < T are written (callers' pf_*
+// buffers are 64-row, so a tile straddling T still writes harmless scratch rows).
+__global__ __launch_bounds__(256) void mxfp4_gemm_v21_i4_kernel(const uint32_t *__restrict__ weights, const uint16_t *__restrict__ scales, const __nv_bfloat16 *__restrict__ x16, float *__restrict__ y, int rows, int cols, int T) {
+    constexpr int KT = 64, NT = 32;
+    constexpr int APAD = 8, BPAD = 8;
+    __shared__ __nv_bfloat16 As[2][64][KT + APAD];
+    __shared__ __nv_bfloat16 Bs[2][NT][KT + BPAD];
+    __shared__ uint32_t Braw[2][NT][8];
+    __shared__ uint32_t lut[256];             // INSIG4 E2M1 == MXFP4 code space: v21 table verbatim
+    {
+        const unsigned tbl[16] = {0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
+                                  0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
+        lut[threadIdx.x] = tbl[threadIdx.x & 15] | (tbl[(threadIdx.x >> 4) & 15] << 16);
+    }
+    const int groups = cols >> 5;             // 32-elt nibble groups per row; scales stride groups>>1
+    const int n0 = blockIdx.x * NT;
+    const int tid = threadIdx.x;
+
+    auto prefetch = [&](int kb, int buf) {
+        const int k = kb * KT;
+        {
+            const char *ag = reinterpret_cast<const char *>(x16);
+            for (int i = tid; i < 64 * (KT / 8); i += 256) {
+                const int m = i / (KT / 8), c8 = i % (KT / 8);
+                const size_t srcoff = (size_t(m) * cols + k) * 2 + c8 * 16;
+                cp_async16(&As[buf][m][c8 * 8], ag + srcoff);
+            }
+        }
+        {
+            for (int i = tid; i < NT * 2; i += 256) {
+                const int n = i >> 1, half = i & 1;
+                cp_async16(&Braw[buf][n][half * 4], reinterpret_cast<const char *>(weights + size_t(n0 + n) * groups * 4 + k / 8 + half * 4));
+            }
+        }
+    };
+    auto dequant = [&](int kb, int buf) {    // ONE fp16 super-group scale per row per step
+        const int n = tid >> 3, w = tid & 7;
+        const float sc = __half2float(__ldg(reinterpret_cast<const __half *>(scales) + size_t(n0 + n) * (groups >> 1) + kb));
+        const uint32_t word = Braw[buf][n][w];
+        __nv_bfloat16 out[8];
+        #pragma unroll
+        for (int byt = 0; byt < 4; byt++) {
+            const uint32_t pair = lut[(word >> (byt * 8)) & 0xff];
+            const float lo = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&pair));
+            const float hi = __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(&pair)[1]);
+            out[byt * 2 + 0] = __float2bfloat16(lo * sc);
+            out[byt * 2 + 1] = __float2bfloat16(hi * sc);
+        }
+        *reinterpret_cast<uint4 *>(&Bs[buf][n][w * 8]) = *reinterpret_cast<const uint4 *>(out);
+    };
+
+    const int ksteps = cols / KT;
+    prefetch(0, 0);
+    cp_async_commit();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.f);
+    const int warp = tid >> 5;
+    const int wm = warp >> 1, wn = warp & 1;
+
+    for (int kb = 0; kb < ksteps; kb++) {
+        const int buf = kb & 1;
+        if (kb + 1 < ksteps) { prefetch(kb + 1, buf ^ 1); cp_async_commit(); }
+        if (kb + 2 < ksteps) cp_async_wait_prev();
+        else cp_async_wait_all();
+        __syncthreads();
+        dequant(kb, buf);
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[4];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[4];
+        #pragma unroll
+        for (int kh = 0; kh < 4; kh++) {
+            wmma::load_matrix_sync(af[kh], &As[buf][wm * 16][kh * 16], KT + APAD);
+            wmma::load_matrix_sync(bf[kh], &Bs[buf][wn * 16][kh * 16], KT + BPAD);
+            wmma::mma_sync(acc, af[kh], bf[kh], acc);
+        }
+        __syncthreads();
+    }
+    if (wm * 16 < T) wmma::store_matrix_sync(y + size_t(wm * 16) * rows + n0 + wn * 16, acc, rows, wmma::mem_row_major);
+}
+
+void mxfp4_gemm_v21_i4(const uint32_t *weights, const uint16_t *scales, const void *x16, float *y, int rows, int cols, int T, cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0 || (cols & 1023) || T <= 0 || (rows & 31)) throw std::runtime_error("insignia: bad GEMM dims rows=" + std::to_string(rows) + " cols=" + std::to_string(cols));
+    if (T > 64) throw std::runtime_error("insignia: mxfp4_gemm_v21_i4 T=" + std::to_string(T) + " exceeds the 64-row A tile");
+    mxfp4_gemm_v21_i4_kernel<<<rows >> 5, 256, 0, stream>>>(weights, scales, (const __nv_bfloat16 *)x16, y, rows, cols, T);
+}
+
+// a/b monster-killer: BOTH in_proj_a and in_proj_b for all T tokens in ONE launch
+// (replaces the T x 2 per-token GEMV loop: at T=64 that was 3072 launches ~ 9-12 ms
+// per 64-token chunk). Two blocks, v21_i4 tile pipeline verbatim; block 0 walks a's
+// 32 rows -> ya[T,32], block 1 walks b's 32 rows -> yb[T,32]. A (x16) shared, block 1
+// hits L2. Both tensors are 9B in_proj_a/b with EXACTLY 32 rows (baked in).
+__global__ __launch_bounds__(256) void mxfp4_gemm_ab_i4_kernel(const uint32_t *__restrict__ wa, const uint16_t *__restrict__ sa, const uint32_t *__restrict__ wb, const uint16_t *__restrict__ sb, const __nv_bfloat16 *__restrict__ x16, float *__restrict__ ya, float *__restrict__ yb, int cols, int T) {
+    constexpr int KT = 64, NT = 32;
+    constexpr int APAD = 8, BPAD = 8;
+    __shared__ __nv_bfloat16 As[2][64][KT + APAD];
+    __shared__ __nv_bfloat16 Bs[2][NT][KT + BPAD];
+    __shared__ uint32_t Braw[2][NT][8];
+    __shared__ uint32_t lut[256];
+    {
+        const unsigned tbl[16] = {0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
+                                  0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
+        lut[threadIdx.x] = tbl[threadIdx.x & 15] | (tbl[(threadIdx.x >> 4) & 15] << 16);
+    }
+    const int groups = cols >> 5;
+    const uint32_t *weights = blockIdx.x ? wb : wa;   // uniform per block: no divergence
+    const uint16_t *scales = blockIdx.x ? sb : sa;
+    float *y = blockIdx.x ? yb : ya;                  // [T,32] outputs, row stride 32
+    const int tid = threadIdx.x;
+
+    auto prefetch = [&](int kb, int buf) {
+        const int k = kb * KT;
+        {
+            const char *ag = reinterpret_cast<const char *>(x16);
+            for (int i = tid; i < 64 * (KT / 8); i += 256) {
+                const int m = i / (KT / 8), c8 = i % (KT / 8);
+                const size_t srcoff = (size_t(m) * cols + k) * 2 + c8 * 16;
+                cp_async16(&As[buf][m][c8 * 8], ag + srcoff);
+            }
+        }
+        {
+            for (int i = tid; i < NT * 2; i += 256) {
+                const int n = i >> 1, half = i & 1;
+                cp_async16(&Braw[buf][n][half * 4], reinterpret_cast<const char *>(weights + size_t(n) * groups * 4 + k / 8 + half * 4));
+            }
+        }
+    };
+    auto dequant = [&](int kb, int buf) {
+        const int n = tid >> 3, w = tid & 7;
+        const float sc = __half2float(__ldg(reinterpret_cast<const __half *>(scales) + size_t(n) * (groups >> 1) + kb));
+        const uint32_t word = Braw[buf][n][w];
+        __nv_bfloat16 out[8];
+        #pragma unroll
+        for (int byt = 0; byt < 4; byt++) {
+            const uint32_t pair = lut[(word >> (byt * 8)) & 0xff];
+            const float lo = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&pair));
+            const float hi = __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(&pair)[1]);
+            out[byt * 2 + 0] = __float2bfloat16(lo * sc);
+            out[byt * 2 + 1] = __float2bfloat16(hi * sc);
+        }
+        *reinterpret_cast<uint4 *>(&Bs[buf][n][w * 8]) = *reinterpret_cast<const uint4 *>(out);
+    };
+
+    const int ksteps = cols / KT;
+    prefetch(0, 0);
+    cp_async_commit();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.f);
+    const int warp = tid >> 5;
+    const int wm = warp >> 1, wn = warp & 1;
+
+    for (int kb = 0; kb < ksteps; kb++) {
+        const int buf = kb & 1;
+        if (kb + 1 < ksteps) { prefetch(kb + 1, buf ^ 1); cp_async_commit(); }
+        if (kb + 2 < ksteps) cp_async_wait_prev();
+        else cp_async_wait_all();
+        __syncthreads();
+        dequant(kb, buf);
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[4];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[4];
+        #pragma unroll
+        for (int kh = 0; kh < 4; kh++) {
+            wmma::load_matrix_sync(af[kh], &As[buf][wm * 16][kh * 16], KT + APAD);
+            wmma::load_matrix_sync(bf[kh], &Bs[buf][wn * 16][kh * 16], KT + BPAD);
+            wmma::mma_sync(acc, af[kh], bf[kh], acc);
+        }
+        __syncthreads();
+    }
+    if (wm * 16 < T) wmma::store_matrix_sync(y + size_t(wm * 16) * 32 + wn * 16, acc, 32, wmma::mem_row_major);
+}
+
+void mxfp4_gemm_ab_i4(const uint32_t *wa, const uint16_t *sa, const uint32_t *wb, const uint16_t *sb, const void *x16, float *ya, float *yb, int T, int cols, cudaStream_t stream) {
+    if (cols <= 0 || (cols & 1023)) throw std::runtime_error("insignia: bad ab GEMM cols=" + std::to_string(cols));
+    if (T <= 0 || T > 64) throw std::runtime_error("insignia: ab GEMM T=" + std::to_string(T) + " outside 1..64");
+    mxfp4_gemm_ab_i4_kernel<<<2, 256, 0, stream>>>(wa, sa, wb, sb, (const __nv_bfloat16 *)x16, ya, yb, cols, T);
 }
 }

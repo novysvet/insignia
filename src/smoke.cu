@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 __global__ void smoke(uint32_t *out) { out[0] = (uint32_t)(blockIdx.x * blockDim.x + threadIdx.x); }

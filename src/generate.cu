@@ -1,5 +1,8 @@
 #include "insignia_decode.hpp"
+#include "insignia_layout.cuh"
+#include "insignia_prefill.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -7,7 +10,92 @@
 // Prefill runs batched chunks, then the whole speculative step (MTP draft + pair verify +
 // device-side commit/rollback) is captured as one CUDA graph and replayed back-to-back.
 // The host only checks the committed id stream every few steps for EOS/max_new.
+
+// NLL mode: "nll" <index> <tokens> — teacher-forced perplexity via batched chunks.
+__global__ void row_logp_kernel(const float *__restrict__ logits, const int *__restrict__ targets, float *__restrict__ logp, int vocab) {
+    const int row = blockIdx.x;
+    const float *l = logits + size_t(row) * vocab;
+    __shared__ float red[32];
+    float best = -3.402823466e+38F;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) best = fmaxf(best, __ldg(l + i));
+    for (int m = 16; m; m >>= 1) best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, m));
+    if (!(threadIdx.x & 31)) red[threadIdx.x >> 5] = best;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        best = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -3.402823466e+38F;
+        for (int m = 16; m; m >>= 1) best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, m));
+        if (!threadIdx.x) red[8] = best;
+    }
+    __syncthreads();
+    const float mx = red[8];
+    float sum = 0;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) sum += __expf(__ldg(l + i) - mx);
+    for (int m = 16; m; m >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, m);
+    if (!(threadIdx.x & 31)) red[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
+        for (int m = 16; m; m >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, m);
+        if (!threadIdx.x) red[9] = sum;
+    }
+    __syncthreads();
+    if (!threadIdx.x) {
+        const float tgt = __ldg(l + __ldg(targets + row));
+        logp[row] = tgt - mx - __logf(red[9]);
+    }
+}
+static int run_nll(int argc, wchar_t **argv) {
+    insignia::ModelFile m(argv[2]);
+    std::vector<int> tokens;
+    {
+        char buf[1 << 20];
+        size_t n = wcstombs(buf, argv[3], sizeof(buf) - 1);
+        buf[n] = 0;
+        for (char *s2 = strtok(buf, ","); s2; s2 = strtok(nullptr, ",")) tokens.push_back(atoi(s2));
+    }
+    if (tokens.size() < 2) return 2;
+    insignia::DecodeWorkspace x(4096);
+    insignia::Qwen35Weights w(m, 6ull << 30, x.stream);
+    insignia::Qwen35Decode d(w, x);
+    const int vocab = insignia::Qwen35Shape::vocab;
+    float *logitsT;
+    if (cudaMalloc(&logitsT, size_t(64) * vocab * 4)) throw std::runtime_error("logits alloc");
+    int *targets;
+    cudaMalloc(&targets, 64 * 4);
+    float *logp;
+    cudaMalloc(&logp, 64 * 4);
+    double total = 0;
+    size_t count = 0, done = 0;
+    while (done + 1 < tokens.size()) {
+        const size_t remain = tokens.size() - done - 1;
+        const int T = int(remain) >= 64 ? 64 : int(remain);
+        d.prefill_chunk(tokens.data() + done, T);
+        std::vector<int> tgt(tokens.begin() + done + 1, tokens.begin() + done + 1 + T);
+        cudaMemcpyAsync(targets, tgt.data(), T * 4, cudaMemcpyHostToDevice, x.stream);
+        {
+            auto lh = w.matrix("language_model.lm_head");
+            const bool i4 = lh.insig4;
+            if (i4) insignia::mxfp4_gemm_mlx_i4((const uint32_t *)lh.weight.data, (const uint16_t *)lh.scales.data, x.pf_n, logitsT, lh.rows, lh.cols, T, x.stream);
+            else insignia::mxfp4_gemm_mlx((const uint32_t *)lh.weight.data, (const uint8_t *)lh.scales.data, x.pf_n, logitsT, lh.rows, lh.cols, T, x.stream);
+            w.release("language_model.lm_head");
+        }
+        row_logp_kernel<<<T, 256, 0, x.stream>>>(logitsT, targets, logp, vocab);
+        std::vector<float> lp(T);
+        cudaMemcpyAsync(lp.data(), logp, T * 4, cudaMemcpyDeviceToHost, x.stream);
+        cudaStreamSynchronize(x.stream);
+        for (float v : lp) total += -double(v);
+        count += T;
+        done += T;
+    }
+    printf("tokens=%zu nll=%.4f ppl=%.5f\n", count, total, exp(total / count));
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc > 3 && wcscmp(argv[1], L"nll") == 0) {
+        try { return run_nll(argc, argv); }
+        catch (const std::exception& e) { fprintf(stderr, "%s\n", e.what()); return 3; }
+    }
     if (argc < 4) return 2;
     try {
         insignia::ModelFile m(argv[1]);
@@ -22,7 +110,9 @@ int wmain(int argc, wchar_t** argv) {
         int max_new = _wtoi(argv[3]);
         if (tokens.empty() || max_new <= 0) return 2;
         int ctx = int(tokens.size()) + max_new + 16;
-        if (ctx > 4090) ctx = 4090;
+        // graph replay bypasses the eager KV-full guard, so over-budget runs must be
+        // rejected here rather than clamped (clamped ctx + unclamped want_total = OOB KV)
+        if (ctx > 4090) throw std::runtime_error("context overflow: prompt+max_new+16 exceeds the 4090 cache cap; reduce max_new");
         insignia::DecodeWorkspace x(ctx);
         insignia::Qwen35Weights w(m, 6ull << 30, x.stream);
         insignia::Qwen35Decode d(w, x);

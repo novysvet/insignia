@@ -11,6 +11,7 @@ void store_kv_batch(const float *k, const float *v, float *kc, float *vc, const 
 void gqa_prefill(const float *q, const float *kc, const float *vc, float *out, const int *pos_dev, int T, int max_context, cudaStream_t stream = nullptr);
 void conv_prefill_silu(float *x, float *scratch, float *state, const uint16_t *w, int T, cudaStream_t stream = nullptr, float *row0_snap = nullptr);
 void deltanet_params_batch(float *a, float *b, const float *A_log, const uint16_t *dt_bias, int T, cudaStream_t stream = nullptr);
+void deltanet_params_batch_h(float *a, float *b, const float *A_log, const uint16_t *dt_bias, int T, int heads, cudaStream_t stream = nullptr);
 void deltanet_prefill(float *state, const float *qkv, const float *a, const float *b, float *out, int T, cudaStream_t stream = nullptr, float *row0_snap = nullptr);
 void addi_kernel_launch(int *p, int v, cudaStream_t stream = nullptr);
 // Device-state speculative step plumbing (graph replayable).

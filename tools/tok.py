@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-import argparse,json,pathlib,struct
+"""Tokenize/detokenize with the GLM-5.3 tokenizer (fast tokenizers only).
+Usage: tok.py 'prompt text'      -> prints comma-separated token ids
+       tok.py --decode 1,2,3     -> prints text
+"""
+import sys
 from tokenizers import Tokenizer
 
-def main():
- p=argparse.ArgumentParser();p.add_argument('model_dir',type=pathlib.Path);p.add_argument('text');p.add_argument('--chat',action='store_true');p.add_argument('--decode',type=int,nargs='*');a=p.parse_args()
- tok=Tokenizer.from_file(str(a.model_dir/'tokenizer.json'))
- if a.decode is not None:
-  print(tok.decode(a.decode,skip_special_tokens=False));return
- text=a.text
- if a.chat:
-  tpl=(a.model_dir/'chat_template.jinja').read_text(encoding='utf-8')
-  try:
-   from jinja2 import Environment
-  except ImportError: raise SystemExit('pip install jinja2')
-  text=Environment().from_string(tpl).render(messages=[{'role':'user','content':text}],add_generation_prompt=True,enable_thinking=False,tools=None)
- ids=tok.encode(text,add_special_tokens=False).ids
- print(json.dumps({'text':text,'ids':ids},ensure_ascii=False))
-if __name__=='__main__':main()
+tok = Tokenizer.from_file("/mnt/e/coding/Insignia/GLM-5.3-Flash-ABLITERATED-NVFP4/tokenizer.json")
+if sys.argv[1] in ("--decode", "-d"):
+    ids = [int(x) for x in sys.argv[2].split(",") if x.strip()]
+    print(tok.decode(ids))
+elif sys.argv[1] in ("--file", "-f"):
+    ids = tok.encode(open(sys.argv[2], encoding="utf-8").read()).ids
+    print(",".join(map(str, ids)))
+else:
+    ids = tok.encode(sys.argv[1]).ids
+    print(",".join(map(str, ids)))

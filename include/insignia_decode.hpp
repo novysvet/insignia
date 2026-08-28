@@ -22,6 +22,7 @@ public:
  void forward_token(int token);          // processes token at position x.position, then bumps
  int decode_token(int token);            // forward_token + argmax
  int prefill_chunk(const int *tokens, int T);  // batched forward over T<=64 tokens, returns argmax after last
+ void prefill_chunk_seam(const int *tokens, int T, void(*seam)(int layer,const float*pf_x,int T,void*user),void*user);  // parity-dump variant
  int spec_step(int next_token);  // one speculative iteration: pair forward + MTP draft; commits 2 tokens, returns the next undecided token
  int spec_second{};bool spec_accepted{};  // second committed token of the last spec_step and whether the draft hit
  int logits_argmax();                    // argmax of x.logits into next_dev, returns it
@@ -45,6 +46,7 @@ private:
  DeviceView tensor(const std::string&name);
  void forward_body();                    // embed..lm_head over device token/pos
  void prefill_chunk_device(const int*tokens_dev,int T);  // batched forward, argmax into next_dev (no sync)
+ void prefill_chunk_device(const int*tokens_dev,int T,void(*seam)(int layer,const float*pf_x,int T,void*user),void*user);  // parity-dump variant: seam fires after each layer
  Qwen35Weights&w_;DecodeWorkspace&x_;cudaGraphExec_t graph_{},spec_graph_{};bool captured_{};
 };
 }

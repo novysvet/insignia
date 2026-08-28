@@ -1,0 +1,2 @@
+Question: A factory produces 247 widgets per hour. The factory operates 13 hours per day, 6 days per week. How many widgets does it produce in 4 weeks? Show your reasoning step by step, then give the final answer.
+Answer:

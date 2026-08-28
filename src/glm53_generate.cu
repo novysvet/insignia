@@ -561,6 +561,7 @@ public:
             vram_budget_mb_ = std::max(0, std::atoi(budget));
         for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
         start_pool();
+        load_pin_list();
     }
     ~ExpertStager() {
         stop_pool();
@@ -595,6 +596,61 @@ public:
             start_read(window, key, layer, experts[index], false);
             ++prefetch_started_;
         }
+    }
+
+    // Static hot-set pinning: a trace-derived list of the hottest experts
+    // per sparse layer is loaded into dedicated windows (and, later, VRAM
+    // slots) that eviction can never reclaim. Real-text routing entropy is
+    // ~5 bits (not the 8.17 maximum), so the top-8 per layer alone covers
+    // ~40% of accesses — capacity the recency-only LRU never captures.
+    void load_pin_list() {
+        const char *path = std::getenv("INSIGNIA_GLM53_PIN_LIST");
+        if (!path || !*path) return;
+        int per_layer = 8, per_layer_device = 2;
+        if (const char *value = std::getenv("INSIGNIA_GLM53_PIN_HOST"))
+            per_layer = std::max(0, std::atoi(value));
+        if (const char *value = std::getenv("INSIGNIA_GLM53_PIN_DEV"))
+            per_layer_device = std::max(0, std::atoi(value));
+        std::FILE *file = std::fopen(path, "r");
+        if (!file) {
+            std::printf("pin list: cannot open %s, ignoring\n", path);
+            return;
+        }
+        std::vector<int> staged;
+        int layer = -1, taken = 0, taken_device = 0, pinned_count = 0;
+        int parsed_layer = 0, parsed_expert = 0, parsed_hits = 0;
+        while (std::fscanf(file, "%d %d %d", &parsed_layer, &parsed_expert, &parsed_hits) == 3) {
+            if (parsed_layer != layer) {
+                layer = parsed_layer;
+                taken = 0;
+                taken_device = 0;
+            }
+            if (taken >= per_layer) continue;
+            if (int(free_windows_.size()) <= 16) break;
+            const uint32_t key = route_key(layer, parsed_expert);
+            if (flight_index_.count(key)) {
+                ++taken;
+                ++taken_device;
+                continue;
+            }
+            const int window = free_windows_.back();
+            free_windows_.pop_back();
+            start_read(window, key, layer, parsed_expert, false);
+            windows_[size_t(window)].pinned = true;
+            staged.push_back(window);
+            if (taken < per_layer_device) pinned_device_keys_.insert(key);
+            ++taken;
+            ++taken_device;
+            ++pinned_count;
+        }
+        std::fclose(file);
+        for (int window : staged) wait_and_consume_error(window);
+        for (int window : staged)
+            if (windows_[size_t(window)].error)
+                windows_[size_t(window)].pinned = false;
+        if (pinned_count)
+            std::printf("pin list: %d hot records pinned in host tier (%zu VRAM keys)\n",
+                        pinned_count, pinned_device_keys_.size());
     }
 
     void load_batch(int layer, const std::array<int, 8> &experts, int count = 8,
@@ -749,6 +805,8 @@ public:
                 state.copy_issued = true;
                 device_index_.emplace(key, device_slot);
                 device_slot_keys_[size_t(device_slot)] = key;
+                device_slot_pinned_[size_t(device_slot)] =
+                    pinned_device_keys_.count(key) ? 1 : 0;
             }
             device_slot_stamps_[size_t(device_slot)] = ++device_stamp_;
             active_device_ = device_arena_ + size_t(device_slot) * device_stride_;
@@ -772,8 +830,7 @@ public:
         }
         active_ = state.layout;
         active_globals_ = state.globals;
-        if (batch_populate_[size_t(slot)] && batch_admit_[size_t(slot)]) {
-            // Admitted: the window stays resident in the host LRU; eviction
+        if (state.pinned || (batch_populate_[size_t(slot)] && batch_admit_[size_t(slot)])) {            // Admitted: the window stays resident in the host LRU; eviction
             // re-checks copy_done before the slot can be refilled. The pinned
             // window now owns the bytes, so drop the page-cache shadow.
             if (l2_mode_ && state.l2_shard >= 0)
@@ -823,7 +880,7 @@ private:
         uint32_t key = kNoKey;
         int layer = -1, expert = -1;
         bool demand = false, done = true, claimed = false, copy_issued = false;
-        bool releasing = false;
+        bool releasing = false, pinned = false;
         uint64_t stamp = 0;
         unsigned hits = 0;
         Layout layout{};
@@ -878,6 +935,7 @@ private:
         device_slot_count_ = int(attempt);
         device_slot_keys_.assign(attempt, kNoKey);
         device_slot_stamps_.assign(attempt, 0);
+        device_slot_pinned_.assign(attempt, 0);
         device_slot_reads_.resize(attempt, nullptr);
         for (cudaEvent_t &event : device_slot_reads_)
             check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
@@ -903,6 +961,7 @@ private:
         int victim = -1;
         for (int index = begin; index < end; ++index) {
             if (index == active_device_slot_) continue;  // fence not recorded yet
+            if (device_slot_pinned_[size_t(index)]) continue;
             if (device_slot_keys_[size_t(index)] == kNoKey) return index;
             if (victim < 0 ||
                 device_slot_stamps_[size_t(index)] < device_slot_stamps_[size_t(victim)])
@@ -922,6 +981,7 @@ private:
         state.done = false;
         state.claimed = false;
         state.copy_issued = false;
+        state.pinned = false;
         state.stamp = 0;
         state.hits = 0;
         state.error = nullptr;
@@ -986,7 +1046,9 @@ private:
         int victim = -1;
         for (int window = 0; window < window_count_; ++window) {
             const WindowState &state = windows_[size_t(window)];
-            if (state.key == kNoKey || !state.done || state.claimed || state.releasing) continue;
+            if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
+                state.pinned)
+                continue;
             if (victim < 0 || state.stamp < windows_[size_t(victim)].stamp) victim = window;
         }
         if (victim < 0) {
@@ -1225,6 +1287,8 @@ private:
     uint64_t device_stamp_ = 0;
     std::vector<uint32_t> device_slot_keys_;
     std::vector<uint64_t> device_slot_stamps_;
+    std::vector<uint8_t> device_slot_pinned_;
+    std::unordered_set<uint32_t> pinned_device_keys_;
     std::vector<cudaEvent_t> device_slot_reads_;
     std::unordered_map<uint32_t, int> device_index_;
     uint64_t device_hits_ = 0, device_lookups_ = 0;

@@ -20,6 +20,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("trace")
     parser.add_argument("--cap", type=int, default=64)
+    parser.add_argument("--max-tokens", type=int, default=0,
+                        help="keep batches no wider than this (0 keeps all)")
     args = parser.parse_args()
 
     groups = []
@@ -29,6 +31,8 @@ def main():
             if len(fields) < 6:
                 continue
             batch, layer, tokens, recorded, predicted_count, actual_count = fields[:6]
+            if args.max_tokens and tokens > args.max_tokens:
+                continue
             payload = fields[6:]
             if len(payload) != 16 * tokens:
                 raise RuntimeError(f"bad payload for batch {batch} layer {layer}")

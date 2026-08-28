@@ -2083,6 +2083,25 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
               mla_keys_.get() + size_t(slot) * expanded_stride,
               mla_values_.get() + size_t(slot) * expanded_stride,
               mla_output_, position, mla_heads_, mla_head_dim_), "legacy MLA attention");
+        if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&
+            position >= 4 && position <= 6) {
+            const std::filesystem::path dir = std::getenv("INSIGNIA_GLM53_MLA_DUMP");
+            std::filesystem::create_directories(dir);
+            const auto save_dev = [&](const std::string &name, const void *device, size_t bytes) {
+                std::vector<uint8_t> host(bytes);
+                check(cudaMemcpy(host.data(), device, bytes, cudaMemcpyDeviceToHost), name.c_str());
+                std::FILE *file = std::fopen((dir / name).string().c_str(), "wb");
+                std::fwrite(host.data(), 1, bytes, file);
+                std::fclose(file);
+            };
+            const std::string tag = "legacy.dec" + std::to_string(position) + ".";
+            save_dev(tag + "q.bin", mla_query_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
+            save_dev(tag + "out.bin", mla_output_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
+            save_dev(tag + "keys.bin", mla_keys_.get() + size_t(slot) * expanded_stride,
+                     size_t(position + 1) * q_b_rows_ * sizeof(float));
+            save_dev(tag + "values.bin", mla_values_.get() + size_t(slot) * expanded_stride,
+                     size_t(position + 1) * q_b_rows_ * sizeof(float));
+        }
         linear(stem + "o_proj.weight", mla_output_, output, hidden_, q_b_rows_);
         return;
     }
@@ -2245,8 +2264,6 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
     for (int slot = 0; slot < moe_topk_; ++slot) denominator += scores[order[slot]];
     std::vector<int> selected(order.begin(), order.begin() + moe_topk_);
     route_trace(layer, selected, scores);
-    if (std::getenv("INSIGNIA_GLM53_CANONICAL_MOE"))
-        std::sort(selected.begin(), selected.end());
 
     check(cudaMemset(routed_, 0, hidden_ * sizeof(float)), "clear routed output");
     if (!nvfp4_experts_) {

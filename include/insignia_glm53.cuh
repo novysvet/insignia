@@ -216,7 +216,8 @@ cudaError_t mla_flash2_prefill(
 // (q_head @ W_uk_head) . latent and the output is
 // W_uv_head @ (softmax-weighted latent sum), which is algebraically the
 // same attention but touches the 512-wide latent instead of the 16384-wide
-// expanded K/V.  w_uk and w_uv are BF16 [heads,head_dim,latent_dim]
+// expanded K/V.  w_uk and w_uv are FP32-dequantized
+// [heads,head_dim,latent_dim]
 // row-major (j-major) per-head blocks of the kv_b_proj K and V halves.
 // When cache_f32 is non-null the cache is FP32 and scales are ignored
 // (INSIGNIA_GLM53_KV_FP8=0 A/B path); otherwise cache is e4m3 with one
@@ -245,8 +246,8 @@ cudaError_t mla_decode_latent(
     uint8_t *cache,
     float *scales,
     float *cache_f32,
-    const uint16_t *w_uk,
-    const uint16_t *w_uv,
+    const float *w_uk,
+    const float *w_uv,
     float *partial,
     float *output,
     int position,
@@ -264,8 +265,8 @@ cudaError_t mla_prefill_latent(
     uint8_t *cache,
     float *scales,
     float *cache_f32,
-    const uint16_t *w_uk,
-    const uint16_t *w_uv,
+    const float *w_uk,
+    const float *w_uv,
     float *output,
     int tokens,
     int position_base,

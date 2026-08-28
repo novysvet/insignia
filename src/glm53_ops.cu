@@ -809,7 +809,7 @@ __global__ __launch_bounds__(256) void mla_decode_latent_partial_kernel(
     const uint8_t *__restrict__ cache,
     const float *__restrict__ scales,
     const float *__restrict__ cache_f32,
-    const uint16_t *__restrict__ w_uk,
+    const float *__restrict__ w_uk,
     float *__restrict__ partial,
     int position,
     int tiles,
@@ -832,9 +832,9 @@ __global__ __launch_bounds__(256) void mla_decode_latent_partial_kernel(
     float qe0 = 0.0f, qe1 = 0.0f;
     for (int j = 0; j < 256; ++j) {
         const float qj = q_shared[j];
-        const uint16_t *row = w_uk + (size_t(head) * 256 + j) * latent_dim;
-        qe0 = fmaf(qj, bf16_to_float(row[element]), qe0);
-        qe1 = fmaf(qj, bf16_to_float(row[element + 256]), qe1);
+        const float *row = w_uk + (size_t(head) * 256 + j) * latent_dim;
+        qe0 = fmaf(qj, row[element], qe0);
+        qe1 = fmaf(qj, row[element + 256], qe1);
     }
 
     float maximum = -3.402823466e38F;
@@ -888,7 +888,7 @@ __global__ __launch_bounds__(256) void mla_decode_latent_partial_kernel(
 // normalized weighted latent sum through W_uv (rows transposed to
 // [head_dim, latent_dim] so each output dimension streams one row).
 __global__ __launch_bounds__(256) void mla_decode_latent_merge_kernel(
-    const uint16_t *__restrict__ w_uv,
+    const float *__restrict__ w_uv,
     const float *__restrict__ partial,
     float *__restrict__ output,
     int tiles,
@@ -916,9 +916,9 @@ __global__ __launch_bounds__(256) void mla_decode_latent_merge_kernel(
     acc[element] = acc0 * inverse;
     acc[element + 256] = acc1 * inverse;
     __syncthreads();
-    const uint16_t *row = w_uv + (size_t(head) * 256 + element) * latent_dim;
+    const float *row = w_uv + (size_t(head) * 256 + element) * latent_dim;
     float total = 0.0f;
-    for (int c = 0; c < latent_dim; ++c) total = fmaf(acc[c], bf16_to_float(row[c]), total);
+    for (int c = 0; c < latent_dim; ++c) total = fmaf(acc[c], row[c], total);
     output[head * 256 + element] = total;
 }
 
@@ -929,8 +929,8 @@ __global__ __launch_bounds__(256) void mla_prefill_latent_kernel(
     const uint8_t *__restrict__ cache,
     const float *__restrict__ scales,
     const float *__restrict__ cache_f32,
-    const uint16_t *__restrict__ w_uk,
-    const uint16_t *__restrict__ w_uv,
+    const float *__restrict__ w_uk,
+    const float *__restrict__ w_uv,
     float *__restrict__ output,
     int tokens,
     int position_base,
@@ -959,9 +959,9 @@ __global__ __launch_bounds__(256) void mla_prefill_latent_kernel(
         float e0 = 0.0f, e1 = 0.0f;
         for (int j = 0; j < 256; ++j) {
             const float qj = q_shared[j];
-            const uint16_t *row = w_uk + (size_t(head) * 256 + j) * latent_dim;
-            e0 = fmaf(qj, bf16_to_float(row[element]), e0);
-            e1 = fmaf(qj, bf16_to_float(row[element + 256]), e1);
+            const float *row = w_uk + (size_t(head) * 256 + j) * latent_dim;
+            e0 = fmaf(qj, row[element], e0);
+            e1 = fmaf(qj, row[element + 256], e1);
         }
         qe[slot][0] = e0;
         qe[slot][1] = e1;
@@ -1024,9 +1024,9 @@ __global__ __launch_bounds__(256) void mla_prefill_latent_kernel(
         acc_shared[element] = acc0[slot] * inverse;
         acc_shared[element + 256] = acc1[slot] * inverse;
         __syncthreads();
-        const uint16_t *row = w_uv + (size_t(head) * 256 + element) * latent_dim;
+        const float *row = w_uv + (size_t(head) * 256 + element) * latent_dim;
         float total = 0.0f;
-        for (int c = 0; c < latent_dim; ++c) total = fmaf(acc_shared[c], bf16_to_float(row[c]), total);
+        for (int c = 0; c < latent_dim; ++c) total = fmaf(acc_shared[c], row[c], total);
         output[size_t(query_base + slot) * width + head * 256 + element] = total;
         __syncthreads();
     }
@@ -1056,8 +1056,8 @@ cudaError_t mla_decode_latent(
     uint8_t *cache,
     float *scales,
     float *cache_f32,
-    const uint16_t *w_uk,
-    const uint16_t *w_uv,
+    const float *w_uk,
+    const float *w_uv,
     float *partial,
     float *output,
     int position,
@@ -1089,8 +1089,8 @@ cudaError_t mla_prefill_latent(
     uint8_t *cache,
     float *scales,
     float *cache_f32,
-    const uint16_t *w_uk,
-    const uint16_t *w_uv,
+    const float *w_uk,
+    const float *w_uv,
     float *output,
     int tokens,
     int position_base,

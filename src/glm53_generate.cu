@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1252,6 +1253,44 @@ float from_bf16_host(uint16_t value) {
     return result;
 }
 
+float from_f16_host(uint16_t value) {
+    const uint32_t sign = uint32_t(value & 0x8000u) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fu;
+    uint32_t mantissa = value & 0x03ffu;
+    uint32_t bits = sign;
+    if (!exponent) {
+        if (mantissa) {
+            int unbiased = -14;
+            while (!(mantissa & 0x0400u)) {
+                mantissa <<= 1;
+                --unbiased;
+            }
+            mantissa &= 0x03ffu;
+            bits |= uint32_t(unbiased + 127) << 23;
+            bits |= mantissa << 13;
+        }
+    } else if (exponent == 0x1fu) {
+        bits |= 0x7f800000u | (mantissa << 13);
+    } else {
+        bits |= (exponent + 112u) << 23;
+        bits |= mantissa << 13;
+    }
+    float result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+float from_fp8_e4m3_host(uint8_t value) {
+    const int exponent = (value >> 3) & 0x0f;
+    const int mantissa = value & 0x07;
+    if (exponent == 0x0f && mantissa == 0x07)
+        return std::numeric_limits<float>::quiet_NaN();
+    const float magnitude = exponent
+        ? std::ldexp(float(8 + mantissa), exponent - 10)
+        : std::ldexp(float(mantissa), -9);
+    return value & 0x80 ? -magnitude : magnitude;
+}
+
 // Flash stores the mHC metadata as FP32, the tiny oracle as BF16; both widen
 // to the same FP32 device upload.
 std::vector<float> read_widened(ShardedIndex &model, std::string_view name) {
@@ -1686,8 +1725,7 @@ private:
     // per-head absorb weights projected out of kv_b_proj, and flash-decode
     // merge scratch [heads, tiles, latent+2].
     DeviceBuffer<uint8_t> mla_latent_u8_;
-    DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_;
-    DeviceBuffer<uint16_t> w_uk_, w_uv_;
+    DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_, w_uk_, w_uv_;
     bool kv_fp8_ = true;
     size_t absorb_per_layer_ = 0;
     const uint32_t *chunk_bf16_weights_ = nullptr;
@@ -1949,37 +1987,72 @@ void Runner::kda(int layer, const float *input, float *output, int position) {
     linear(stem + "o_proj.weight", projected_8192_, output, hidden_, kda_width_);
 }
 
-// Extracts per-head absorb weights from the BF16 kv_b_proj tensors in the
-// store: kv_b output rows are h*(2*head_dim) + j for K and
+// Extracts per-head absorb weights from kv_b_proj. With the normal dense FP8
+// cache, widen the exact e4m3*FP16 values used by fp8_tc_gemv so absorbed MLA
+// remains the same quantized model. Raw BF16 is only the cache-less fallback.
+// The store's kv_b output rows are h*(2*head_dim) + j for K and
 // h*(2*head_dim) + head_dim + j for V, each [latent] wide.  W_uk[h] is the
 // head's K block and W_uv[h] its V block, both copied straight into
 // [head_dim, latent] rows (row j-major matches the kernel index math).
 void Runner::extract_mla_absorb() {
     const size_t heads = size_t(mla_heads_), head_dim = size_t(mla_head_dim_);
     const size_t latent = size_t(kv_a_rows_);
-    const size_t per_head = head_dim * latent;
-    std::vector<uint16_t> source(size_t(kv_b_rows_) * latent);
-    std::vector<uint16_t> host_uk(absorb_per_layer_), host_uv(absorb_per_layer_);
+    std::vector<float> host_uk(absorb_per_layer_), host_uv(absorb_per_layer_);
+    std::array<float, 256> fp8_table{};
+    for (int value = 0; value < 256; ++value)
+        fp8_table[size_t(value)] = from_fp8_e4m3_host(uint8_t(value));
+    const bool use_fp8 = q8_index_ && q8_index_->format() == Cache8Format::fp8_e4m3 &&
+                         !std::getenv("INSIGNIA_GLM53_MLA_BF16_ABSORB");
     for (int slot = 0; slot < mla_layers_; ++slot) {
         const std::string name =
             layer_stem(mla_slot_[size_t(slot)]) + "self_attn.kv_b_proj.weight";
         const TensorLocation &location = model_.tensor(name);
-        require(location.bytes == source.size() * sizeof(uint16_t),
+        require(location.bytes == size_t(kv_b_rows_) * latent * sizeof(uint16_t),
                 "unexpected kv_b_proj tensor size");
-        model_.read(location, source.data());
-        for (size_t h = 0; h < heads; ++h) {
-            std::memcpy(host_uk.data() + h * per_head,
-                        source.data() + (h * 2 * head_dim) * latent,
-                        per_head * sizeof(uint16_t));
-            std::memcpy(host_uv.data() + h * per_head,
-                        source.data() + (h * 2 * head_dim + head_dim) * latent,
-                        per_head * sizeof(uint16_t));
+        if (use_fp8) {
+            const Q8TensorLocation *quantized = q8_index_->find(name);
+            require(quantized && quantized->rows == uint32_t(kv_b_rows_) &&
+                    quantized->cols == uint32_t(latent),
+                    "FP8 cache misses MLA absorb tensor " + name);
+            std::vector<uint8_t> weights(size_t(quantized->weight_bytes));
+            std::vector<uint16_t> scales(size_t(quantized->scale_bytes) / sizeof(uint16_t));
+            q8_index_->read_rows(*quantized, 0, quantized->rows,
+                                 weights.data(), scales.data());
+            constexpr size_t group = insignia::glm53::kQ8GroupSize;
+            const size_t groups = latent / group;
+            const auto dequant_row = [&](size_t row, float *destination) {
+                for (size_t g = 0; g < groups; ++g) {
+                    const float scale = from_f16_host(scales[row * groups + g]);
+                    for (size_t within = 0; within < group; ++within) {
+                        const size_t column = g * group + within;
+                        destination[column] = fp8_table[weights[row * latent + column]] * scale;
+                    }
+                }
+            };
+            for (size_t h = 0; h < heads; ++h)
+                for (size_t j = 0; j < head_dim; ++j) {
+                    dequant_row(h * 2 * head_dim + j,
+                                host_uk.data() + (h * head_dim + j) * latent);
+                    dequant_row(h * 2 * head_dim + head_dim + j,
+                                host_uv.data() + (h * head_dim + j) * latent);
+                }
+        } else {
+            std::vector<uint16_t> source(size_t(kv_b_rows_) * latent);
+            model_.read(location, source.data());
+            for (size_t h = 0; h < heads; ++h)
+                for (size_t j = 0; j < head_dim; ++j)
+                    for (size_t column = 0; column < latent; ++column) {
+                        host_uk[(h * head_dim + j) * latent + column] = from_bf16_host(
+                            source[(h * 2 * head_dim + j) * latent + column]);
+                        host_uv[(h * head_dim + j) * latent + column] = from_bf16_host(
+                            source[(h * 2 * head_dim + head_dim + j) * latent + column]);
+                    }
         }
         check(cudaMemcpy(w_uk_.get() + size_t(slot) * absorb_per_layer_, host_uk.data(),
-                         host_uk.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+                         host_uk.size() * sizeof(float), cudaMemcpyHostToDevice),
               "upload W_uk");
         check(cudaMemcpy(w_uv_.get() + size_t(slot) * absorb_per_layer_, host_uv.data(),
-                         host_uv.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+                         host_uv.size() * sizeof(float), cudaMemcpyHostToDevice),
               "upload W_uv");
     }
 }
@@ -2582,8 +2655,8 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
     const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
     uint8_t *cache_u8 = kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr;
     float *cache_f32 = kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride;
-    const uint16_t *w_uk = w_uk_.get() + size_t(slot) * absorb_per_layer_;
-    const uint16_t *w_uv = w_uv_.get() + size_t(slot) * absorb_per_layer_;
+    const float *w_uk = w_uk_.get() + size_t(slot) * absorb_per_layer_;
+    const float *w_uv = w_uv_.get() + size_t(slot) * absorb_per_layer_;
     static const bool scalar_attention =
         std::getenv("INSIGNIA_GLM53_SCALAR_MLA_PREFILL") != nullptr;
     if (scalar_attention) {
@@ -2625,8 +2698,8 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
             save_dev("scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext *
                          insignia::glm53::kMlaLatentGroups,
                      size_t(tokens) * insignia::glm53::kMlaLatentGroups * sizeof(float));
-            save_dev("wuk.bin", w_uk, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(uint16_t));
-            save_dev("wuv.bin", w_uv, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(uint16_t));
+            save_dev("wuk.bin", w_uk, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(float));
+            save_dev("wuv.bin", w_uv, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(float));
             std::fprintf(stderr, "mla dump written to %s\n", dir.string().c_str());
         }
     }

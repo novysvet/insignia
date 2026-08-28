@@ -29,7 +29,7 @@ public:
     static constexpr int kKVHeads = 8;
     static constexpr int kHeadDim = 128;
     static constexpr int kIntermediate = 12288;
-    static constexpr int kMaxTokens = 32;      // capture rows per commit batch
+    static constexpr int kMaxTokens = 64;      // capture rows per commit batch
     static constexpr int kMaxCtx = 264;        // 256 target positions + block
     static constexpr int kMaskToken = 154856;
     static constexpr int kTopK = 16;

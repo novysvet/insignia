@@ -219,11 +219,11 @@ __global__ void df_gather_kernel(const float *__restrict__ cap,  // [5][tokens][
     const int t = global >> 12, c = global & 4095;
     if (t >= tokens) return;
     // concatenated column = l*4096 + c for capture l; halves split at 10240.
-    const float v0 = cap[(size_t(0) * 32 + t) * 4096 + c];
-    const float v1 = cap[(size_t(1) * 32 + t) * 4096 + c];
-    const float v2 = cap[(size_t(2) * 32 + t) * 4096 + c];
-    const float v3 = cap[(size_t(3) * 32 + t) * 4096 + c];
-    const float v4 = cap[(size_t(4) * 32 + t) * 4096 + c];
+    const float v0 = cap[(size_t(0) * DFlash2Drafter::kMaxTokens + t) * 4096 + c];
+    const float v1 = cap[(size_t(1) * DFlash2Drafter::kMaxTokens + t) * 4096 + c];
+    const float v2 = cap[(size_t(2) * DFlash2Drafter::kMaxTokens + t) * 4096 + c];
+    const float v3 = cap[(size_t(3) * DFlash2Drafter::kMaxTokens + t) * 4096 + c];
+    const float v4 = cap[(size_t(4) * DFlash2Drafter::kMaxTokens + t) * 4096 + c];
     out_a[t * 10240 + c] = v0;
     out_a[t * 10240 + 4096 + c] = v1;
     if (c < 2048) {

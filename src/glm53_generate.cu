@@ -2245,6 +2245,8 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
     for (int slot = 0; slot < moe_topk_; ++slot) denominator += scores[order[slot]];
     std::vector<int> selected(order.begin(), order.begin() + moe_topk_);
     route_trace(layer, selected, scores);
+    if (std::getenv("INSIGNIA_GLM53_CANONICAL_MOE"))
+        std::sort(selected.begin(), selected.end());
 
     check(cudaMemset(routed_, 0, hidden_ * sizeof(float)), "clear routed output");
     if (!nvfp4_experts_) {

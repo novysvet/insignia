@@ -3131,7 +3131,7 @@ int main(int argc, char **argv) {
                 std::printf("\n");
                 std::fflush(stdout);
                 while (int(generated.size()) < generate) {
-                    const int draft_k = verify_k;
+                    const int draft_k = std::min(verify_k, generate - int(generated.size()));
                     if (std::getenv("INSIGNIA_GLM53_DF_DEBUG"))
                         std::fprintf(stderr, "df round %d: anchor %d pos %d truth0 %d\n",
                                      rounds, root, position, truth0);
@@ -3164,23 +3164,23 @@ int main(int argc, char **argv) {
                     }
 
                     const auto verify_begin = std::chrono::steady_clock::now();
-                    std::vector<int> arg(static_cast<size_t>(verify_k), 0);
+                    std::vector<int> arg(static_cast<size_t>(draft_k), 0);
                     int matched = 1;
                     bool df_seq_verify =
                         df_verify_mode_env == 1 ||
                         (df_verify_mode_env == 0 && accept_ema_init &&
-                         accept_ema < 0.70 * verify_k);
+                         accept_ema < 0.70 * draft_k);
                     if (df_seq_verify) {
                         // Row-sequential verify: stop forwarding as soon as
                         // acceptance fails; rejected-tail experts are never
                         // read, and the recurrent state always stands at the
                         // accepted boundary so no rollback is ever needed.
                         runner.verify_may_rollback_ = false;
-                        for (int r = 0; r < verify_k; ++r) {
+                        for (int r = 0; r < draft_k; ++r) {
                             runner.capture_offset_ = r;
                             arg[size_t(r)] = runner.verify_token(candidates[size_t(r)],
                                                                  position + 1 + r);
-                            if (r + 1 >= verify_k) { matched = verify_k; break; }
+                            if (r + 1 >= draft_k) { matched = draft_k; break; }
                             if (arg[size_t(r)] != candidates[size_t(r + 1)]) {
                                 matched = r + 1;
                                 break;
@@ -3190,7 +3190,7 @@ int main(int argc, char **argv) {
                         runner.verify_may_rollback_ = true;
                     } else {
                         const std::vector<int> verify_candidates(
-                            candidates.begin(), candidates.begin() + verify_k);
+                            candidates.begin(), candidates.begin() + draft_k);
                         const std::pair<int, std::vector<int>> verdict =
                             runner.verify_round(verify_candidates, position + 1);
                         arg = verdict.second;

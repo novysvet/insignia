@@ -1682,7 +1682,7 @@ public:
         c_attn_.reset(size_t(kMaxChunk) * hidden_);
         c_ffn_.reset(size_t(kMaxChunk) * hidden_);
         c_routed_.reset(size_t(kMaxChunk) * hidden_);
-        c_expert_out_.reset(size_t(kMaxChunk) * moe_topk_ * hidden_);
+        c_expert_out_.reset(size_t(kMaxVerify) * moe_topk_ * hidden_);
         c_q_.reset(size_t(kMaxChunk) * kda_width_);
         c_k_.reset(size_t(kMaxChunk) * kda_width_);
         c_v_.reset(size_t(kMaxChunk) * kda_width_);
@@ -1718,15 +1718,15 @@ public:
             mtp_moe_.reset(hidden_);
             mtp_recycle_.reset(hidden_);
             mtp_logits_.reset(model_.vocab_size());
-            verify_means_.reset(size_t(kMaxChunk) * hidden_);
-            verify_normed_.reset(size_t(kMaxChunk) * hidden_);
-            verify_logits_.reset(size_t(kMaxChunk) * model_.vocab_size());
-            verify_arg_.reset(kMaxChunk);
+            verify_means_.reset(size_t(kMaxVerify) * hidden_);
+            verify_normed_.reset(size_t(kMaxVerify) * hidden_);
+            verify_logits_.reset(size_t(kMaxVerify) * model_.vocab_size());
+            verify_arg_.reset(kMaxVerify);
             kda_snap_.reset(kda_states_.size());
             conv_snap_.reset(conv_history_.size());
             // Per (kda layer, token): pre-conv q,k,v + raw gate + raw beta, the
             // exact inputs the recurrence replay needs after a rejected draft.
-            kda_arch_.reset(size_t(kda_layers_) * kMaxChunk * (4 * size_t(kda_width_) + kda_heads_));
+            kda_arch_.reset(size_t(kda_layers_) * kMaxVerify * (4 * size_t(kda_width_) + kda_heads_));
         }
         check(cudaMemset(kda_states_, 0, kda_states_.size() * sizeof(float)), "clear KDA states");
         check(cudaMemset(conv_history_, 0, conv_history_.size() * sizeof(float)), "clear convolution history");
@@ -1757,7 +1757,11 @@ public:
     }
 
     int layer_count() const { return int(model_.layers()); }
-    static constexpr int kMaxChunk = 32;
+    static constexpr int kMaxChunk = 64;
+    // Verify passes are hard-capped by the drafter (DFlash2 kDrafts=7, MTP
+    // clamp 8); sizing their scratch by kMaxChunk would burn ~240 MiB per
+    // chunk-size doubling for nothing.
+    static constexpr int kMaxVerify = 8;
     bool dflash2_on() const { return dflash2_on_; }
 
     std::vector<std::pair<int, float>> step(int token, int position, int layer_limit, bool produce_logits);
@@ -2524,7 +2528,7 @@ void Runner::archive_kda_rows(int layer, const float *src, int rows, int slot) {
     require(row >= 0, "archiving a non-KDA layer");
     const size_t stride = 4 * size_t(width) + kda_heads_;
     const size_t span = slot == 4 ? size_t(kda_heads_) : size_t(width);
-    const size_t layer_base = size_t(row) * kMaxChunk * stride;
+    const size_t layer_base = size_t(row) * kMaxVerify * stride;
     // `src` is projection-major ([token][span]), while the replay archive is
     // token-major ([token][q,k,v,gate,beta]). A contiguous rows*span copy
     // overlaps the following fields and corrupts every row after token 0.
@@ -2764,7 +2768,7 @@ void Runner::rollback_kda(int accepted, int position_base) {
         float *history = conv_history_.get() + size_t(layer) * 9 * width;
         float *state = kda_states_.get() + size_t(layer) * width * kda_head_dim_;
         for (int token = 0; token < accepted; ++token) {
-            const float *arch = kda_arch_.get() + (size_t(row) * kMaxChunk + token) * stride;
+            const float *arch = kda_arch_.get() + (size_t(row) * kMaxVerify + token) * stride;
             check(cudaMemcpy(q_, arch, size_t(width) * sizeof(float), cudaMemcpyDeviceToDevice),
                   "replay q");
             check(cudaMemcpy(k_, arch + width, size_t(width) * sizeof(float),

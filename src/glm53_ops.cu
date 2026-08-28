@@ -749,7 +749,7 @@ cudaError_t mla_flash2_prefill(
     int head_dim,
     cudaStream_t stream) {
     if (!query || !kv || !key_cache || !value_cache || !output ||
-        tokens <= 0 || tokens > 32 || position_base < 0 ||
+        tokens <= 0 || tokens > 64 || position_base < 0 ||
         position_base + tokens > kMlaExactContext || heads <= 0 ||
         head_dim < 32 || head_dim > 256 || head_dim % 32)
         return cudaErrorInvalidValue;
@@ -1325,7 +1325,7 @@ cudaError_t mla_prefill_latent(
     int head_dim,
     int latent_dim,
     cudaStream_t stream) {
-    if (tokens <= 0 || tokens > 32 || position_base < 0 ||
+    if (tokens <= 0 || tokens > 64 || position_base < 0 ||
         position_base + tokens > kMlaMaxContext || heads != kKdaHeads ||
         head_dim != kMlaHeadDim || latent_dim != kMlaLatentDim ||
         !query || !latents || !w_uk || !w_uv || !output ||

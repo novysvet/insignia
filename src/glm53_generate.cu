@@ -557,6 +557,8 @@ public:
             admit_threshold_ = std::max(1, std::atoi(filter));
         else if (const char *filter = std::getenv("INSIGNIA_GLM53_ADMIT"))
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
+        if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
+            vram_budget_mb_ = std::max(0, std::atoi(budget));
         for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
         start_pool();
     }
@@ -570,6 +572,9 @@ public:
         for (WindowState &state : windows_)
             if (state.copy_done) cudaEventDestroy(state.copy_done);
         if (host_raw_) cudaFreeHost(host_raw_);
+        if (device_arena_) cudaFree(device_arena_);
+        for (cudaEvent_t &event : device_slot_reads_)
+            if (event) cudaEventDestroy(event);
         if (device_) cudaFree(device_);
     }
     ExpertStager(const ExpertStager &) = delete;
@@ -680,6 +685,20 @@ public:
         io_bytes_ += uint64_t(started) * (kBodyBytes + kScaleBytes + 3 * sizeof(float));
         (void)adopted;
     }
+    // Whole-layer demand read-ahead: puts every still-missing record of the
+    // layer's deduplicated union into the reader pool immediately at demand
+    // priority, so all readers stream while the GPU works through the first
+    // 8-record batches. Records already resident or in flight are skipped.
+    void stage_layer(int layer, const int *experts, int count) {
+        if (!overlap_reads_) return;
+        for (int index = 0; index < count; ++index) {
+            if (experts[index] < 0) continue;
+            const uint32_t key = route_key(layer, experts[index]);
+            if (flight_index_.count(key)) continue;
+            const int window = take_window();
+            start_read(window, key, layer, experts[index], true);
+        }
+    }
     void upload(int slot) {
         const int window = batch_window_[slot];
         require(window >= 0, "expert slot has no record in flight");
@@ -691,19 +710,60 @@ public:
             release_window(window);
             std::rethrow_exception(error);
         }
-        // Async H2D on the copy stream: the copy engine overlaps the SMs'
-        // previous expert GEMVs instead of stalling the CPU per record. The
-        // default-stream GEMVs below wait on copy_done, so ordering holds.
-        // copy_stream_ MUST stay a legacy-synchronizing stream (created with
-        // cudaStreamCreate): the device_ scratch is reused across slots and
-        // only the legacy-sync semantics keep slot N+1's copy behind slot
-        // N's default-stream GEMVs.
-        check(cudaMemcpyAsync(device_, state.payload, state.layout.bytes,
-                              cudaMemcpyHostToDevice, copy_stream_), "expert record H2D");
-        check(cudaEventRecord(state.copy_done, copy_stream_), "record expert copy");
-        check(cudaStreamWaitEvent(nullptr, state.copy_done, 0), "order expert copy");
-        state.copy_issued = true;
-        active_device_ = device_;
+        ensure_device_arena();
+        if (device_arena_) {
+            // Slot-owning arena path. The previously active device slot is
+            // fenced here: by now the default stream holds every GEMV launch
+            // that reads it, so the event provably covers its last consumer
+            // before any future recycle overwrites the slot.
+            if (active_device_slot_ >= 0)
+                check(cudaEventRecord(device_slot_reads_[size_t(active_device_slot_)], nullptr),
+                      "fence active expert slot");
+            ++device_lookups_;
+            const uint32_t key = state.key;
+            const auto found = device_index_.find(key);
+            int device_slot;
+            if (found != device_index_.end()) {
+                device_slot = found->second;
+                ++device_hits_;
+            } else {
+                device_slot = take_device_slot();
+                // The recycle waits on the victim's read fence: the copy
+                // stream never overwrites bytes a default-stream GEMV may
+                // still be reading. First fill of a fresh slot waits on an
+                // unrecorded event, which is immediately signalled.
+                check(cudaStreamWaitEvent(copy_stream_, device_slot_reads_[size_t(device_slot)], 0),
+                      "order expert slot recycle");
+                check(cudaMemcpyAsync(device_arena_ + size_t(device_slot) * device_stride_,
+                                      state.payload, state.layout.bytes,
+                                      cudaMemcpyHostToDevice, copy_stream_),
+                      "expert record H2D");
+                check(cudaEventRecord(state.copy_done, copy_stream_), "record expert copy");
+                check(cudaStreamWaitEvent(nullptr, state.copy_done, 0), "order expert copy");
+                state.copy_issued = true;
+                device_index_.emplace(key, device_slot);
+                device_slot_keys_[size_t(device_slot)] = key;
+            }
+            device_slot_stamps_[size_t(device_slot)] = ++device_stamp_;
+            active_device_ = device_arena_ + size_t(device_slot) * device_stride_;
+            active_device_slot_ = device_slot;
+        } else {
+            // Legacy single-scratch path: async H2D on the copy stream lets
+            // the copy engine overlap the SMs' previous expert GEMVs instead
+            // of stalling the CPU per record. The default-stream GEMVs below
+            // wait on copy_done, so ordering holds. copy_stream_ MUST stay a
+            // legacy-synchronizing stream (created with cudaStreamCreate):
+            // the device_ scratch is reused across slots and only the
+            // legacy-sync semantics keep slot N+1's copy behind slot N's
+            // default-stream GEMVs.
+            check(cudaMemcpyAsync(device_, state.payload, state.layout.bytes,
+                                  cudaMemcpyHostToDevice, copy_stream_), "expert record H2D");
+            check(cudaEventRecord(state.copy_done, copy_stream_), "record expert copy");
+            check(cudaStreamWaitEvent(nullptr, state.copy_done, 0), "order expert copy");
+            state.copy_issued = true;
+            active_device_ = device_;
+            active_device_slot_ = -1;
+        }
         active_ = state.layout;
         active_globals_ = state.globals;
         if (batch_populate_[size_t(slot)] && batch_admit_[size_t(slot)]) {
@@ -743,6 +803,9 @@ public:
     uint64_t prefetch_useful() const { return prefetch_useful_; }
     uint64_t prefetch_wasted_observable() const { return prefetch_wasted_; }
     int cache_slots() const { return window_count_; }
+    uint64_t device_hits() const { return device_hits_; }
+    uint64_t device_lookups() const { return device_lookups_; }
+    int device_slots() const { return device_slot_count_; }
 private:
     struct Layout {
         std::array<size_t, 3> body{};
@@ -770,6 +833,70 @@ private:
     static uint32_t route_key(int layer, int expert) {
         return uint32_t(layer) * 4096u + uint32_t(expert);
     }
+    // Sizes and allocates the VRAM tier at first expert use, when every
+    // startup allocation (dense FP8 residency, drafter, state buffers) has
+    // already claimed its VRAM and cudaMemGetInfo reflects steady state.
+    void ensure_device_arena() {
+        if (device_arena_ready_) return;
+        device_arena_ready_ = true;
+        size_t budget = 0;
+        if (vram_budget_mb_ >= 0) {
+            budget = size_t(vram_budget_mb_) << 20;
+        } else {
+            size_t free_bytes = 0, total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                cudaGetLastError();
+                return;  // stay on the legacy single-scratch path
+            }
+            // Leave headroom for context growth and activation spikes.
+            budget = free_bytes > (768ull << 20) ? free_bytes - (768ull << 20) : 0;
+        }
+        const size_t stride = (kPayloadCapacity + kAlignment - 1) & ~(kAlignment - 1);
+        size_t attempt = budget / stride;
+        while (attempt > 1) {
+            if (cudaMalloc(&device_arena_, attempt * stride) == cudaSuccess) break;
+            cudaGetLastError();  // clear the sticky error and retry smaller
+            attempt /= 2;
+        }
+        if (attempt < 2) {
+            // A one-slot arena cannot recycle (the active slot is never its
+            // own victim); stay on the legacy single-scratch path instead.
+            if (device_arena_) {
+                cudaFree(device_arena_);
+                device_arena_ = nullptr;
+            }
+            return;
+        }
+        device_stride_ = stride;
+        device_slot_count_ = int(attempt);
+        device_slot_keys_.assign(attempt, kNoKey);
+        device_slot_stamps_.assign(attempt, 0);
+        device_slot_reads_.resize(attempt, nullptr);
+        for (cudaEvent_t &event : device_slot_reads_)
+            check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                  "cudaEventCreate expert slot fence");
+        // Slots are individually owned now, so copies for different records
+        // no longer alias: swap the legacy-synchronizing copy stream for a
+        // real async one and let ordering live entirely in the events.
+        cudaStreamSynchronize(copy_stream_);
+        cudaStreamDestroy(copy_stream_);
+        check(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking),
+              "expert copy stream (async)");
+    }
+    int take_device_slot() {
+        int victim = -1;
+        for (int index = 0; index < device_slot_count_; ++index) {
+            if (index == active_device_slot_) continue;  // fence not recorded yet
+            if (device_slot_keys_[size_t(index)] == kNoKey) return index;
+            if (victim < 0 ||
+                device_slot_stamps_[size_t(index)] < device_slot_stamps_[size_t(victim)])
+                victim = index;
+        }
+        require(victim >= 0, "expert VRAM tier needs at least one slot");
+        device_index_.erase(device_slot_keys_[size_t(victim)]);
+        device_slot_keys_[size_t(victim)] = kNoKey;
+        return victim;
+    }
     void start_read(int window, uint32_t key, int layer, int expert, bool demand) {
         WindowState &state = windows_[size_t(window)];
         state.key = key;
@@ -778,6 +905,7 @@ private:
         state.demand = demand;
         state.done = false;
         state.claimed = false;
+        state.copy_issued = false;
         state.stamp = 0;
         state.hits = 0;
         state.error = nullptr;
@@ -1067,6 +1195,22 @@ private:
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
+    // VRAM tier: an arena of per-record device slots acts as an LRU above the
+    // pinned host windows. A device hit skips both the NVMe read and the PCIe
+    // H2D entirely; a miss streams into its own slot, so copies for different
+    // records pipeline instead of serializing through one shared scratch.
+    uint8_t *device_arena_ = nullptr;
+    size_t device_stride_ = 0;
+    int device_slot_count_ = 0;
+    int active_device_slot_ = -1;
+    bool device_arena_ready_ = false;
+    int vram_budget_mb_ = -1;  // -1 = size from free VRAM at first use
+    uint64_t device_stamp_ = 0;
+    std::vector<uint32_t> device_slot_keys_;
+    std::vector<uint64_t> device_slot_stamps_;
+    std::vector<cudaEvent_t> device_slot_reads_;
+    std::unordered_map<uint32_t, int> device_index_;
+    uint64_t device_hits_ = 0, device_lookups_ = 0;
 };
 
 class Q8Stager {
@@ -2855,6 +2999,26 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             if (std::find(distinct.begin(), distinct.end(), expert) == distinct.end())
                 distinct.push_back(expert);
     check(cudaMemset(c_routed_, 0, size_t(tokens) * hidden_ * sizeof(float)), "clear routed (prefill)");
+    if (nvfp4_experts_ && expert_stager_) {
+        // Routing bookkeeping + speculative next-layer reads, mirroring the
+        // decode path. Demand staging for the whole deduplicated union comes
+        // first so all four readers stream the layer while its first GEMV
+        // batches run; speculative queues can never jump a demand record.
+        for (int slot = 0; slot < topk; ++slot)
+            prev_routing_[size_t(layer)][size_t(slot)] = selection[size_t(tokens - 1)][size_t(slot)].first;
+        expert_stager_->stage_layer(layer, distinct.data(), int(distinct.size()));
+        if (prefetch_on_ && size_t(layer) + 1 < prev_routing_.size() &&
+            is_sparse_[size_t(layer) + 1])
+            expert_stager_->prefetch(int(layer) + 1, prev_routing_[size_t(layer) + 1].data(),
+                                     moe_topk_);
+        if (prefetch_on_ && !cct_.empty())
+            cct_prefetch(layer);
+        // The shared expert is dense-resident FP8; running it first lets its
+        // GEMVs hide under the routed records' disk reads (same ordering as
+        // the decode path). It writes `output`; routed experts accumulate
+        // into c_routed_ and the combine order below is unchanged.
+        mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);
+    }
 
     if (!nvfp4_experts_) {
         for (int expert : distinct) {
@@ -2998,7 +3162,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                             (size_t(token) * topk + size_t(pick_slot)) * hidden_,
                         selection[token][size_t(pick_slot)].second, hidden_);
     }
-    mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);
+    if (!nvfp4_experts_)
+        mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);
     for (int token = 0; token < tokens; ++token)
         add_kernel<<<16, 256>>>(output + size_t(token) * hidden_,
                                 c_routed_.get() + size_t(token) * hidden_, hidden_);
@@ -3324,6 +3489,13 @@ std::vector<std::pair<int, float>> Runner::step(
                         (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes + 3 * sizeof(float)) /
                         double(1ull << 30),
                     expert_stager_->cache_slots());
+    if (expert_stager_ && expert_stager_->device_lookups())
+        std::printf("  VRAM expert tier %llu/%llu hits (%.1f%%, %.3f GiB PCIe avoided; %d slots)\n",
+                    (unsigned long long)expert_stager_->device_hits(),
+                    (unsigned long long)expert_stager_->device_lookups(),
+                    100.0 * expert_stager_->device_hits() / expert_stager_->device_lookups(),
+                    expert_stager_->device_hits() * ExpertStager::kPayloadCapacity / double(1ull << 30),
+                    expert_stager_->device_slots());
     if (expert_stager_ && expert_stager_->prefetch_started())
         std::printf("  expert prefetch %llu started, %llu adopted, %llu wasted (%.3f GiB speculative)\n",
                     (unsigned long long)expert_stager_->prefetch_started(),

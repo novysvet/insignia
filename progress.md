@@ -1,5 +1,36 @@
 # progress
 
+### 2026-08-28 (session 6) — speed campaign: I/O engineering round; 256K unblocked at P0
+
+Open problems handed to a math-focused follow-up: `audits/s6-open-problems.md`
+(adaptive-K optimality, expert-union model, hot-set allocation +
+generalization, routing predictability bounds, MLA tile-merge bit-exactness
+proofs, throughput lower bound, admission policy, prefill optimum, latent
+quantization risk, acceptance prediction, KDA transplant proof, DSA
+trade-off). Landed this session, every step parity-gated (greedy IDs and
+top-10 logits digit-identical in all A/Bs): VRAM expert LRU tier (per-layer
+segments, async multi-slot H2D on a non-blocking copy stream, ~-8% verify
+round), whole-layer demand read staging in moe_multi, prefill chunk 32->64
+(128-tok prompt prefill 43.7->30.4 s, -30%) with verify scratch decoupled
+(kMaxVerify=8) and DFlash2 capture/commit extended to 64 rows, multi-row
+NVFP4 expert GEMV chain (one weight pass serves up to 8 verify rows,
+bit-exact), adaptive draft length from the acceptance EMA, trace-derived
+static hot-expert pin list (host + VRAM, eviction-excluded; in-sample -15%
+ms/token, out-of-sample -8%), runtime context limit to 262144 with @file
+prompt input and drafter cutoff at position 263. Real-text baselines
+(cold-process, 4 cases): scalar 570.9 ms/tok median, DFlash2-k7 627.5
+(0.91x) at session start, 608.0 (0.94x) after chunk-64, ~454-515 on 128-tok
+prompt runs with pins+retention; acceptance on real text 2.9-4.6/round vs
+5.88 on the parrot prompt. Routing truth from ROUTE_TRACE on real text:
+per-layer entropy 4.5-5.2 bits (not uniform), top-8/layer static coverage
+41%, adjacent overlap 0.193; CCT split-sample 14.5%@1.28x — weak; 40 GiB
+tier -7%; 2048-token prefill 369.4 s (180 ms/token) with the new stack.
+Decode is bounded by the single NVMe serving ~70% misses on near-uniform
+routing; the 20 tok/s target needs the P6 proof run either way. Operational:
+WSL VM recycles kill long runs — benchmarks run via Windows Task Scheduler
+(build/s6-inner.sh + C:\coding\s6-task.cmd reading /var/lib/insignia/s6-args);
+parallel-session GPU contention is the default hazard.
+
 ### 2026-08-28 (parallel session) — DFlash2 verdict byte-closed; latent past-256 validated; CCT repaired; pilot medians
 
 Full findings in `audits/quality-cct-session.md`. Short form: (1) three

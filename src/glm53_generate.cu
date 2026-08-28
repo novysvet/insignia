@@ -526,7 +526,7 @@ public:
     explicit ExpertStager(ShardedIndex &model, uint64_t host_cache_bytes) : model_(model) {
         // A full decode token needs 336 records; default the tier just above
         // that and let the environment shrink it on smaller hosts.
-        window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / kWindowBytes, 64, 1024));
+        window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / kWindowBytes, 64, 4096));
         size_t attempt = size_t(window_count_);
         while (attempt >= 64) {
             void *block = nullptr;

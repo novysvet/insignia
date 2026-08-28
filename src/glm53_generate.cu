@@ -1673,6 +1673,8 @@ public:
         early_route_on_ = std::getenv("INSIGNIA_GLM53_EARLY_ROUTE") != nullptr;
         early_route_prefetch_ = std::getenv("INSIGNIA_GLM53_EARLY_PREFETCH") != nullptr;
         early_route_on_ = early_route_on_ || early_route_prefetch_;
+        if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_PREFETCH_N"))
+            early_route_prefetch_n_ = std::clamp(std::atoi(count), 1, moe_topk_);
         if (const char *path = std::getenv("INSIGNIA_GLM53_EARLY_ROUTE_TRACE")) {
             early_route_trace_ = std::fopen(path, "w");
             early_route_on_ = true;
@@ -1947,6 +1949,7 @@ private:
     std::vector<float> seam_host_;
     bool prefetch_on_ = true, deep_checks_ = false, trace_layers_ = false;
     bool early_route_on_ = false, early_route_prefetch_ = false;
+    int early_route_prefetch_n_ = 8;
     uint64_t early_route_hits_ = 0, early_route_total_ = 0;
 
     void route_trace(int layer, const std::vector<int> &selected, const std::vector<float> &scores);
@@ -2459,7 +2462,8 @@ void Runner::early_route(int layer, const float *input) {
     for (int slot = 0; slot < moe_topk_; ++slot)
         early_routing_[size_t(layer)][size_t(slot)] = order[size_t(slot)];
     if (early_route_prefetch_ && prefetch_on_)
-        expert_stager_->prefetch(layer, early_routing_[size_t(layer)].data(), moe_topk_);
+        expert_stager_->prefetch(layer, early_routing_[size_t(layer)].data(),
+                                 early_route_prefetch_n_);
 }
 
 // Routing-locality trace: one line per (token, sparse layer) after CPU routing,

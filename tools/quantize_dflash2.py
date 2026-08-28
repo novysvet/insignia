@@ -17,10 +17,57 @@ import struct
 import time
 
 import numpy as np
-import torch
 
 GROUP = 64
 ALIGNMENT = 4096
+
+
+def encode_e4m3fn(values):
+    """Encode finite float32 values as IEEE-style E4M3FN with RNE.
+
+    DFlash2 inputs are clipped to the finite E4M3FN range before this call.
+    Keeping the encoder in NumPy avoids a multi-gigabyte PyTorch dependency on
+    inference-only hosts while producing the same bytes as torch.float8_e4m3fn.
+    """
+    if values.dtype != np.float32:
+        raise TypeError("E4M3FN encoder requires float32 input")
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("E4M3FN encoder received a non-finite value")
+
+    bits = values.view(np.uint32)
+    magnitude = bits & np.uint32(0x7FFFFFFF)
+    exponent32 = magnitude >> np.uint32(23)
+    mantissa32 = magnitude & np.uint32(0x007FFFFF)
+    sign = ((bits >> np.uint32(24)) & np.uint32(0x80)).astype(np.uint8)
+    encoded = np.empty(values.shape, dtype=np.uint8)
+
+    # E4M3FN's smallest normal is 2^-6 (float32 biased exponent 121).
+    # Smaller values use its three-bit subnormal significand in units of 2^-9.
+    normal = exponent32 >= np.uint32(121)
+    subnormal = ~normal
+    if np.any(subnormal):
+        scaled = np.abs(values[subnormal]) * np.float32(512.0)
+        encoded[subnormal] = np.rint(scaled).astype(np.uint8)
+
+    if np.any(normal):
+        source_mantissa = mantissa32[normal]
+        kept = source_mantissa >> np.uint32(20)
+        remainder = source_mantissa & np.uint32(0x000FFFFF)
+        halfway = np.uint32(0x00080000)
+        increment = ((remainder > halfway) |
+                     ((remainder == halfway) & ((kept & np.uint32(1)) != 0)))
+        kept += increment.astype(np.uint32)
+
+        exponent8 = exponent32[normal].astype(np.int32) - 120
+        exponent8 += (kept >> np.uint32(3)).astype(np.int32)
+        kept &= np.uint32(7)
+        code = (exponent8.astype(np.uint32) << np.uint32(3)) | kept
+        if np.any(code >= np.uint32(0x7F)):
+            raise RuntimeError("E4M3FN encoder overflowed the finite range")
+        encoded[normal] = code.astype(np.uint8)
+
+    encoded |= sign
+    return encoded
 
 
 def align(value):
@@ -41,7 +88,7 @@ def quantize_matrix(mapping, offset, rows, cols, source_cols=None, source_col=0)
     divisors = np.where(scales > 0, scales, np.float32(1.0))
     normalized = np.ascontiguousarray(values / divisors[:, :, None])
     np.clip(normalized, -448.0, 448.0, out=normalized)
-    quantized = torch.from_numpy(normalized).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+    quantized = encode_e4m3fn(normalized)
     if np.any((quantized & 0x7F) == 0x7F):
         raise RuntimeError("FP8 encoder emitted NaN")
     return quantized, np.ascontiguousarray(scales.astype("<f2"))

@@ -1,5 +1,32 @@
 # progress
 
+### 2026-08-28 (parallel session) — DFlash2 verdict byte-closed; latent past-256 validated; CCT repaired; pilot medians
+
+Full findings in `audits/quality-cct-session.md`. Short form: (1) three
+independent exonerations on top of session-5's prompt-artifact verdict —
+LEGACY=1 bit-identical histograms on the realistic prompt, an all-batch
+12-token DF_DEBUG trace (the seq-verify latch never engaged), and a BF16
+NumPy oracle + byte-exact FP8-cache re-quantization proving drafter numerics
+and the regenerated cache are clean; the drafter simply ranks truth0
+2nd/3rd on `prompt_math.txt` openings ("Step"/"**" vs "Let"/"\n\n").
+(2) Published calibration (DFlash arXiv:2602.06036, EAGLE-3, SPEED-Bench):
+2.0–2.7 ADPR at ~35% empty rounds = EAGLE-3-small-tree floor, low-normal;
+healthy is 2.5–3.5 with 15–25% empties; FP8 drafter weights cost only
+single-digit %. (3) GSM8K pilot (10 cases, k4, parity 10/10): scalar
+545 ms/tok vs DFlash 612 ms/tok = 0.89x — k4 loses on real prompts at this
+acceptance; math500 half + k7 pending (VM recycle killed the run).
+(4) Latent MLA past position 256 validated at last: 500-tok prompt, greedy
+16/16 identical FP8-vs-FP32 latent, cos 0.9957, PPL 1.456 vs 1.414 (+3.0%);
+tooling `tools/compare_logits.py` + `tools/ppl.py` (dump format documented).
+(5) CCT was dead on arrival — builder/loader format mismatch
+(`IGCCT1\0` vs `CCT0`), `prev_routing_ == -1` wild row read on the first
+step, prefetch queued ahead of demand, ungated under PREFETCH=0 — repaired
+with a rewritten `tools/dump_cct.py`, loader header validation,
+`INSIGNIA_GLM53_CCT_MAX` (default 8), demand-first ordering, prefetch gate;
+table regeneration + A/B pending. Ops: glm-box has no GitHub push creds
+(pushes hang; use the bundle relay); the WSL VM recycled twice; parallel
+engine sessions contend for the GPU — `pgrep -af glm53-generate` first.
+
 ### 2026-08-28 (session 5) — DFlash2 "regression" resolved: prompt artifact, engine healthy
 
 `audits/dflash2-regression-artifact.md`. The session-4 alarm (1.43

@@ -2216,7 +2216,8 @@ void Runner::load_cct() {
     uint32_t header[3] = {};
     const bool ok = std::fread(magic, 4, 1, file) == 1 && std::strcmp(magic, "CCT0") == 0 &&
                     std::fread(header, sizeof(header), 1, file) == 1 &&
-                    header[0] == model_.layers() && header[2] >= 1 && header[2] <= 16;
+                    header[0] == model_.layers() && header[1] == uint32_t(moe_experts_) &&
+                    header[2] >= 1 && header[2] <= 16;
     if (!ok) {
         std::printf("cct: bad table header, disabled\n");
         std::fclose(file);
@@ -2248,13 +2249,22 @@ void Runner::load_cct() {
 void Runner::cct_prefetch(int layer) {
     if (size_t(layer) >= cct_offset_.size() || cct_offset_[size_t(layer)] < 0)
         return;
-    // Union of the routed experts' successor lists, capped at 16 records.
+    // Union of the routed experts' successor lists. The cap defaults to 8:
+    // at the measured ~2.4x table overfetch a 16-record union costs more disk
+    // than it saves (see audits/mla-latent-session.md section 6).
+    static const int cct_max = [] {
+        const char *value = std::getenv("INSIGNIA_GLM53_CCT_MAX");
+        return std::clamp(value ? std::atoi(value) : 8, 1, 16);
+    }();
     int picks[16];
     int count = 0;
     const uint16_t *table = cct_.data() + cct_offset_[size_t(layer)];
-    for (int slot = 0; slot < moe_topk_; ++slot) {
-        const uint16_t *row = table + size_t(prev_routing_[size_t(layer)][size_t(slot)]) * cct_topk_;
-        for (int k = 0; k < cct_topk_ && count < 16; ++k) {
+    for (int slot = 0; slot < moe_topk_ && count < cct_max; ++slot) {
+        const int routed = prev_routing_[size_t(layer)][size_t(slot)];
+        if (routed < 0 || routed >= cct_experts_)
+            continue;  // routing not yet computed for this token
+        const uint16_t *row = table + size_t(routed) * cct_topk_;
+        for (int k = 0; k < cct_topk_ && count < cct_max; ++k) {
             bool duplicate = false;
             for (int j = 0; j < count; ++j)
                 duplicate = duplicate || picks[j] == int(row[k]);
@@ -2308,10 +2318,12 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
             is_sparse_[size_t(layer) + 1])
             expert_stager_->prefetch(int(layer) + 1, prev_routing_[size_t(layer) + 1].data(),
                                      moe_topk_);
-        if (!cct_.empty())
-            cct_prefetch(layer);
         expert_stager_->load_batch(layer, {selected[0], selected[1], selected[2], selected[3],
                                            selected[4], selected[5], selected[6], selected[7]});
+        // Cross-layer prefetch queues behind this layer's own demand records
+        // so speculative reads can never delay the current GEMVs.
+        if (prefetch_on_ && !cct_.empty())
+            cct_prefetch(layer);
         check(insignia::glm53::nvfp4_quantize_activation(input, hidden_, nv_workspace_4096_),
               "quantize expert input");
         // The shared expert is dense-resident FP8; running it first lets its
@@ -3148,7 +3160,7 @@ std::vector<std::pair<int, float>> Runner::step(
             for (size_t layer = 3; layer < prev_routing_.size() && layer < 6; ++layer)
                 if (is_sparse_[layer])
                     expert_stager_->prefetch(int(layer), prev_routing_[layer].data(), moe_topk_);
-        if (!cct_.empty()) {
+        if (prefetch_on_ && !cct_.empty()) {
             // Warm the reader pool with the prompt-side layers before the
             // stack starts (same window the prev-token prefetch uses).
             for (size_t layer = 3; layer + 1 < prev_routing_.size() && layer < 6; ++layer)

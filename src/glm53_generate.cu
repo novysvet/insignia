@@ -1702,8 +1702,9 @@ public:
         c_comb_.reset(size_t(kMaxChunk) * 16);
         c_beta_.reset(size_t(kMaxChunk) * kda_heads_);
         if (nvfp4_experts_) {
-            nv_workspace_4096_.reset(insignia::glm53::nvfp4_workspace_bytes(hidden_));
-            nv_workspace_2048_.reset(insignia::glm53::nvfp4_workspace_bytes(moe_intermediate_));
+            nv_workspace_4096_.reset(insignia::glm53::nvfp4_workspace_rows_bytes(hidden_, kMaxVerify));
+            nv_workspace_2048_.reset(
+                insignia::glm53::nvfp4_workspace_rows_bytes(moe_intermediate_, kMaxVerify));
         }
         if (q8_index_)
             q8_workspace_.reset(q8_index_->format() == Cache8Format::fp8_e4m3 ?
@@ -3153,43 +3154,51 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             for (int slot = 0; slot < batch_count; ++slot) {
                 const int expert = distinct[base_slot + slot];
                 expert_stager_->upload(slot);
-                for (int token = 0; token < tokens; ++token) {
-                    float weight = 0.0f;
-                    int selected_slot = -1;
+                // Collect this expert's users in ascending token order — the
+                // same visit order the per-token loop had — then serve each
+                // group of up to 8 rows in one weight pass. The batched
+                // kernels preserve every per-row accumulation chain, so the
+                // routed-sum rounding is untouched.
+                std::array<int, kMaxChunk> users{}, out_ids{};
+                std::array<float, kMaxChunk> combine{};
+                int total = 0;
+                for (int token = 0; token < tokens; ++token)
                     for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
-                        if (selection[token][size_t(pick_slot)].first == expert) {
-                            selected_slot = pick_slot;
-                            weight = selection[token][size_t(pick_slot)].second;
+                        if (selection[size_t(token)][size_t(pick_slot)].first == expert &&
+                            selection[size_t(token)][size_t(pick_slot)].second != 0.0f) {
+                            users[size_t(total)] = token;
+                            out_ids[size_t(total)] = token * topk + pick_slot;
+                            combine[size_t(total)] = selection[size_t(token)][size_t(pick_slot)].second;
+                            ++total;
                         }
-                    if (weight == 0.0f) continue;
-                    check(insignia::glm53::nvfp4_quantize_activation(input + size_t(token) * hidden_,
-                          hidden_, nv_workspace_4096_), "quantize expert input (prefill)");
-                    check(insignia::glm53::nvfp4_gemv2_dp4a_quantized(
-                        expert_stager_->gate_weight(), expert_stager_->gate_scale(),
-                        expert_stager_->gate_global(int(slot)),
-                        expert_stager_->up_weight(), expert_stager_->up_scale(),
-                        expert_stager_->up_global(int(slot)),
-                        nv_workspace_4096_,
-                        c_gateu_.get() + size_t(token) * moe_intermediate_,
-                        c_up_.get() + size_t(token) * moe_intermediate_,
-                        moe_intermediate_, hidden_), "routed expert gate/up (prefill)");
-                    check(insignia::glm53::quantize_swiglu_activation(
-                        c_gateu_.get() + size_t(token) * moe_intermediate_,
-                        c_up_.get() + size_t(token) * moe_intermediate_, moe_intermediate_,
-                        nv_workspace_2048_), "quantize routed SwiGLU (prefill)");
+                for (int base = 0; base < total; base += kMaxVerify) {
+                    const int count = std::min(kMaxVerify, total - base);
+                    check(insignia::glm53::nvfp4_quantize_activation_rows(
+                              input, hidden_, &users[size_t(base)], count, nv_workspace_4096_),
+                          "quantize expert input (batched prefill)");
+                    check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
+                              expert_stager_->gate_weight(), expert_stager_->gate_scale(),
+                              expert_stager_->gate_global(int(slot)),
+                              expert_stager_->up_weight(), expert_stager_->up_scale(),
+                              expert_stager_->up_global(int(slot)),
+                              nv_workspace_4096_, count,
+                              c_gateu_.get(), c_up_.get(), &users[size_t(base)],
+                              moe_intermediate_, hidden_), "routed expert gate/up (batched prefill)");
+                    check(insignia::glm53::quantize_swiglu_activation_rows(
+                              c_gateu_.get(), c_up_.get(), moe_intermediate_, &users[size_t(base)],
+                              count, nv_workspace_2048_), "quantize routed SwiGLU (batched prefill)");
                     if (ordered_accumulation) {
-                        check(insignia::glm53::nvfp4_gemv_dp4a_quantized(
-                            expert_stager_->down_weight(), expert_stager_->down_scale(),
-                            expert_stager_->down_global(int(slot)), nv_workspace_2048_,
-                            c_expert_out_.get() +
-                                (size_t(token) * topk + size_t(selected_slot)) * hidden_,
-                            hidden_, moe_intermediate_), "routed expert down (ordered prefill)");
+                        check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                                  expert_stager_->down_weight(), expert_stager_->down_scale(),
+                                  expert_stager_->down_global(int(slot)), nv_workspace_2048_,
+                                  count, c_expert_out_.get(), &out_ids[size_t(base)],
+                                  hidden_, moe_intermediate_), "routed expert down (ordered batched)");
                     } else {
-                        check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
-                            expert_stager_->down_weight(), expert_stager_->down_scale(),
-                            expert_stager_->down_global(int(slot)), nv_workspace_2048_,
-                            c_routed_.get() + size_t(token) * hidden_, weight,
-                            hidden_, moe_intermediate_), "routed expert down (prefill)");
+                        check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
+                                  expert_stager_->down_weight(), expert_stager_->down_scale(),
+                                  expert_stager_->down_global(int(slot)), nv_workspace_2048_,
+                                  count, c_routed_.get(), &users[size_t(base)], &combine[size_t(base)],
+                                  hidden_, moe_intermediate_), "routed expert down (batched prefill)");
                     }
                 }
             }

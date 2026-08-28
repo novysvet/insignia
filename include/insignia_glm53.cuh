@@ -89,6 +89,65 @@ cudaError_t quantize_swiglu_activation(
     void *workspace,
     cudaStream_t stream = nullptr);
 
+// Multi-row (R <= 8) variants for the verify path: one weight pass serves all
+// token rows that share an expert. Row r of the workspace holds the same
+// layout nvfp4_workspace_bytes(cols) defines for a single row. Per-row output
+// accumulation order is bit-identical to looping the 1-row kernels.
+size_t nvfp4_workspace_rows_bytes(int cols, int rows);
+cudaError_t nvfp4_quantize_activation_rows(
+    const float *x,
+    int cols,
+    const int *row_ids,
+    int count,
+    void *workspace,
+    cudaStream_t stream = nullptr);
+cudaError_t quantize_swiglu_activation_rows(
+    const float *gate,
+    const float *up,
+    int cols,
+    const int *row_ids,
+    int count,
+    void *workspace,
+    cudaStream_t stream = nullptr);
+cudaError_t nvfp4_gemv_dp4a_quantized_rows(
+    const uint8_t *weights,
+    const uint8_t *scales,
+    float global_scale,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows(
+    const uint8_t *weights,
+    const uint8_t *scales,
+    float global_scale,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    const float *combine,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+cudaError_t nvfp4_gemv2_dp4a_quantized_rows(
+    const uint8_t *weights_a,
+    const uint8_t *scales_a,
+    float global_scale_a,
+    const uint8_t *weights_b,
+    const uint8_t *scales_b,
+    float global_scale_b,
+    const void *workspace,
+    int count,
+    float *y_a,
+    float *y_b,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // GLM-5.3's dimensions are part of the ABI: 4 residual streams are baked into
 // the mHC kernels and never parameterized.  Widths default to the Flash
 // geometry (hidden 4096, 64 KDA heads of 128, MLA heads 64 of 256) so the

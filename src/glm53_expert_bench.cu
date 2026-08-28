@@ -341,6 +341,284 @@ __global__ __launch_bounds__(256, 1) void quantize_swiglu_x16_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-row (R <= 8) variants for the verify path: one weight pass serves all
+// token rows that share the expert. Every per-row arithmetic chain (group
+// order, scale association, warp_sum tree) is a verbatim transplant of the
+// 1-row kernels above, so each output element stays bit-identical to running
+// the single-row kernel row by row.
+// ---------------------------------------------------------------------------
+
+struct Nvfp4RowIds {
+    int count;
+    int ids[8];
+};
+
+struct Nvfp4RowOut {
+    int count;
+    int ids[8];
+    float weights[8];
+};
+
+__global__ __launch_bounds__(256, 1) void quantize_x16_rows_kernel(
+    const float *__restrict__ x,
+    uint32_t *__restrict__ xq,        // [rows][words_per_row]
+    float *__restrict__ xscale,       // [rows][groups]
+    int groups,
+    int words_per_row,
+    Nvfp4RowIds rows) {
+    const int group = threadIdx.x;
+    if (group >= groups) return;
+    const float4 *source = reinterpret_cast<const float4 *>(
+        x + static_cast<size_t>(rows.ids[blockIdx.x]) * (groups * 16) + group * 16);
+    uint32_t *row_q = xq + static_cast<size_t>(blockIdx.x) * words_per_row;
+    float *row_scale = xscale + static_cast<size_t>(blockIdx.x) * groups;
+    float values[16];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 value = __ldg(source + i);
+        values[4 * i + 0] = value.x;
+        values[4 * i + 1] = value.y;
+        values[4 * i + 2] = value.z;
+        values[4 * i + 3] = value.w;
+        maximum = fmaxf(maximum, fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                       fmaxf(fabsf(value.z), fabsf(value.w))));
+    }
+    const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+    row_scale[group] = maximum * (1.0f / 127.0f);
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte)
+            packed |= uint32_t(uint8_t(__float2int_rn(values[word * 4 + byte] * inverse))) << (byte * 8);
+        row_q[group * 4 + word] = packed;
+    }
+}
+
+__global__ __launch_bounds__(256, 1) void quantize_swiglu_x16_rows_kernel(
+    const float *__restrict__ gate,
+    const float *__restrict__ up,
+    uint32_t *__restrict__ xq,
+    float *__restrict__ xscale,
+    int groups,
+    int words_per_row,
+    Nvfp4RowIds rows) {
+    const int group = threadIdx.x;
+    if (group >= groups) return;
+    const size_t base = static_cast<size_t>(rows.ids[blockIdx.x]) * (groups * 16);
+    const float4 *gate4 = reinterpret_cast<const float4 *>(gate + base + group * 16);
+    const float4 *up4 = reinterpret_cast<const float4 *>(up + base + group * 16);
+    uint32_t *row_q = xq + static_cast<size_t>(blockIdx.x) * words_per_row;
+    float *row_scale = xscale + static_cast<size_t>(blockIdx.x) * groups;
+    float values[16];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        const float4 g = __ldg(gate4 + word);
+        const float4 u = __ldg(up4 + word);
+        const float gv[4] = {g.x, g.y, g.z, g.w};
+        const float uv[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float gc = fminf(gv[i], 10.0f);
+            const float uc = fminf(fmaxf(uv[i], -10.0f), 10.0f);
+            const float value = (gc / (1.0f + __expf(-gc))) * uc;
+            values[word * 4 + i] = value;
+            maximum = fmaxf(maximum, fabsf(value));
+        }
+    }
+    const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+    row_scale[group] = maximum * (1.0f / 127.0f);
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte)
+            packed |= uint32_t(uint8_t(__float2int_rn(values[word * 4 + byte] * inverse))) << (byte * 8);
+        row_q[group * 4 + word] = packed;
+    }
+}
+
+__global__ __launch_bounds__(256) void nvfp4_dp4a_rows_kernel(
+    const uint32_t *__restrict__ weights,
+    const uint8_t *__restrict__ scales,
+    const uint32_t *__restrict__ xq,        // [rows][words_per_row]
+    const float *__restrict__ xscale,       // [rows][groups]
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_scale,
+    Nvfp4RowOut out) {
+    __shared__ unsigned long long table[256];
+    const int code = threadIdx.x;
+    const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+    const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+    table[code] = static_cast<unsigned long long>(lo) | (static_cast<unsigned long long>(hi) << 32);
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const uint32_t *row_weights = weights + static_cast<size_t>(row) * groups * 2;
+    const uint8_t *row_scales = scales + static_cast<size_t>(row) * groups;
+    float sums[8] = {};
+#pragma unroll 8
+    for (int group = lane; group < groups; group += 32) {
+        const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
+        uint32_t w0, w1, w2, w3;
+        unpack_e2(packed.x, table, w0, w1);
+        unpack_e2(packed.y, table, w2, w3);
+        const float base_scale = 0.5f * c_e4m3[row_scales[group]] * global_scale;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r >= out.count) break;
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            int dot = __dp4a(int(w0), int(xg[0]), 0);
+            dot = __dp4a(int(w1), int(xg[1]), dot);
+            dot = __dp4a(int(w2), int(xg[2]), dot);
+            dot = __dp4a(int(w3), int(xg[3]), dot);
+            sums[r] = fmaf(float(dot), base_scale * xscale[static_cast<size_t>(r) * groups + group],
+                           sums[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (r >= out.count) break;
+        const float sum = warp_sum(sums[r]);
+        if (!lane) y[static_cast<size_t>(out.ids[r]) * rows + row] = sum;
+    }
+}
+
+__global__ __launch_bounds__(256) void nvfp4_dp4a_acc_rows_kernel(
+    const uint32_t *__restrict__ weights,
+    const uint8_t *__restrict__ scales,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_scale,
+    Nvfp4RowOut out) {
+    __shared__ unsigned long long table[256];
+    const int code = threadIdx.x;
+    const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+    const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+    table[code] = static_cast<unsigned long long>(lo) | (static_cast<unsigned long long>(hi) << 32);
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const uint32_t *row_weights = weights + static_cast<size_t>(row) * groups * 2;
+    const uint8_t *row_scales = scales + static_cast<size_t>(row) * groups;
+    float sums[8] = {};
+#pragma unroll 8
+    for (int group = lane; group < groups; group += 32) {
+        const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
+        uint32_t w0, w1, w2, w3;
+        unpack_e2(packed.x, table, w0, w1);
+        unpack_e2(packed.y, table, w2, w3);
+        const float base_scale = 0.5f * c_e4m3[row_scales[group]] * global_scale;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r >= out.count) break;
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            int dot = __dp4a(int(w0), int(xg[0]), 0);
+            dot = __dp4a(int(w1), int(xg[1]), dot);
+            dot = __dp4a(int(w2), int(xg[2]), dot);
+            dot = __dp4a(int(w3), int(xg[3]), dot);
+            sums[r] = fmaf(float(dot), base_scale * xscale[static_cast<size_t>(r) * groups + group],
+                           sums[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (r >= out.count) break;
+        const float sum = warp_sum(sums[r]);
+        if (!lane) {
+            float *slot = y + static_cast<size_t>(out.ids[r]) * rows;
+            slot[row] = fmaf(sum, out.weights[r], slot[row]);
+        }
+    }
+}
+
+__global__ __launch_bounds__(256) void nvfp4_dp4a_pair_rows_kernel(
+    const uint32_t *__restrict__ weights_a,
+    const uint8_t *__restrict__ scales_a,
+    const uint32_t *__restrict__ weights_b,
+    const uint8_t *__restrict__ scales_b,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y_a,
+    float *__restrict__ y_b,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_a,
+    float global_b,
+    Nvfp4RowIds out) {
+    __shared__ unsigned long long table[256];
+    const int code = threadIdx.x;
+    const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+    const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+    table[code] = static_cast<unsigned long long>(lo) | (static_cast<unsigned long long>(hi) << 32);
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const uint32_t *row_a = weights_a + static_cast<size_t>(row) * groups * 2;
+    const uint32_t *row_b = weights_b + static_cast<size_t>(row) * groups * 2;
+    const uint8_t *scale_a = scales_a + static_cast<size_t>(row) * groups;
+    const uint8_t *scale_b = scales_b + static_cast<size_t>(row) * groups;
+    float sums_a[8] = {}, sums_b[8] = {};
+#pragma unroll 8
+    for (int group = lane; group < groups; group += 32) {
+        const uint2 packed_a = __ldcs(reinterpret_cast<const uint2 *>(row_a + group * 2));
+        const uint2 packed_b = __ldcs(reinterpret_cast<const uint2 *>(row_b + group * 2));
+        uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
+        unpack_e2(packed_a.x, table, a0, a1);
+        unpack_e2(packed_a.y, table, a2, a3);
+        unpack_e2(packed_b.x, table, b0, b1);
+        unpack_e2(packed_b.y, table, b2, b3);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r >= out.count) break;
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            const float activation_scale = 0.5f * xscale[static_cast<size_t>(r) * groups + group];
+            int dot_a = __dp4a(int(a0), int(xg[0]), 0);
+            dot_a = __dp4a(int(a1), int(xg[1]), dot_a);
+            dot_a = __dp4a(int(a2), int(xg[2]), dot_a);
+            dot_a = __dp4a(int(a3), int(xg[3]), dot_a);
+            int dot_b = __dp4a(int(b0), int(xg[0]), 0);
+            dot_b = __dp4a(int(b1), int(xg[1]), dot_b);
+            dot_b = __dp4a(int(b2), int(xg[2]), dot_b);
+            dot_b = __dp4a(int(b3), int(xg[3]), dot_b);
+            sums_a[r] = fmaf(float(dot_a),
+                             activation_scale * c_e4m3[scale_a[group]] * global_a, sums_a[r]);
+            sums_b[r] = fmaf(float(dot_b),
+                             activation_scale * c_e4m3[scale_b[group]] * global_b, sums_b[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (r >= out.count) break;
+        const float sum_a = warp_sum(sums_a[r]);
+        const float sum_b = warp_sum(sums_b[r]);
+        if (!lane) {
+            y_a[static_cast<size_t>(out.ids[r]) * rows + row] = sum_a;
+            y_b[static_cast<size_t>(out.ids[r]) * rows + row] = sum_b;
+        }
+    }
+}
+
 __global__ __launch_bounds__(256, 1) void quantize_x64_kernel(
     const float *__restrict__ x,
     uint32_t *__restrict__ xq,
@@ -595,6 +873,113 @@ cudaError_t quantize_swiglu_activation(
     const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
     auto *xscale = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(workspace) + aligned);
     quantize_swiglu_x16_kernel<<<1, 256, 0, stream>>>(gate, up, xq, xscale, cols / 16);
+    return cudaPeekAtLastError();
+}
+
+size_t nvfp4_workspace_rows_bytes(int cols, int rows) {
+    return nvfp4_workspace_bytes(cols) * static_cast<size_t>(rows);
+}
+
+cudaError_t nvfp4_quantize_activation_rows(
+    const float *x, int cols, const int *row_ids, int count, void *workspace,
+    cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !x || !row_ids || !workspace || count <= 0 || count > 8)
+        return cudaErrorInvalidValue;
+    Nvfp4RowIds batch{};
+    batch.count = count;
+    for (int r = 0; r < count; ++r) batch.ids[r] = row_ids[r];
+    auto *xq = reinterpret_cast<uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    auto *xscale = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(workspace) +
+                                             count * aligned);
+    quantize_x16_rows_kernel<<<count, 256, 0, stream>>>(
+        x, xq, xscale, cols / 16, int(aligned / 4), batch);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t quantize_swiglu_activation_rows(
+    const float *gate, const float *up, int cols, const int *row_ids, int count,
+    void *workspace, cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !gate || !up || !row_ids || !workspace || count <= 0 || count > 8)
+        return cudaErrorInvalidValue;
+    Nvfp4RowIds batch{};
+    batch.count = count;
+    for (int r = 0; r < count; ++r) batch.ids[r] = row_ids[r];
+    auto *xq = reinterpret_cast<uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    auto *xscale = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(workspace) +
+                                             count * aligned);
+    quantize_swiglu_x16_rows_kernel<<<count, 256, 0, stream>>>(
+        gate, up, xq, xscale, cols / 16, int(aligned / 4), batch);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t nvfp4_gemv_dp4a_quantized_rows(
+    const uint8_t *weights, const uint8_t *scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids,
+    int rows, int cols, cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !weights || !scales || !workspace || !y || !y_ids ||
+        rows <= 0 || count <= 0 || count > 8) return cudaErrorInvalidValue;
+    Nvfp4RowOut out{};
+    out.count = count;
+    for (int r = 0; r < count; ++r) out.ids[r] = y_ids[r];
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+    nvfp4_dp4a_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
+        reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale,
+        y, rows, cols / 16, int(aligned / 4), global_scale, out);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows(
+    const uint8_t *weights, const uint8_t *scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids, const float *combine,
+    int rows, int cols, cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !weights || !scales || !workspace || !y || !y_ids || !combine ||
+        rows <= 0 || count <= 0 || count > 8) return cudaErrorInvalidValue;
+    Nvfp4RowOut out{};
+    out.count = count;
+    for (int r = 0; r < count; ++r) {
+        out.ids[r] = y_ids[r];
+        out.weights[r] = combine[r];
+    }
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+    nvfp4_dp4a_acc_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
+        reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale,
+        y, rows, cols / 16, int(aligned / 4), global_scale, out);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t nvfp4_gemv2_dp4a_quantized_rows(
+    const uint8_t *weights_a, const uint8_t *scales_a, float global_scale_a,
+    const uint8_t *weights_b, const uint8_t *scales_b, float global_scale_b,
+    const void *workspace, int count, float *y_a, float *y_b, const int *y_ids,
+    int rows, int cols, cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !weights_a || !scales_a || !weights_b || !scales_b || !workspace ||
+        !y_a || !y_b || !y_ids || rows <= 0 || count <= 0 || count > 8)
+        return cudaErrorInvalidValue;
+    Nvfp4RowIds out{};
+    out.count = count;
+    for (int r = 0; r < count; ++r) out.ids[r] = y_ids[r];
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+    nvfp4_dp4a_pair_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
+        reinterpret_cast<const uint32_t *>(weights_a), scales_a,
+        reinterpret_cast<const uint32_t *>(weights_b), scales_b,
+        xq, xscale, y_a, y_b, rows, cols / 16, int(aligned / 4),
+        global_scale_a, global_scale_b, out);
     return cudaPeekAtLastError();
 }
 

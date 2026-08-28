@@ -1698,6 +1698,9 @@ public:
             early_multi_route_on_ = true;
         }
         early_multi_rows_.resize(size_t(layer_count));
+        if (early_multi_route_on_)
+            std::printf("early multi route: prefetch %s, top-%d, cap %d\n",
+                        early_multi_prefetch_ ? "on" : "off", early_multi_n_, early_multi_max_);
         deep_checks_ = std::getenv("INSIGNIA_GLM53_FINITE_EVERY_LAYER") != nullptr;
         trace_layers_ = std::getenv("INSIGNIA_GLM53_PROFILE") != nullptr;
         if (mla_layers_) {

@@ -1,5 +1,21 @@
 # progress
 
+### 2026-08-28 (session 5) — DFlash2 "regression" resolved: prompt artifact, engine healthy
+
+`audits/dflash2-regression-artifact.md`. The session-4 alarm (1.43
+accepted/round on the bridge) reproduces identically on a **pre-bridge
+binary** and under `MLA_LEGACY=1` — same histogram to the round — so the
+bridge is exonerated. The 1.43 number belongs to the 5-token oracle prompt,
+which parrots `200 200 ...`; the drafter cannot anchor on it (15/21 rounds
+die at the d1 short-circuit). On the 16-token campaign prompt HEAD holds k4
+3.70/round 228.7 ms/tok and k7 5.88/round 227.8 ms/tok at 100 gen — campaign
+levels, parity intact in every A/B. Rule: judge DFlash2 only on the campaign
+prompt or real prompts; the oracle prompt is parity-gate-only. Also landed:
+glm-box's two unpushed commits (`bf577e6`, `c295638` — logits comparator,
+PPL scorer, parameterized bench) reached origin via bundle+scp. Open queue
+unchanged: GSM8K/MATH-500 campaign, latent-MLA >256 validation, CCT
+prefetch; prefill remains expert-I/O-bound.
+
 ### 2026-08-28 (session 4) — glm-box online: 5.3 tok/s peak; latent-MLA bridge; DFlash2 regression OPEN
 
 Full findings in `audits/mla-latent-session.md`. Short form: the 4070 Ti

@@ -45,7 +45,7 @@ using insignia::glm53::Q8Index;
 using insignia::glm53::Q8TensorLocation;
 using insignia::glm53::Cache8Format;
 constexpr int kStreams = insignia::glm53::kHyperStreams;
-constexpr int kMaxContext = insignia::glm53::kMlaMaxContext;
+static int kMaxContext() { static const int limit = [] { const char *v = std::getenv("INSIGNIA_GLM53_CONTEXT"); return std::clamp(v ? std::atoi(v) : 8192, 512, 262144); }(); return limit; }
 constexpr int kLegacyMlaContext = 256;
 
 void check(cudaError_t status, const char *what) {
@@ -1724,15 +1724,15 @@ public:
             mla_keys_.reset(size_t(mla_layers_) * expanded_stride);
             mla_values_.reset(size_t(mla_layers_) * expanded_stride);
         } else {
-            const size_t latent_stride = size_t(kMaxContext) * kv_a_rows_;
+            const size_t latent_stride = size_t(kMaxContext()) * kv_a_rows_;
             const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
             mla_latent_u8_.reset(kv_fp8_ ? size_t(mla_layers_) * latent_stride : 0);
             mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
-            mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext *
+            mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext() *
                                     insignia::glm53::kMlaLatentGroups);
             mla_keys_.reset(size_t(mla_layers_) * expanded_stride);
             mla_values_.reset(size_t(mla_layers_) * expanded_stride);
-            mla_partial_.reset(size_t(mla_heads_) * (kMaxContext / 512) *
+            mla_partial_.reset(size_t(mla_heads_) * ((kMaxContext() + 511) / 512) *
                                (size_t(kv_a_rows_) + 2));
             absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
             w_uk_.reset(absorb_per_layer_ * mla_layers_);
@@ -2338,11 +2338,11 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
         linear(stem + "o_proj.weight", mla_output_, output, hidden_, q_b_rows_);
         return;
     }
-    const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
+    const size_t layer_stride = size_t(kMaxContext()) * kv_a_rows_;
     uint8_t *cache_u8 = kv_fp8_
         ? mla_latent_u8_.get() + size_t(slot) * layer_stride
         : nullptr;
-    float *cache_scale = mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+    float *cache_scale = mla_latent_scale_.get() + size_t(slot) * kMaxContext() *
                          insignia::glm53::kMlaLatentGroups;
     float *cache_f32 = kv_fp8_
         ? nullptr
@@ -2383,10 +2383,10 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
         save_dev(tag + "latent.bin", small_b_.get(), size_t(kv_a_rows_) * sizeof(float));
         save_dev(tag + "out.bin", mla_output_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
         save_dev(tag + "cache.bin",
-                 kv_fp8_ ? (const void *)(mla_latent_u8_.get() + size_t(slot) * size_t(kMaxContext) * kv_a_rows_)
-                         : (const void *)(mla_latent_f32_.get() + size_t(slot) * size_t(kMaxContext) * kv_a_rows_),
+                 kv_fp8_ ? (const void *)(mla_latent_u8_.get() + size_t(slot) * size_t(kMaxContext()) * kv_a_rows_)
+                         : (const void *)(mla_latent_f32_.get() + size_t(slot) * size_t(kMaxContext()) * kv_a_rows_),
                  size_t(position + 1) * kv_a_rows_ * (kv_fp8_ ? 1 : 4));
-        save_dev(tag + "scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+        save_dev(tag + "scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext() *
                      insignia::glm53::kMlaLatentGroups,
                  size_t(position + 1) * insignia::glm53::kMlaLatentGroups * sizeof(float));
     }
@@ -2984,12 +2984,12 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
         linear_multi(stem + "o_proj.weight", c_mlao_, output, tokens, hidden_, q_b_rows_);
         return;
     }
-    const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
+    const size_t layer_stride = size_t(kMaxContext()) * kv_a_rows_;
     uint8_t *cache_u8 = kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr;
     float *cache_f32 = kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride;
     const float *w_uk = w_uk_.get() + size_t(slot) * absorb_per_layer_;
     const float *w_uv = w_uv_.get() + size_t(slot) * absorb_per_layer_;
-    float *cache_scale = mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+    float *cache_scale = mla_latent_scale_.get() + size_t(slot) * kMaxContext() *
                          insignia::glm53::kMlaLatentGroups;
     const bool exact_prefix = position_base + tokens <= kLegacyMlaContext;
     if (exact_prefix) {
@@ -3042,7 +3042,7 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
             save_dev("out.bin", c_mlao_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
             save_dev("cache.bin", kv_fp8_ ? (const void *)cache_u8 : (const void *)cache_f32,
                      size_t(tokens) * kv_a_rows_ * (kv_fp8_ ? 1 : 4));
-            save_dev("scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext *
+            save_dev("scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext() *
                          insignia::glm53::kMlaLatentGroups,
                      size_t(tokens) * insignia::glm53::kMlaLatentGroups * sizeof(float));
             save_dev("wuk.bin", w_uk, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(float));
@@ -3421,7 +3421,7 @@ std::vector<std::pair<int, float>> Runner::step(
     require(token >= 0 && token < int(model_.vocab_size()), "input token is outside vocabulary");
     require(layer_limit >= 1 && layer_limit <= layers,
             "layer limit must be between 1 and the indexed layer count");
-    require(position >= 0 && position < kMaxContext, "position exceeds the exact-attention cache");
+    require(position >= 0 && position < kMaxContext(), "position exceeds the exact-attention cache");
     const TensorLocation &embedding = model_.tensor("model.language_model.embed_tokens.weight");
     require(embedding.type == TensorType::bf16 && embedding.shape.size() == 2 &&
             embedding.shape[0] == model_.vocab_size() && embedding.shape[1] == uint32_t(hidden_),
@@ -3642,7 +3642,22 @@ int main(int argc, char **argv) {
         check(cudaGetDeviceProperties(&properties, 0), "cudaGetDeviceProperties");
         require(properties.major == 8 && properties.minor == 9,
                 "GLM-5.3 runner is deliberately compiled only for sm_89");
-        const std::string encoded = argc >= 4 ? argv[3] : "154820";
+        // Prompt tokens: a literal CSV, or "@file" to read the CSV from a
+        // file (long contexts do not fit any command line).
+        std::string encoded = argc >= 4 ? argv[3] : "154820";
+        if (!encoded.empty() && encoded[0] == '@') {
+            std::FILE *prompt_file = std::fopen(encoded.c_str() + 1, "r");
+            require(prompt_file, "cannot open prompt file");
+            std::vector<char> payload;
+            char chunk[65536];
+            size_t read = 0;
+            while ((read = std::fread(chunk, 1, sizeof(chunk), prompt_file)) > 0)
+                payload.insert(payload.end(), chunk, chunk + read);
+            std::fclose(prompt_file);
+            encoded.assign(payload.begin(), payload.end());
+            while (!encoded.empty() && std::isspace(static_cast<unsigned char>(encoded.back())))
+                encoded.pop_back();
+        }
         std::vector<int> tokens;
         size_t begin_token = 0;
         while (begin_token < encoded.size()) {
@@ -3651,10 +3666,10 @@ int main(int argc, char **argv) {
             if (comma == std::string::npos) break;
             begin_token = comma + 1;
         }
-        require(!tokens.empty() && tokens.size() <= kMaxContext, "token list must contain 1..8192 IDs");
+        require(!tokens.empty() && tokens.size() <= kMaxContext(), "token list exceeds the context limit");
         const int layers_argc = argc >= 5 ? std::atoi(argv[4]) : 0;
         const int generate = argc >= 6 ? std::atoi(argv[5]) : 1;
-        require(generate >= 1 && tokens.size() + size_t(generate) - 1 <= kMaxContext,
+        require(generate >= 1 && tokens.size() + size_t(generate) - 1 <= kMaxContext(),
                 "generation must fit the exact-attention cache");
         Runner runner(argv[1], argv[2], argc >= 7 ? argv[6] : "");
         const int layers = layers_argc > 0 ? layers_argc : runner.layer_count();
@@ -3726,6 +3741,10 @@ int main(int argc, char **argv) {
                 std::printf("\n");
                 std::fflush(stdout);
                 while (int(generated.size()) < generate) {
+                    // The drafter attends over a fixed 264-position KV window;
+                    // past it the block proposals have no context, so fall
+                    // back to plain greedy steps for the remainder.
+                    if (position + 1 >= insignia::glm53::DFlash2Drafter::kMaxCtx) break;
                     int round_verify_k = verify_k;
                     if (adaptive_k_on && accept_ema_init)
                         round_verify_k = std::clamp(int(accept_ema * 1.3) + 1, 2, verify_k);
@@ -3815,6 +3834,16 @@ int main(int argc, char **argv) {
                     accept_total += matched;
                     ++rounds;
                     std::fflush(stdout);
+                }
+                // Drafter window exhausted (position >= 263): plain greedy
+                // steps for the remainder, same shape as the empty-round
+                // fallback.
+                while (int(generated.size()) < generate) {
+                    generated.push_back(truth0);
+                    if (int(generated.size()) >= generate) break;
+                    top = runner.step(truth0, position + 1, layers, true);
+                    truth0 = top.front().first;
+                    ++position;
                 }
                 const double decode_seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - decode_begin).count();

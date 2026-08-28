@@ -46,6 +46,7 @@ using insignia::glm53::Q8TensorLocation;
 using insignia::glm53::Cache8Format;
 constexpr int kStreams = insignia::glm53::kHyperStreams;
 constexpr int kMaxContext = insignia::glm53::kMlaMaxContext;
+constexpr int kLegacyMlaContext = 256;
 
 void check(cudaError_t status, const char *what) {
     if (status != cudaSuccess)
@@ -1490,18 +1491,26 @@ public:
         logits_.reset(model_.vocab_size());
         kda_states_.reset(size_t(layer_count) * kda_width_ * kda_head_dim_);
         conv_history_.reset(size_t(layer_count) * 9 * kda_width_);
+        mla_legacy_ = std::getenv("INSIGNIA_GLM53_MLA_LEGACY") != nullptr;
         kv_fp8_ = !std::getenv("INSIGNIA_GLM53_KV_FP8") ||
                   std::atoi(std::getenv("INSIGNIA_GLM53_KV_FP8")) != 0;
-        const size_t latent_stride = size_t(kMaxContext) * kv_a_rows_;
-        mla_latent_u8_.reset(kv_fp8_ ? size_t(mla_layers_) * latent_stride : 0);
-        mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
-        mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext *
-                                insignia::glm53::kMlaLatentGroups);
-        mla_partial_.reset(size_t(mla_heads_) * (kMaxContext / 512) * (size_t(kv_a_rows_) + 2));
-        absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
-        w_uk_.reset(absorb_per_layer_ * mla_layers_);
-        w_uv_.reset(absorb_per_layer_ * mla_layers_);
-        extract_mla_absorb();
+        if (mla_legacy_) {
+            const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+            mla_keys_.reset(size_t(mla_layers_) * expanded_stride);
+            mla_values_.reset(size_t(mla_layers_) * expanded_stride);
+        } else {
+            const size_t latent_stride = size_t(kMaxContext) * kv_a_rows_;
+            mla_latent_u8_.reset(kv_fp8_ ? size_t(mla_layers_) * latent_stride : 0);
+            mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
+            mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext *
+                                    insignia::glm53::kMlaLatentGroups);
+            mla_partial_.reset(size_t(mla_heads_) * (kMaxContext / 512) *
+                               (size_t(kv_a_rows_) + 2));
+            absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
+            w_uk_.reset(absorb_per_layer_ * mla_layers_);
+            w_uv_.reset(absorb_per_layer_ * mla_layers_);
+            extract_mla_absorb();
+        }
         c_stream_a_.reset(size_t(kMaxChunk) * kStreams * hidden_);
         c_stream_b_.reset(c_stream_a_.size());
         c_collapsed_.reset(size_t(kMaxChunk) * hidden_);
@@ -1726,7 +1735,8 @@ private:
     // merge scratch [heads, tiles, latent+2].
     DeviceBuffer<uint8_t> mla_latent_u8_;
     DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_, w_uk_, w_uv_;
-    bool kv_fp8_ = true;
+    DeviceBuffer<float> mla_keys_, mla_values_;
+    bool kv_fp8_ = true, mla_legacy_ = false;
     size_t absorb_per_layer_ = 0;
     const uint32_t *chunk_bf16_weights_ = nullptr;
     DeviceBuffer<float> c_stream_a_, c_stream_b_, c_collapsed_, c_normalized_, c_attn_, c_ffn_;
@@ -2065,6 +2075,17 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
     linear(stem + "kv_a_proj_with_mqa.weight", input, small_a_, kv_a_rows_, hidden_);
     rms(stem + "kv_a_layernorm.weight", small_a_, small_b_, 1, kv_a_rows_);
     const int slot = int(std::find(mla_slot_.begin(), mla_slot_.end(), layer) - mla_slot_.begin());
+    if (mla_legacy_) {
+        require(position < kLegacyMlaContext, "legacy MLA context exceeds 256 tokens");
+        linear(stem + "kv_b_proj.weight", small_b_, kv_, kv_b_rows_, kv_a_rows_);
+        const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+        check(insignia::glm53::mla_decode(mla_query_, kv_,
+              mla_keys_.get() + size_t(slot) * expanded_stride,
+              mla_values_.get() + size_t(slot) * expanded_stride,
+              mla_output_, position, mla_heads_, mla_head_dim_), "legacy MLA attention");
+        linear(stem + "o_proj.weight", mla_output_, output, hidden_, q_b_rows_);
+        return;
+    }
     const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
     check(insignia::glm53::mla_decode_latent(mla_query_.get(), small_b_.get(),
         kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr,
@@ -2649,9 +2670,24 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
     linear_multi(stem + "q_a_proj.weight", input, c_small_, tokens, q_a_rows_, hidden_);
     rms(stem + "q_a_layernorm.weight", c_small_, c_small_, tokens, q_a_rows_);
     linear_multi(stem + "q_b_proj.weight", c_small_, c_mlaq_, tokens, q_b_rows_, q_a_rows_);
-    linear_multi(stem + "kv_a_proj_with_mqa.weight", input, c_kv_, tokens, kv_a_rows_, hidden_);
-    rms(stem + "kv_a_layernorm.weight", c_kv_, c_small_, tokens, kv_a_rows_);
+    linear_multi(stem + "kv_a_proj_with_mqa.weight", input, c_small_, tokens, kv_a_rows_, hidden_);
+    rms(stem + "kv_a_layernorm.weight", c_small_, c_small_, tokens, kv_a_rows_);
     const int slot = int(std::find(mla_slot_.begin(), mla_slot_.end(), layer) - mla_slot_.begin());
+    if (mla_legacy_) {
+        require(position_base + tokens <= kLegacyMlaContext,
+                "legacy MLA prefill exceeds 256 tokens");
+        linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_, tokens,
+                     kv_b_rows_, kv_a_rows_);
+        const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+        check(insignia::glm53::mla_flash2_prefill(
+              c_mlaq_, c_kv_,
+              mla_keys_.get() + size_t(slot) * expanded_stride,
+              mla_values_.get() + size_t(slot) * expanded_stride,
+              c_mlao_, tokens, position_base, mla_heads_, mla_head_dim_),
+              "legacy FlashAttention-2 MLA prefill");
+        linear_multi(stem + "o_proj.weight", c_mlao_, output, tokens, hidden_, q_b_rows_);
+        return;
+    }
     const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
     uint8_t *cache_u8 = kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr;
     float *cache_f32 = kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride;

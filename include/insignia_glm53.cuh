@@ -99,7 +99,8 @@ constexpr int kHyperStreams = 4;
 constexpr int kKdaHeads = 64;
 constexpr int kKdaHeadDim = 128;
 constexpr int kMlaHeadDim = 256;
-constexpr int kMlaMaxContext = 256;
+constexpr int kMlaMaxContext = 8192;
+constexpr int kMlaLatentDim = 512;
 
 // Scratch for the mHC dot-product and RMS partials.
 size_t mhc_workspace_bytes();
@@ -204,6 +205,71 @@ cudaError_t mla_flash2_prefill(
     int position_base,
     int heads = kKdaHeads,
     int head_dim = kMlaHeadDim,
+    cudaStream_t stream = nullptr);
+
+// Latent-cache MLA: the cache holds the compressed post-kv_a-layernorm
+// latent [kMlaLatentDim] per (layer, position) instead of the expanded
+// per-head K/V, so a full 8192-token cache costs ~50 MiB in FP8 instead of
+// ~12 GiB in FP32.  Attention runs in absorbed form: scores are
+// (q_head @ W_uk_head) . latent and the output is
+// W_uv_head @ (softmax-weighted latent sum), which is algebraically the
+// same attention but touches the 512-wide latent instead of the 16384-wide
+// expanded K/V.  w_uk and w_uv are BF16 [heads,head_dim,latent_dim]
+// row-major (j-major) per-head blocks of the kv_b_proj K and V halves.
+// When cache_f32 is non-null the cache is FP32 and scales are ignored
+// (INSIGNIA_GLM53_KV_FP8=0 A/B path); otherwise cache is e4m3 with one
+// FP32 absmax/448 scale per position.
+
+// Appends `tokens` latents [tokens,latent_dim] at positions
+// position_base..; writes e4m3 bytes into cache and scales into scales
+// (or FP32 into cache_f32 when it is non-null).
+cudaError_t mla_store_latent(
+    const float *latent,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    int tokens,
+    int position_base,
+    int latent_dim = kMlaLatentDim,
+    cudaStream_t stream = nullptr);
+
+// Single-token decode against the latent cache.  query is
+// [heads,head_dim]; latent is the current token's [latent_dim] pre-norm
+// latent, appended to the cache at `position` by this call.  partial
+// scratch holds [heads,tiles,latent_dim+2] FP32 merge data.
+cudaError_t mla_decode_latent(
+    const float *query,
+    const float *latent,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    const uint16_t *w_uk,
+    const uint16_t *w_uv,
+    float *partial,
+    float *output,
+    int position,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    int latent_dim = kMlaLatentDim,
+    cudaStream_t stream = nullptr);
+
+// Prefill `tokens` queries [tokens,heads,head_dim] against the latent
+// cache, appending the `tokens` latents [tokens,latent_dim] first (causal
+// mask inside the chunk mirrors the expanded flash2 path).
+cudaError_t mla_prefill_latent(
+    const float *query,
+    const float *latents,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    const uint16_t *w_uk,
+    const uint16_t *w_uv,
+    float *output,
+    int tokens,
+    int position_base,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    int latent_dim = kMlaLatentDim,
     cudaStream_t stream = nullptr);
 
 }  // namespace insignia::glm53

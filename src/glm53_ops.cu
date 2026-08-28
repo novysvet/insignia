@@ -1,5 +1,6 @@
 #include "insignia_glm53.cuh"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -12,6 +13,21 @@ __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset; offset >>= 1)
         value += __shfl_xor_sync(0xffffffff, value, offset);
     return value;
+}
+
+__device__ __forceinline__ float warp_max(float value) {
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, offset));
+    return value;
+}
+
+__device__ __forceinline__ float fp8_to_float(uint8_t value) {
+    return __half2float(__nv_cvt_fp8_to_halfraw(value, __NV_E4M3));
+}
+
+__device__ __forceinline__ uint8_t float_to_fp8(float value) {
+    return uint8_t(__nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3));
 }
 
 __device__ __forceinline__ float bf16_to_float(uint16_t value) {
@@ -454,12 +470,17 @@ __global__ __launch_bounds__(256) void mla_decode_kernel(
     value_cache[position * cache_stride + vector_offset] = kv[head * (2 * head_dim) + head_dim + element];
     __syncthreads();
 
-    __shared__ float logits[kMlaMaxContext];
+    // Online softmax: the two-pass form needs logits[kMlaMaxContext] shared
+    // memory, which no longer fits now that the window is 8192.
+    __shared__ float broadcast;
     __shared__ float partial[8];
     const int lane = element & 31;
     const int warp = element >> 5;
     const float q = query[vector_offset];
     const float scale = rsqrtf((float)head_dim);
+    float maximum = -3.402823466e38F;
+    float denominator = 0.0f;
+    float result = 0.0f;
     for (int token = 0; token <= position; ++token) {
         float dot = warp_sum(q * key_cache[token * cache_stride + vector_offset]);
         if (!lane) partial[warp] = dot;
@@ -468,26 +489,18 @@ __global__ __launch_bounds__(256) void mla_decode_kernel(
             float total = 0.0f;
 #pragma unroll 4
             for (int index = 0; index < warps; ++index) total += partial[index];
-            logits[token] = total * scale;
+            broadcast = total * scale;
         }
         __syncthreads();
+        const float score = broadcast;
+        const float maximum_new = fmaxf(maximum, score);
+        const float correction = expf(maximum - maximum_new);
+        const float weight = expf(score - maximum_new);
+        maximum = maximum_new;
+        denominator = denominator * correction + weight;
+        result = fmaf(weight, value_cache[token * cache_stride + vector_offset], result * correction);
     }
-    if (!element) {
-        float maximum = -3.402823466e38F;
-        for (int token = 0; token <= position; ++token) maximum = fmaxf(maximum, logits[token]);
-        float denominator = 0.0f;
-        for (int token = 0; token <= position; ++token) {
-            logits[token] = expf(logits[token] - maximum);
-            denominator += logits[token];
-        }
-        const float inverse = 1.0f / denominator;
-        for (int token = 0; token <= position; ++token) logits[token] *= inverse;
-    }
-    __syncthreads();
-    float result = 0.0f;
-    for (int token = 0; token <= position; ++token)
-        result = fmaf(logits[token], value_cache[token * cache_stride + vector_offset], result);
-    output[vector_offset] = result;
+    output[vector_offset] = result / denominator;
 }
 
 __global__ __launch_bounds__(256) void mla_store_kv_batch_kernel(
@@ -544,8 +557,17 @@ __global__ __launch_bounds__(256, 2) void mla_flash2_prefill_kernel(
     }
 
     __shared__ float partial[kQueries][8];
-    __shared__ float logits[kQueries][kMlaMaxContext];
+    __shared__ float scores[kQueries];
     const int last_key = position_base + query_base + query_count - 1;
+
+    // Online softmax keeps the per-query state in registers; the old
+    // two-pass form needed logits[kQueries][kMlaMaxContext] shared memory.
+    float maximum[kQueries], denominator[kQueries];
+#pragma unroll
+    for (int slot = 0; slot < kQueries; ++slot) {
+        maximum[slot] = -3.402823466e38F;
+        denominator[slot] = 0.0f;
+    }
 
     for (int key = 0; key <= last_key; ++key) {
         const size_t cache_index = size_t(key) * width + head_offset;
@@ -563,39 +585,29 @@ __global__ __launch_bounds__(256, 2) void mla_flash2_prefill_kernel(
                 float dot = 0.0f;
 #pragma unroll 4
                 for (int part = 0; part < warps; ++part) dot += partial[slot][part];
-                logits[slot][key] = dot * scale;
+                scores[slot] = dot * scale;
             }
         }
         __syncthreads();
-    }
 
-    if (element < query_count) {
-        const int slot = element;
-        const int query_last_key = position_base + query_base + slot;
-        float maximum = -3.402823466e38F;
-        for (int key = 0; key <= query_last_key; ++key)
-            maximum = fmaxf(maximum, logits[slot][key]);
-        float denominator = 0.0f;
-        for (int key = 0; key <= query_last_key; ++key) {
-            logits[slot][key] = expf(logits[slot][key] - maximum);
-            denominator += logits[slot][key];
-        }
-        const float inverse = 1.0f / denominator;
-        for (int key = 0; key <= query_last_key; ++key) logits[slot][key] *= inverse;
-    }
-    __syncthreads();
-
-    for (int key = 0; key <= last_key; ++key) {
-        const float value = value_cache[size_t(key) * width + head_offset];
+        const float value = value_cache[cache_index];
 #pragma unroll
-        for (int slot = 0; slot < kQueries; ++slot)
-            if (slot < query_count && key <= position_base + query_base + slot)
-                accumulator[slot] = fmaf(logits[slot][key], value, accumulator[slot]);
+        for (int slot = 0; slot < kQueries; ++slot) {
+            if (slot < query_count && key <= position_base + query_base + slot) {
+                const float score = scores[slot];
+                const float maximum_new = fmaxf(maximum[slot], score);
+                const float correction = expf(maximum[slot] - maximum_new);
+                const float weight = expf(score - maximum_new);
+                maximum[slot] = maximum_new;
+                denominator[slot] = denominator[slot] * correction + weight;
+                accumulator[slot] = fmaf(weight, value, accumulator[slot] * correction);
+            }
+        }
     }
 #pragma unroll
     for (int slot = 0; slot < kQueries; ++slot)
         if (slot < query_count)
-            output[size_t(query_base + slot) * width + head_offset] = accumulator[slot];
+            output[size_t(query_base + slot) * width + head_offset] = accumulator[slot] / denominator[slot];
 }
 
 }  // namespace
@@ -743,6 +755,355 @@ cudaError_t mla_flash2_prefill(
     mla_flash2_prefill_kernel<queries>
         <<<dim3(heads, (tokens + queries - 1) / queries), head_dim, 0, stream>>>(
             query, key_cache, value_cache, output, tokens, position_base, heads, head_dim);
+    return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// Latent-cache MLA (absorbed).  The cache stores the compressed
+// post-kv_a-layernorm latent (512 wide) per position instead of the expanded
+// per-head K/V (16384 wide), so an 8192-token cache costs ~50 MiB in FP8.
+// Attention runs algebraically identically: scores are (q_head @ W_uk) . c_kv
+// and the output is W_uv @ (weighted latent sum).
+// ---------------------------------------------------------------------------
+
+constexpr int kMlaDecodeTile = 512;
+
+__global__ __launch_bounds__(512) void mla_store_latent_kernel(
+    const float *__restrict__ latent,
+    uint8_t *__restrict__ cache,
+    float *__restrict__ scales,
+    float *__restrict__ cache_f32,
+    int position_base,
+    int latent_dim) {
+    const int token = blockIdx.x;
+    const int dim = threadIdx.x;
+    const float value = latent[size_t(token) * latent_dim + dim];
+    __shared__ float partial[16];
+    __shared__ float scale_shared;
+    const int lane = dim & 31;
+    const int warp = dim >> 5;
+    float magnitude = warp_max(fabsf(value));
+    if (!lane) partial[warp] = magnitude;
+    __syncthreads();
+    if (!dim) {
+        float peak = 0.0f;
+        for (int index = 0; index < (latent_dim >> 5); ++index) peak = fmaxf(peak, partial[index]);
+        scale_shared = fmaxf(peak / 448.0f, 1e-30f);
+        if (scales) scales[position_base + token] = scale_shared;
+    }
+    __syncthreads();
+    if (cache_f32) {
+        cache_f32[size_t(position_base + token) * latent_dim + dim] = value;
+    } else {
+        cache[size_t(position_base + token) * latent_dim + dim] =
+            float_to_fp8(value / scale_shared);
+    }
+}
+
+// Stage 1: one block per (head, tile of keys).  Absorbs q into the latent
+// space (q_eff = q @ W_uk), runs the online softmax over its tile, and
+// writes (max, denominator, weighted latent sum) partials.
+__global__ __launch_bounds__(256) void mla_decode_latent_partial_kernel(
+    const float *__restrict__ query,
+    const uint8_t *__restrict__ cache,
+    const float *__restrict__ scales,
+    const float *__restrict__ cache_f32,
+    const uint16_t *__restrict__ w_uk,
+    float *__restrict__ partial,
+    int position,
+    int tiles,
+    int latent_dim) {
+    const int head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int first = tile * kMlaDecodeTile;
+    const int last = min(position, first + kMlaDecodeTile - 1);
+    const int element = threadIdx.x;  // owns latent dims element and element+256
+    const int lane = element & 31;
+    const int warp = element >> 5;
+    __shared__ float q_shared[256];
+    __shared__ float partial_sum[8];
+    __shared__ float broadcast;
+    __shared__ float scale_shared;
+
+    q_shared[element] = query[head * 256 + element];
+    __syncthreads();
+
+    float qe0 = 0.0f, qe1 = 0.0f;
+    for (int j = 0; j < 256; ++j) {
+        const float qj = q_shared[j];
+        const uint16_t *row = w_uk + (size_t(head) * 256 + j) * latent_dim;
+        qe0 = fmaf(qj, bf16_to_float(row[element]), qe0);
+        qe1 = fmaf(qj, bf16_to_float(row[element + 256]), qe1);
+    }
+
+    float maximum = -3.402823466e38F;
+    float denominator = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const float scale = rsqrtf(256.0f);
+    for (int key = first; key <= last; ++key) {
+        float k0, k1;
+        if (cache_f32) {
+            k0 = cache_f32[size_t(key) * latent_dim + element];
+            k1 = cache_f32[size_t(key) * latent_dim + element + 256];
+        } else {
+            if (!element) scale_shared = scales[key];
+            __syncthreads();
+            const float dequant = scale_shared;
+            k0 = fp8_to_float(cache[size_t(key) * latent_dim + element]) * dequant;
+            k1 = fp8_to_float(cache[size_t(key) * latent_dim + element + 256]) * dequant;
+        }
+        const float dot = warp_sum(qe0 * k0 + qe1 * k1);
+        if (!lane) partial_sum[warp] = dot;
+        __syncthreads();
+        if (!element) {
+            float total = 0.0f;
+#pragma unroll
+            for (int index = 0; index < 8; ++index) total += partial_sum[index];
+            broadcast = total * scale;
+        }
+        __syncthreads();
+        const float score = broadcast;
+        const float maximum_new = fmaxf(maximum, score);
+        const float correction = expf(maximum - maximum_new);
+        const float weight = expf(score - maximum_new);
+        maximum = maximum_new;
+        denominator = denominator * correction + weight;
+        acc0 = fmaf(weight, k0, acc0 * correction);
+        acc1 = fmaf(weight, k1, acc1 * correction);
+    }
+
+    float *dst = partial + (size_t(head) * tiles + tile) * (latent_dim + 2);
+    if (!element) {
+        dst[0] = maximum;
+        dst[1] = denominator;
+    }
+    dst[2 + element] = acc0;
+    dst[2 + element + 256] = acc1;
+}
+
+// Stage 2: one block per head.  Merges tile partials, then projects the
+// normalized weighted latent sum through W_uv (rows transposed to
+// [head_dim, latent_dim] so each output dimension streams one row).
+__global__ __launch_bounds__(256) void mla_decode_latent_merge_kernel(
+    const uint16_t *__restrict__ w_uv,
+    const float *__restrict__ partial,
+    float *__restrict__ output,
+    int tiles,
+    int latent_dim) {
+    const int head = blockIdx.x;
+    const int element = threadIdx.x;  // owns latent dims element and element+256
+    const float *base = partial + size_t(head) * tiles * (latent_dim + 2);
+    float maximum = -3.402823466e38F;
+    float denominator = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int tile = 0; tile < tiles; ++tile) {
+        const float *src = base + size_t(tile) * (latent_dim + 2);
+        const float tile_max = src[0];
+        const float tile_denominator = src[1];
+        const float maximum_new = fmaxf(maximum, tile_max);
+        const float correction = expf(maximum - maximum_new);
+        const float tile_correction = expf(tile_max - maximum_new);
+        maximum = maximum_new;
+        denominator = denominator * correction + tile_denominator * tile_correction;
+        acc0 = fmaf(src[2 + element], tile_correction, acc0 * correction);
+        acc1 = fmaf(src[2 + element + 256], tile_correction, acc1 * correction);
+    }
+    const float inverse = 1.0f / denominator;
+    __shared__ float acc[512];
+    acc[element] = acc0 * inverse;
+    acc[element + 256] = acc1 * inverse;
+    __syncthreads();
+    const uint16_t *row = w_uv + (size_t(head) * 256 + element) * latent_dim;
+    float total = 0.0f;
+    for (int c = 0; c < latent_dim; ++c) total = fmaf(acc[c], bf16_to_float(row[c]), total);
+    output[head * 256 + element] = total;
+}
+
+// Absorbed prefill: eight queries per block, latent cache keys, online
+// softmax with the same causal masking as the expanded flash2 kernel.
+__global__ __launch_bounds__(256) void mla_prefill_latent_kernel(
+    const float *__restrict__ query,
+    const uint8_t *__restrict__ cache,
+    const float *__restrict__ scales,
+    const float *__restrict__ cache_f32,
+    const uint16_t *__restrict__ w_uk,
+    const uint16_t *__restrict__ w_uv,
+    float *__restrict__ output,
+    int tokens,
+    int position_base,
+    int latent_dim) {
+    const int head = blockIdx.x;
+    const int query_base = blockIdx.y * 8;
+    const int query_count = min(8, tokens - query_base);
+    const int element = threadIdx.x;  // owns latent dims element and element+256
+    const int lane = element & 31;
+    const int warp = element >> 5;
+    const int width = gridDim.x * 256;
+    __shared__ float q_shared[256];
+    __shared__ float partial_sum[8][8];
+    __shared__ float scores[8];
+    __shared__ float acc_shared[512];
+    __shared__ float scale_shared;
+
+    float qe[8][2];
+#pragma unroll
+    for (int slot = 0; slot < 8; ++slot) qe[slot][0] = qe[slot][1] = 0.0f;
+    const float score_scale = rsqrtf(256.0f);
+    for (int slot = 0; slot < query_count; ++slot) {
+        const float *qrow = query + size_t(query_base + slot) * width + head * 256;
+        q_shared[element] = qrow[element];
+        __syncthreads();
+        float e0 = 0.0f, e1 = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            const float qj = q_shared[j];
+            const uint16_t *row = w_uk + (size_t(head) * 256 + j) * latent_dim;
+            e0 = fmaf(qj, bf16_to_float(row[element]), e0);
+            e1 = fmaf(qj, bf16_to_float(row[element + 256]), e1);
+        }
+        qe[slot][0] = e0;
+        qe[slot][1] = e1;
+        __syncthreads();
+    }
+
+    float maximum[8], denominator[8], acc0[8], acc1[8];
+#pragma unroll
+    for (int slot = 0; slot < 8; ++slot) {
+        maximum[slot] = -3.402823466e38F;
+        denominator[slot] = 0.0f;
+        acc0[slot] = acc1[slot] = 0.0f;
+    }
+    const int last_key = position_base + query_base + query_count - 1;
+    for (int key = 0; key <= last_key; ++key) {
+        float k0, k1;
+        if (cache_f32) {
+            k0 = cache_f32[size_t(key) * latent_dim + element];
+            k1 = cache_f32[size_t(key) * latent_dim + element + 256];
+        } else {
+            if (!element) scale_shared = scales[key];
+            __syncthreads();
+            const float dequant = scale_shared;
+            k0 = fp8_to_float(cache[size_t(key) * latent_dim + element]) * dequant;
+            k1 = fp8_to_float(cache[size_t(key) * latent_dim + element + 256]) * dequant;
+        }
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            const float dot = warp_sum(qe[slot][0] * k0 + qe[slot][1] * k1);
+            if (!lane) partial_sum[slot][warp] = dot;
+        }
+        __syncthreads();
+        if (element < 8) {
+            float total = 0.0f;
+#pragma unroll
+            for (int index = 0; index < 8; ++index) total += partial_sum[element][index];
+            scores[element] = total * score_scale;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            if (slot < query_count && key <= position_base + query_base + slot) {
+                const float score = scores[slot];
+                const float maximum_new = fmaxf(maximum[slot], score);
+                const float correction = expf(maximum[slot] - maximum_new);
+                const float weight = expf(score - maximum_new);
+                maximum[slot] = maximum_new;
+                denominator[slot] = denominator[slot] * correction + weight;
+                acc0[slot] = fmaf(weight, k0, acc0[slot] * correction);
+                acc1[slot] = fmaf(weight, k1, acc1[slot] * correction);
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int slot = 0; slot < query_count; ++slot) {
+        const float inverse = 1.0f / denominator[slot];
+        acc_shared[element] = acc0[slot] * inverse;
+        acc_shared[element + 256] = acc1[slot] * inverse;
+        __syncthreads();
+        const uint16_t *row = w_uv + (size_t(head) * 256 + element) * latent_dim;
+        float total = 0.0f;
+        for (int c = 0; c < latent_dim; ++c) total = fmaf(acc_shared[c], bf16_to_float(row[c]), total);
+        output[size_t(query_base + slot) * width + head * 256 + element] = total;
+        __syncthreads();
+    }
+}
+
+cudaError_t mla_store_latent(
+    const float *latent,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    int tokens,
+    int position_base,
+    int latent_dim,
+    cudaStream_t stream) {
+    if (!latent || tokens <= 0 || position_base < 0 ||
+        position_base + tokens > kMlaMaxContext || latent_dim != kMlaLatentDim ||
+        (!cache && !cache_f32))
+        return cudaErrorInvalidValue;
+    mla_store_latent_kernel<<<tokens, latent_dim, 0, stream>>>(
+        latent, cache, scales, cache_f32, position_base, latent_dim);
+    return cudaGetLastError();
+}
+
+cudaError_t mla_decode_latent(
+    const float *query,
+    const float *latent,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    const uint16_t *w_uk,
+    const uint16_t *w_uv,
+    float *partial,
+    float *output,
+    int position,
+    int heads,
+    int head_dim,
+    int latent_dim,
+    cudaStream_t stream) {
+    if (position < 0 || position >= kMlaMaxContext) return cudaErrorInvalidValue;
+    if (heads != kKdaHeads || head_dim != kMlaHeadDim || latent_dim != kMlaLatentDim ||
+        !query || !latent || !w_uk || !w_uv || !partial || !output)
+        return cudaErrorInvalidValue;
+    mla_store_latent_kernel<<<1, latent_dim, 0, stream>>>(
+        latent, cache, scales, cache_f32, position, latent_dim);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    const int tiles = (position + kMlaDecodeTile) / kMlaDecodeTile;
+    mla_decode_latent_partial_kernel<<<dim3(heads, tiles), 256, 0, stream>>>(
+        query, cache, scales, cache_f32, w_uk, partial, position, tiles, latent_dim);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    mla_decode_latent_merge_kernel<<<heads, 256, 0, stream>>>(
+        w_uv, partial, output, tiles, latent_dim);
+    return cudaGetLastError();
+}
+
+cudaError_t mla_prefill_latent(
+    const float *query,
+    const float *latents,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    const uint16_t *w_uk,
+    const uint16_t *w_uv,
+    float *output,
+    int tokens,
+    int position_base,
+    int heads,
+    int head_dim,
+    int latent_dim,
+    cudaStream_t stream) {
+    if (tokens <= 0 || tokens > 32 || position_base < 0 ||
+        position_base + tokens > kMlaMaxContext || heads != kKdaHeads ||
+        head_dim != kMlaHeadDim || latent_dim != kMlaLatentDim ||
+        !query || !latents || !w_uk || !w_uv || !output)
+        return cudaErrorInvalidValue;
+    mla_store_latent_kernel<<<tokens, latent_dim, 0, stream>>>(
+        latents, cache, scales, cache_f32, position_base, latent_dim);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    mla_prefill_latent_kernel<<<dim3(heads, (tokens + 7) / 8), 256, 0, stream>>>(
+        query, cache, scales, cache_f32, w_uk, w_uv, output, tokens, position_base, latent_dim);
     return cudaGetLastError();
 }
 

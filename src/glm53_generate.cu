@@ -1414,7 +1414,7 @@ public:
                 // touches 42 x 8 = 336 records, so the tier must exceed that
                 // to hit at all. Default 5 GiB pinned (~370 records) inside
                 // the 14 GiB WSL VM; VRAM keeps only the 13.5 MiB H2D target.
-                uint64_t host_cache = 6600ull << 20;
+                uint64_t host_cache = 32768ull << 20;
                 if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_CACHE_MB"))
                     host_cache = uint64_t(std::max(0, std::atoi(budget))) << 20;
                 expert_stager_ = std::make_unique<ExpertStager>(model_, host_cache);
@@ -1451,8 +1451,17 @@ public:
         logits_.reset(model_.vocab_size());
         kda_states_.reset(size_t(layer_count) * kda_width_ * kda_head_dim_);
         conv_history_.reset(size_t(layer_count) * 9 * kda_width_);
-        mla_keys_.reset(size_t(mla_layers_) * kMaxContext * mla_heads_ * mla_head_dim_);
-        mla_values_.reset(mla_keys_.size());
+        kv_fp8_ = !std::getenv("INSIGNIA_GLM53_KV_FP8") ||
+                  std::atoi(std::getenv("INSIGNIA_GLM53_KV_FP8")) != 0;
+        const size_t latent_stride = size_t(kMaxContext) * kv_a_rows_;
+        mla_latent_u8_.reset(kv_fp8_ ? size_t(mla_layers_) * latent_stride : 0);
+        mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
+        mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext);
+        mla_partial_.reset(size_t(mla_heads_) * (kMaxContext / 512) * (size_t(kv_a_rows_) + 2));
+        absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
+        w_uk_.reset(absorb_per_layer_ * mla_layers_);
+        w_uv_.reset(absorb_per_layer_ * mla_layers_);
+        extract_mla_absorb();
         c_stream_a_.reset(size_t(kMaxChunk) * kStreams * hidden_);
         c_stream_b_.reset(c_stream_a_.size());
         c_collapsed_.reset(size_t(kMaxChunk) * hidden_);
@@ -1584,6 +1593,7 @@ private:
              const float *streams, float *normalized);
     void kda(int layer, const float *input, float *output, int position);
     void mla(int layer, const float *input, float *output, int position);
+    void extract_mla_absorb();
     void compute_mlp(std::string_view stem, const float *input, float *output, int intermediate);
     void dense_mlp(std::string_view stem, const float *input, float *output, int intermediate);
     void sparse_moe(int layer, const float *input, float *output);
@@ -1669,7 +1679,16 @@ private:
     DeviceBuffer<float> gate_, up_, activation_, router_, beta_;
     DeviceBuffer<float> logits_;
     DeviceBuffer<int> finite_;
-    DeviceBuffer<float> kda_states_, conv_history_, mla_keys_, mla_values_;
+    DeviceBuffer<float> kda_states_, conv_history_;
+    // Latent-cache MLA: compressed kv_lora-wide latents (FP8 e4m3 with
+    // per-token scales, or FP32 for the INSIGNIA_GLM53_KV_FP8=0 A/B path),
+    // per-head absorb weights projected out of kv_b_proj, and flash-decode
+    // merge scratch [heads, tiles, latent+2].
+    DeviceBuffer<uint8_t> mla_latent_u8_;
+    DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_;
+    DeviceBuffer<uint16_t> w_uk_, w_uv_;
+    bool kv_fp8_ = true;
+    size_t absorb_per_layer_ = 0;
     const uint32_t *chunk_bf16_weights_ = nullptr;
     DeviceBuffer<float> c_stream_a_, c_stream_b_, c_collapsed_, c_normalized_, c_attn_, c_ffn_;
     DeviceBuffer<float> c_routed_, c_expert_out_, c_q_, c_k_, c_v_, c_gate_, c_core_, c_proj_, c_small_;
@@ -1929,6 +1948,41 @@ void Runner::kda(int layer, const float *input, float *output, int position) {
     linear(stem + "o_proj.weight", projected_8192_, output, hidden_, kda_width_);
 }
 
+// Extracts per-head absorb weights from the BF16 kv_b_proj tensors in the
+// store: kv_b output rows are h*(2*head_dim) + j for K and
+// h*(2*head_dim) + head_dim + j for V, each [latent] wide.  W_uk[h] is the
+// head's K block and W_uv[h] its V block, both copied straight into
+// [head_dim, latent] rows (row j-major matches the kernel index math).
+void Runner::extract_mla_absorb() {
+    const size_t heads = size_t(mla_heads_), head_dim = size_t(mla_head_dim_);
+    const size_t latent = size_t(kv_a_rows_);
+    const size_t per_head = head_dim * latent;
+    std::vector<uint16_t> source(size_t(kv_b_rows_) * latent);
+    std::vector<uint16_t> host_uk(absorb_per_layer_), host_uv(absorb_per_layer_);
+    for (int slot = 0; slot < mla_layers_; ++slot) {
+        const std::string name =
+            layer_stem(mla_slot_[size_t(slot)]) + "self_attn.kv_b_proj.weight";
+        const TensorLocation &location = model_.tensor(name);
+        require(location.bytes == source.size() * sizeof(uint16_t),
+                "unexpected kv_b_proj tensor size");
+        model_.read(location, source.data());
+        for (size_t h = 0; h < heads; ++h) {
+            std::memcpy(host_uk.data() + h * per_head,
+                        source.data() + (h * 2 * head_dim) * latent,
+                        per_head * sizeof(uint16_t));
+            std::memcpy(host_uv.data() + h * per_head,
+                        source.data() + (h * 2 * head_dim + head_dim) * latent,
+                        per_head * sizeof(uint16_t));
+        }
+        check(cudaMemcpy(w_uk_.get() + size_t(slot) * absorb_per_layer_, host_uk.data(),
+                         host_uk.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+              "upload W_uk");
+        check(cudaMemcpy(w_uv_.get() + size_t(slot) * absorb_per_layer_, host_uv.data(),
+                         host_uv.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+              "upload W_uv");
+    }
+}
+
 void Runner::mla(int layer, const float *input, float *output, int position) {
     const std::string stem = layer_stem(layer) + "self_attn.";
     linear(stem + "q_a_proj.weight", input, small_a_, q_a_rows_, hidden_);
@@ -1936,13 +1990,37 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
     linear(stem + "q_b_proj.weight", small_b_, mla_query_, q_b_rows_, q_a_rows_);
     linear(stem + "kv_a_proj_with_mqa.weight", input, small_a_, kv_a_rows_, hidden_);
     rms(stem + "kv_a_layernorm.weight", small_a_, small_b_, 1, kv_a_rows_);
-    linear(stem + "kv_b_proj.weight", small_b_, kv_, kv_b_rows_, kv_a_rows_);
     const int slot = int(std::find(mla_slot_.begin(), mla_slot_.end(), layer) - mla_slot_.begin());
-    const size_t layer_stride = size_t(kMaxContext) * mla_heads_ * mla_head_dim_;
-    check(insignia::glm53::mla_decode(mla_query_, kv_,
-        mla_keys_.get() + size_t(slot) * layer_stride,
-        mla_values_.get() + size_t(slot) * layer_stride, mla_output_, position,
-        mla_heads_, mla_head_dim_), "MLA attention");
+    const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
+    check(insignia::glm53::mla_decode_latent(mla_query_.get(), small_b_.get(),
+        kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr,
+        mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+        kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride,
+        w_uk_.get() + size_t(slot) * absorb_per_layer_,
+        w_uv_.get() + size_t(slot) * absorb_per_layer_,
+        mla_partial_.get(), mla_output_, position,
+        mla_heads_, mla_head_dim_, kv_a_rows_), "MLA attention");
+    if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&
+        position >= 4 && position <= 6) {
+        const std::filesystem::path dir = std::getenv("INSIGNIA_GLM53_MLA_DUMP");
+        auto save_dev = [&](const std::string &name, const void *dev, size_t bytes) {
+            std::vector<uint8_t> host(bytes);
+            check(cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost), name.c_str());
+            std::FILE *file = std::fopen((dir / name).string().c_str(), "wb");
+            std::fwrite(host.data(), 1, bytes, file);
+            std::fclose(file);
+        };
+        const std::string tag = "dec" + std::to_string(position) + ".";
+        save_dev(tag + "q.bin", mla_query_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
+        save_dev(tag + "latent.bin", small_b_.get(), size_t(kv_a_rows_) * sizeof(float));
+        save_dev(tag + "out.bin", mla_output_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
+        save_dev(tag + "cache.bin",
+                 kv_fp8_ ? (const void *)(mla_latent_u8_.get() + size_t(slot) * size_t(kMaxContext) * kv_a_rows_)
+                         : (const void *)(mla_latent_f32_.get() + size_t(slot) * size_t(kMaxContext) * kv_a_rows_),
+                 size_t(position + 1) * kv_a_rows_ * (kv_fp8_ ? 1 : 4));
+        save_dev(tag + "scales.bin", mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+                 size_t(position + 1) * sizeof(float));
+    }
     linear(stem + "o_proj.weight", mla_output_, output, hidden_, q_b_rows_);
 }
 
@@ -2495,26 +2573,55 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
     linear_multi(stem + "q_a_proj.weight", input, c_small_, tokens, q_a_rows_, hidden_);
     rms(stem + "q_a_layernorm.weight", c_small_, c_small_, tokens, q_a_rows_);
     linear_multi(stem + "q_b_proj.weight", c_small_, c_mlaq_, tokens, q_b_rows_, q_a_rows_);
-    linear_multi(stem + "kv_a_proj_with_mqa.weight", input, c_small_, tokens, kv_a_rows_, hidden_);
-    rms(stem + "kv_a_layernorm.weight", c_small_, c_small_, tokens, kv_a_rows_);
-    linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_, tokens, kv_b_rows_, kv_a_rows_);
+    linear_multi(stem + "kv_a_proj_with_mqa.weight", input, c_kv_, tokens, kv_a_rows_, hidden_);
+    rms(stem + "kv_a_layernorm.weight", c_kv_, c_small_, tokens, kv_a_rows_);
     const int slot = int(std::find(mla_slot_.begin(), mla_slot_.end(), layer) - mla_slot_.begin());
-    const size_t layer_stride = size_t(kMaxContext) * mla_heads_ * mla_head_dim_;
+    const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
+    uint8_t *cache_u8 = kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr;
+    float *cache_f32 = kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride;
+    const uint16_t *w_uk = w_uk_.get() + size_t(slot) * absorb_per_layer_;
+    const uint16_t *w_uv = w_uv_.get() + size_t(slot) * absorb_per_layer_;
     static const bool scalar_attention =
         std::getenv("INSIGNIA_GLM53_SCALAR_MLA_PREFILL") != nullptr;
     if (scalar_attention) {
         for (int token = 0; token < tokens; ++token)
-            check(insignia::glm53::mla_decode(c_mlaq_.get() + size_t(token) * q_b_rows_,
-                  c_kv_.get() + size_t(token) * kv_b_rows_,
-                  mla_keys_.get() + size_t(slot) * layer_stride,
-                  mla_values_.get() + size_t(slot) * layer_stride,
+            check(insignia::glm53::mla_decode_latent(
+                  c_mlaq_.get() + size_t(token) * q_b_rows_,
+                  c_small_.get() + size_t(token) * kv_a_rows_,
+                  cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+                  cache_f32, w_uk, w_uv, mla_partial_.get(),
                   c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
-                  mla_heads_, mla_head_dim_), "scalar MLA attention (prefill)");
+                  mla_heads_, mla_head_dim_, kv_a_rows_), "scalar MLA attention (prefill)");
     } else {
-        check(insignia::glm53::mla_flash2_prefill(c_mlaq_, c_kv_,
-              mla_keys_.get() + size_t(slot) * layer_stride,
-              mla_values_.get() + size_t(slot) * layer_stride, c_mlao_, tokens,
-              position_base, mla_heads_, mla_head_dim_), "FlashAttention-2 MLA prefill");
+        check(insignia::glm53::mla_prefill_latent(c_mlaq_.get(), c_small_.get(),
+              cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext,
+              cache_f32, w_uk, w_uv, c_mlao_, tokens,
+              position_base, mla_heads_, mla_head_dim_, kv_a_rows_), "MLA latent prefill");
+    }
+    if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&
+        position_base == 0 && tokens > 1) {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            const std::filesystem::path dir = std::getenv("INSIGNIA_GLM53_MLA_DUMP");
+            std::filesystem::create_directories(dir);
+            auto save_dev = [&](const char *name, const void *dev, size_t bytes) {
+                std::vector<uint8_t> host(bytes);
+                check(cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost), name);
+                std::FILE *file = std::fopen((dir / name).string().c_str(), "wb");
+                std::fwrite(host.data(), 1, bytes, file);
+                std::fclose(file);
+            };
+            save_dev("q.bin", c_mlaq_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
+            save_dev("latent.bin", c_small_.get(), size_t(kv_a_rows_) * sizeof(float));
+            save_dev("out.bin", c_mlao_.get(), size_t(2) * mla_head_dim_ * sizeof(float));
+            save_dev("cache.bin", kv_fp8_ ? (const void *)cache_u8 : (const void *)cache_f32,
+                     size_t(tokens) * kv_a_rows_ * (kv_fp8_ ? 1 : 4));
+            save_dev("scales.bin", mla_latent_scale_.get(), size_t(tokens) * sizeof(float));
+            save_dev("wuk.bin", w_uk, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(uint16_t));
+            save_dev("wuv.bin", w_uv, size_t(mla_head_dim_) * kv_a_rows_ * sizeof(uint16_t));
+            std::fprintf(stderr, "mla dump written to %s\n", dir.string().c_str());
+        }
     }
     linear_multi(stem + "o_proj.weight", c_mlao_, output, tokens, hidden_, q_b_rows_);
 }
@@ -2850,7 +2957,7 @@ std::vector<std::pair<int, float>> Runner::step(
     require(token >= 0 && token < int(model_.vocab_size()), "input token is outside vocabulary");
     require(layer_limit >= 1 && layer_limit <= layers,
             "layer limit must be between 1 and the indexed layer count");
-    require(position >= 0 && position < kMaxContext, "position exceeds the 256-token exact-attention cache");
+    require(position >= 0 && position < kMaxContext, "position exceeds the exact-attention cache");
     const TensorLocation &embedding = model_.tensor("model.language_model.embed_tokens.weight");
     require(embedding.type == TensorType::bf16 && embedding.shape.size() == 2 &&
             embedding.shape[0] == model_.vocab_size() && embedding.shape[1] == uint32_t(hidden_),
@@ -2994,6 +3101,11 @@ std::vector<std::pair<int, float>> Runner::step(
     std::vector<float> host_logits(model_.vocab_size());
     check(cudaMemcpy(host_logits.data(), logits_.get(), host_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
           "download logits");
+    if (const char *dump_path = std::getenv("INSIGNIA_GLM53_LOGITS_DUMP")) {
+        static std::FILE *dump = nullptr;
+        if (!dump) dump = std::fopen(dump_path, "wb");
+        if (dump) std::fwrite(host_logits.data(), sizeof(float), host_logits.size(), dump);
+    }
     std::vector<int> order(host_logits.size());
     std::iota(order.begin(), order.end(), 0);
     std::partial_sort(order.begin(), order.begin() + 10, order.end(),
@@ -3065,11 +3177,11 @@ int main(int argc, char **argv) {
             if (comma == std::string::npos) break;
             begin_token = comma + 1;
         }
-        require(!tokens.empty() && tokens.size() <= kMaxContext, "token list must contain 1..256 IDs");
+        require(!tokens.empty() && tokens.size() <= kMaxContext, "token list must contain 1..8192 IDs");
         const int layers_argc = argc >= 5 ? std::atoi(argv[4]) : 0;
         const int generate = argc >= 6 ? std::atoi(argv[5]) : 1;
         require(generate >= 1 && tokens.size() + size_t(generate) - 1 <= kMaxContext,
-                "generation must fit the 256-token exact-attention cache");
+                "generation must fit the exact-attention cache");
         Runner runner(argv[1], argv[2], argc >= 7 ? argv[6] : "");
         const int layers = layers_argc > 0 ? layers_argc : runner.layer_count();
 

@@ -727,7 +727,7 @@ public:
                 device_slot = found->second;
                 ++device_hits_;
             } else {
-                device_slot = take_device_slot();
+                device_slot = take_device_slot(state.layer);
                 // The recycle waits on the victim's read fence: the copy
                 // stream never overwrites bytes a default-stream GEMV may
                 // still be reading. First fill of a fresh slot waits on an
@@ -883,16 +883,25 @@ private:
         check(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking),
               "expert copy stream (async)");
     }
-    int take_device_slot() {
+    // One fixed slot segment per sparse layer: a global LRU thrashes at
+    // round scale (~1,300 distinct records/round >> slots), but the slice
+    // for layer L retains its own most recent records, so the measured ~27%
+    // adjacent-token routing overlap converts directly into PCIe-free hits.
+    int take_device_slot(int layer) {
+        const int segments = std::max(1, std::min(46, device_slot_count_));
+        const int begin = size_t(layer) % size_t(segments) * device_slot_count_ / segments;
+        const int end = size_t(layer) % size_t(segments) + 1 == segments
+                            ? device_slot_count_
+                            : (size_t(layer) % size_t(segments) + 1) * device_slot_count_ / segments;
         int victim = -1;
-        for (int index = 0; index < device_slot_count_; ++index) {
+        for (int index = begin; index < end; ++index) {
             if (index == active_device_slot_) continue;  // fence not recorded yet
             if (device_slot_keys_[size_t(index)] == kNoKey) return index;
             if (victim < 0 ||
                 device_slot_stamps_[size_t(index)] < device_slot_stamps_[size_t(victim)])
                 victim = index;
         }
-        require(victim >= 0, "expert VRAM tier needs at least one slot");
+        require(victim >= 0, "expert VRAM segment needs a recyclable slot");
         device_index_.erase(device_slot_keys_[size_t(victim)]);
         device_slot_keys_[size_t(victim)] = kNoKey;
         return victim;
@@ -2620,6 +2629,18 @@ int Runner::mtp_forward(int token, const float *hidden_in, int position) {
 // lm_head the 7 draft hiddens through the target's FP8 head, then the host
 // selector walks the top-16 candidate lattice.
 std::vector<int> Runner::df_draft(int anchor, int position) {
+    // Same reader-pool warm-up the scalar step() path performs: the drafter
+    // phase is otherwise dead time for the disks, and the first sparse
+    // layers' records (predicted from the previous round's routing) are what
+    // the verify pass demands first.
+    if (prefetch_on_ && expert_stager_) {
+        for (size_t layer = 3; layer < prev_routing_.size() && layer < 6; ++layer)
+            if (is_sparse_[layer])
+                expert_stager_->prefetch(int(layer), prev_routing_[layer].data(), moe_topk_);
+        if (!cct_.empty())
+            for (size_t layer = 3; layer + 1 < prev_routing_.size() && layer < 6; ++layer)
+                cct_prefetch(int(layer));
+    }
     const TensorLocation &embedding = model_.tensor("model.language_model.embed_tokens.weight");
     const auto stage_row = [&](int token, int t) {
         const uint16_t *row = reinterpret_cast<const uint16_t *>(

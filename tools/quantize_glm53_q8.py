@@ -13,6 +13,8 @@ import time
 
 import numpy as np
 
+from quantize_dflash2 import encode_e4m3fn
+
 
 GROUP = 64
 ALIGNMENT = 4096
@@ -84,8 +86,6 @@ def write_index(path, records, data_bytes, cache_format):
 
 
 def quantize(root, data_path, records, data_bytes, cache_format):
-    if cache_format == "fp8":
-        import torch
     free = shutil.disk_usage(data_path.parent).free
     if free < data_bytes + (2 << 30):
         raise RuntimeError(
@@ -128,12 +128,7 @@ def quantize(root, data_path, records, data_bytes, cache_format):
                     quantized = np.ascontiguousarray(quantized.astype(np.int8))
                 else:
                     np.clip(normalized, -448.0, 448.0, out=normalized)
-                    quantized = (
-                        torch.from_numpy(normalized)
-                        .to(torch.float8_e4m3fn)
-                        .view(torch.uint8)
-                        .numpy()
-                    )
+                    quantized = encode_e4m3fn(normalized)
                     if np.any((quantized & 0x7F) == 0x7F):
                         raise RuntimeError(f"FP8 encoder emitted NaN for {record['name']}")
                 scale16 = np.ascontiguousarray(scales.astype("<f2"))

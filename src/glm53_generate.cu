@@ -1675,10 +1675,22 @@ public:
         early_route_on_ = early_route_on_ || early_route_prefetch_;
         if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_PREFETCH_N"))
             early_route_prefetch_n_ = std::clamp(std::atoi(count), 1, moe_topk_);
+        early_multi_route_on_ = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_ROUTE") != nullptr;
+        early_multi_prefetch_ = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_PREFETCH") != nullptr;
+        early_multi_route_on_ = early_multi_route_on_ || early_multi_prefetch_;
+        if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_N"))
+            early_multi_n_ = std::clamp(std::atoi(count), 1, moe_topk_);
+        if (const char *count = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_MAX"))
+            early_multi_max_ = std::max(1, std::atoi(count));
         if (const char *path = std::getenv("INSIGNIA_GLM53_EARLY_ROUTE_TRACE")) {
             early_route_trace_ = std::fopen(path, "w");
             early_route_on_ = true;
         }
+        if (const char *path = std::getenv("INSIGNIA_GLM53_EARLY_MULTI_TRACE")) {
+            early_multi_trace_ = std::fopen(path, "w");
+            early_multi_route_on_ = true;
+        }
+        early_multi_rows_.resize(size_t(layer_count));
         deep_checks_ = std::getenv("INSIGNIA_GLM53_FINITE_EVERY_LAYER") != nullptr;
         trace_layers_ = std::getenv("INSIGNIA_GLM53_PROFILE") != nullptr;
         if (mla_layers_) {
@@ -1929,6 +1941,7 @@ private:
     DeviceBuffer<float> expert_scratch_;
     FILE *route_trace_ = nullptr;
     FILE *early_route_trace_ = nullptr;
+    FILE *early_multi_trace_ = nullptr;
     bool route_trace_probed_ = false;
     long token_index_ = 0;
     // Parity instrumentation: INSIGNIA_GLM53_LAYER_DUMP=<path> appends one
@@ -1951,9 +1964,15 @@ private:
     bool early_route_on_ = false, early_route_prefetch_ = false;
     int early_route_prefetch_n_ = 8;
     uint64_t early_route_hits_ = 0, early_route_total_ = 0;
+    bool early_multi_route_on_ = false, early_multi_prefetch_ = false;
+    int early_multi_n_ = 4, early_multi_max_ = 64;
+    uint64_t early_multi_batch_ = 0, early_multi_hits_ = 0;
+    uint64_t early_multi_predicted_ = 0, early_multi_actual_ = 0;
+    std::vector<std::vector<std::array<int, 8>>> early_multi_rows_;
 
     void route_trace(int layer, const std::vector<int> &selected, const std::vector<float> &scores);
     void early_route(int layer, const float *input);
+    void early_route_multi(int layer, const float *input, int tokens);
     void load_cct();
     void cct_prefetch(int layer);
     void seam(int layer, int tag, const float *device, int count) {
@@ -2464,6 +2483,41 @@ void Runner::early_route(int layer, const float *input) {
     if (early_route_prefetch_ && prefetch_on_)
         expert_stager_->prefetch(layer, early_routing_[size_t(layer)].data(),
                                  early_route_prefetch_n_);
+}
+
+void Runner::early_route_multi(int layer, const float *input, int tokens) {
+    const std::string stem = layer_stem(layer) + "mlp.";
+    linear_multi(stem + "gate.weight", input, c_router_, tokens,
+                 moe_experts_, hidden_);
+    std::vector<float> logits(size_t(tokens) * moe_experts_);
+    check(cudaMemcpy(logits.data(), c_router_.get(), logits.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "download early router logits (multi)");
+    const std::vector<float> &bias = host_f32(stem + "gate.e_score_correction_bias");
+    auto &rows = early_multi_rows_[size_t(layer)];
+    rows.resize(size_t(tokens));
+    std::vector<float> choice(static_cast<size_t>(moe_experts_));
+    std::vector<int> order(static_cast<size_t>(moe_experts_));
+    for (int token = 0; token < tokens; ++token) {
+        const float *row = logits.data() + size_t(token) * moe_experts_;
+        for (int expert = 0; expert < moe_experts_; ++expert)
+            choice[size_t(expert)] =
+                1.0f / (1.0f + std::exp(-row[expert])) + bias[size_t(expert)];
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + moe_topk_, order.end(),
+            [&](int left, int right) { return choice[size_t(left)] > choice[size_t(right)]; });
+        for (int slot = 0; slot < moe_topk_; ++slot)
+            rows[size_t(token)][size_t(slot)] = order[size_t(slot)];
+    }
+    if (!early_multi_prefetch_ || !prefetch_on_) return;
+    std::vector<int> picks;
+    picks.reserve(size_t(std::min(early_multi_max_, tokens * early_multi_n_)));
+    for (int rank = 0; rank < early_multi_n_ && int(picks.size()) < early_multi_max_; ++rank)
+        for (int token = 0; token < tokens && int(picks.size()) < early_multi_max_; ++token) {
+            const int expert = rows[size_t(token)][size_t(rank)];
+            if (std::find(picks.begin(), picks.end(), expert) == picks.end())
+                picks.push_back(expert);
+        }
+    if (!picks.empty()) expert_stager_->prefetch(layer, picks.data(), int(picks.size()));
 }
 
 // Routing-locality trace: one line per (token, sparse layer) after CPU routing,
@@ -3174,6 +3228,36 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (const auto &[expert, weight] : picks)
             if (std::find(distinct.begin(), distinct.end(), expert) == distinct.end())
                 distinct.push_back(expert);
+    if (early_multi_route_on_) {
+        const auto &predicted_rows = early_multi_rows_[size_t(layer)];
+        require(predicted_rows.size() == size_t(tokens), "missing early multi-route rows");
+        std::vector<int> predicted;
+        for (int rank = 0; rank < topk; ++rank)
+            for (int token = 0; token < tokens; ++token) {
+                const int expert = predicted_rows[size_t(token)][size_t(rank)];
+                if (std::find(predicted.begin(), predicted.end(), expert) == predicted.end())
+                    predicted.push_back(expert);
+            }
+        int overlap = 0;
+        for (int expert : predicted)
+            overlap += std::find(distinct.begin(), distinct.end(), expert) != distinct.end();
+        early_multi_hits_ += uint64_t(overlap);
+        early_multi_predicted_ += predicted.size();
+        early_multi_actual_ += distinct.size();
+        if (early_multi_trace_) {
+            std::fprintf(early_multi_trace_, "%llu %d %d %d %zu %zu",
+                         (unsigned long long)early_multi_batch_, layer, tokens, overlap,
+                         predicted.size(), distinct.size());
+            for (int token = 0; token < tokens; ++token) {
+                for (int expert : predicted_rows[size_t(token)])
+                    std::fprintf(early_multi_trace_, " %d", expert);
+                for (const auto &[expert, weight] : selection[size_t(token)])
+                    std::fprintf(early_multi_trace_, " %d", expert);
+            }
+            std::fputc('\n', early_multi_trace_);
+            std::fflush(early_multi_trace_);
+        }
+    }
     check(cudaMemset(c_routed_, 0, size_t(tokens) * hidden_ * sizeof(float)), "clear routed (prefill)");
     if (nvfp4_experts_ && expert_stager_) {
         // Routing bookkeeping + speculative next-layer reads, mirroring the
@@ -3365,6 +3449,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
 void Runner::prefill(const std::vector<int> &tokens, int position_base, bool capture) {
     const int count = int(tokens.size());
     require(count >= 1 && count <= kMaxChunk, "prefill chunk out of range");
+    if (early_multi_route_on_) ++early_multi_batch_;
     if (capture) {
         require(mtp_draft_total_, "verify capture requested with MTP disabled");
         // Snapshot the recurrent state so a rejected draft prefix can be
@@ -3408,6 +3493,8 @@ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool cap
         const std::string base = layer_stem(layer);
         mhc_multi(base + "hc_attn", streams, c_collapsed_, count);
         rms(base + "input_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
+        if (early_multi_route_on_ && is_sparse_[size_t(layer)])
+            early_route_multi(layer, c_normalized_, count);
         if (is_mla_[layer])
             mla_multi(layer, c_normalized_, c_attn_, count, position_base);
         else
@@ -3704,6 +3791,14 @@ std::vector<std::pair<int, float>> Runner::step(
                     (unsigned long long)early_route_hits_,
                     (unsigned long long)early_route_total_,
                     100.0 * early_route_hits_ / early_route_total_);
+    if (early_multi_actual_)
+        std::printf("  batched pre-attention union recall %.1f%%, precision %.1f%% "
+                    "(%llu useful / %llu predicted / %llu actual)\n",
+                    100.0 * early_multi_hits_ / early_multi_actual_,
+                    100.0 * early_multi_hits_ / early_multi_predicted_,
+                    (unsigned long long)early_multi_hits_,
+                    (unsigned long long)early_multi_predicted_,
+                    (unsigned long long)early_multi_actual_);
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",
                     q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8",

@@ -1,6 +1,37 @@
 # progress
 
-### 2026-08-28 (session 3) — DFlash2 drafter wired, parity-exact, acceptance 0 (in progress)
+### 2026-08-28 (session 4) — glm-box online: 5.3 tok/s peak; latent-MLA bridge; DFlash2 regression OPEN
+
+Full findings in `audits/mla-latent-session.md`. Short form: the 4070 Ti
+SUPER box (ssh `glm-box`, worktree `C:\coding\Insignia-glm53-dflash2`) is the
+performance machine now — 32 GiB pinned expert tier (2425 slots, 80% hits,
+new engine default with halve-and-retry), PyTorch-free FP8 quantizers, FA2
+verify-width boundary bug fixed. Best sustained: **k7 DFlash2 187.7 ms/tok
+(5.33 tok/s), 194.4 ms/tok over 240 tokens, 56.5% faster than the 447 ms/tok
+scalar baseline, bit-exact output**. The latent-MLA rework (512-wide FP8
+group-scaled latent + absorbed attention, 8192 context) was diagnosed to
+death: kernels/formula correct, failure is router sensitivity to ~1e-6
+attention perturbation; the coherent shipping path is the **shadow bridge**
+(exact expanded K/V for the first 256 positions, 352 MiB, latent populated
+beyond) which reproduces the oracle 12/12. Determinism law discovered:
+expert-accumulation order and softmax operation order are part of the
+effective model — canonical-order MoE probe rejected, exact 256-token oracle
+restored (`INSIGNIA_GLM53_MLA_LEGACY=1`). **OPEN**: on the bridge, DFlash2
+acceptance collapsed to 1.43/round (516.7 ms/tok) — drafter/verify alignment
+under investigation. GSM8K/MATH-500 harness (`tools/benchmark_math.py`)
+staged on glm-box, campaign not yet run.
+
+### 2026-08-28 (session 3 continued) — DFlash2 root causes found: acceptance 0 -> 5.0 (backfilled audit)
+
+`audits/dflash2-fixes-session.md` documents the arc this progress file
+skipped: batch-1 paired-FP8 API, `df_gather` column-split, and the quantized
+FC strided-slice bug (`glm53-dflash2-fp8-fixed` is the good cache) took
+layer-0 cosine 0.664 -> 0.9995 and acceptance to 5.00/round on realistic
+prompts; ordered MoE accumulation + the KDA archive scatter fix made every
+block size greedy-exact (k4 628.2 ms/tok, first speculative win over plain
+decode); empty-round short-circuit cut 30-token decode 32.8%.
+
+### 2026-08-28 (session 3) — DFlash2 drafter wired, parity-exact, acceptance 0 (in progress; superseded by session 3-continued and 4)
 
 Full findings in `audits/dflash2-session.md`; paper digests + links in
 `audits/papers-session3.md`. Short form: DFlash2 block

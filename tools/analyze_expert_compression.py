@@ -103,6 +103,8 @@ def main():
     body_counts = [0] * 16
     scale_counts = [0] * 256
     results = {name: [] for name, _ in codecs}
+    body_results = {name: [] for name, _ in codecs}
+    scale_results = {name: [] for name, _ in codecs}
     for sample in range(args.samples):
         at = 0 if args.samples == 1 else round(sample * (len(sparse) - 1) / (args.samples - 1))
         layer = sparse[at]
@@ -117,11 +119,22 @@ def main():
         for name, codec in codecs:
             fraction, gib_s = codec(raw, args.repeat)
             results[name].append((fraction, gib_s))
+            body_results[name].append(codec(bytes(bodies), args.repeat))
+            scale_results[name].append(codec(bytes(scales), args.repeat))
             fields.append(f"{name}={fraction:.3f}x/{gib_s:.2f}GiB/s")
         print(f"L{layer:02d} E{expert:03d} {len(raw) / 2**20:.2f}MiB " + " ".join(fields))
 
     print(f"body nibble entropy: {entropy(body_counts):.4f}/4 bits")
     print(f"scale byte entropy:  {entropy(scale_counts):.4f}/8 bits")
+    used_scales = [(count, code) for code, count in enumerate(scale_counts) if count]
+    used_scales.sort(reverse=True)
+    total_scales = sum(scale_counts)
+    print(f"scale alphabet: {len(used_scales)} codes, fixed-width "
+          f"{math.ceil(math.log2(max(1, len(used_scales))))} bits")
+    print("scale top codes: " + " ".join(
+        f"0x{code:02x}:{100 * count / total_scales:.2f}%"
+        for count, code in used_scales[:16]
+    ))
     for name, samples in results.items():
         fractions = [item[0] for item in samples]
         speeds = [item[1] for item in samples]
@@ -129,6 +142,10 @@ def main():
         print(
             f"{name:10s} median stored={fraction:.3f}x "
             f"effective-NVMe={1 / fraction:.3f}x decode={statistics.median(speeds):.2f}GiB/s"
+        )
+        print(
+            f"{'':10s} body={statistics.median(item[0] for item in body_results[name]):.3f}x "
+            f"scales={statistics.median(item[0] for item in scale_results[name]):.3f}x"
         )
 
 

@@ -95,9 +95,11 @@ under WSL2 for the GLM path:
 
 - Reach: `ssh glm-box` (→ `desktop-hlvh09q` over Tailscale, user `PC`, key
   auth). Windows OpenSSH + Tailscale are auto-start services.
-- GPU: NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB VRAM, driver 610.47, mild OC
-  (core ~2.95–2.97 GHz, mem 12.251 GHz ≈ 784 GB/s observed; validated stable
-  under sustained load — no throttle/PCI/token faults).
+- GPU: NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB VRAM, driver 610.47,
+  **overclocked: +150 MHz core (~2.95–2.97 GHz sustained) and +2000 MHz
+  memory (12.251 GHz effective, ~800 GB/s observed)**. Verified stable
+  through sustained testing under load — no throttle/PCI/token faults, no
+  clock dips, no token divergence.
 - CPU: Intel i7-14700KF (Raptor Lake). AVX2 + FMA + 256-bit AVX-VNNI + F16C +
   GFNI. **No** AVX-512, AMX, AVX-VNNI-INT8, native BF16/FP16 arithmetic. See
   `audits/14700kf-isa.md`.

@@ -18,7 +18,8 @@ only allowed when a benchmark and disassembly prove they help.
 - Dev box: RTX 4070 SUPER 12 GiB, Ryzen 5 5600X, 15.9 GiB RAM (14 GiB WSL),
   dual SSD (C: 980 PRO + E:), pinned ceiling 6.6–9.25 GiB, 4-reader virtio
   sweet spot.
-- glm-box: RTX 4070 Ti SUPER 16 GiB (mild OC, validated), i7-14700KF
+- glm-box: RTX 4070 Ti SUPER 16 GiB, overclocked +150 MHz core /
+  +2000 MHz memory (~800 GB/s observed, verified stable), i7-14700KF
   (AVX2/FMA/AVX-VNNI-256; no AVX-512/AMX), 60 GiB WSL RAM, single NVMe,
   32 GiB pinned expert cache sweet spot.
 - Both: CUDA 13.3, Arch WSL2, sm_89. Ada has no block-scaled FP4 MMA:

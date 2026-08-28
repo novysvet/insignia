@@ -697,10 +697,7 @@ public:
                 } else {
                     // A prefetch for exactly this (layer, expert) is in
                     // flight; promote it instead of reading bytes twice.
-                    {
-                        std::lock_guard<std::mutex> lock(pool_mutex_);
-                        state.demand = true;
-                    }
+                    promote_read(resident->second);
                     ++adopted;
                     ++prefetch_useful_;
                 }
@@ -750,7 +747,11 @@ public:
         for (int index = 0; index < count; ++index) {
             if (experts[index] < 0) continue;
             const uint32_t key = route_key(layer, experts[index]);
-            if (flight_index_.count(key)) continue;
+            const auto resident = flight_index_.find(key);
+            if (resident != flight_index_.end()) {
+                if (!window_done(resident->second)) promote_read(resident->second);
+                continue;
+            }
             const int window = take_window();
             start_read(window, key, layer, experts[index], true);
             io_bytes_ += kBodyBytes + kScaleBytes + 3 * sizeof(float);
@@ -991,6 +992,25 @@ private:
         state.l2_shard = -1;
         flight_index_.emplace(key, window);
         submit_window(window, demand);
+    }
+    // Relabeling an adopted prefetch is insufficient: if it has not started,
+    // it still sits in the speculative FIFO behind unrelated hints. Move that
+    // exact window to the demand queue so the advertised priority is real.
+    void promote_read(int window) {
+        bool moved = false;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            windows_[size_t(window)].demand = true;
+            for (int drive = 0; drive < 2 && !moved; ++drive) {
+                auto &queue = prefetch_queue_[drive];
+                const auto found = std::find(queue.begin(), queue.end(), window);
+                if (found == queue.end()) continue;  // already being read
+                queue.erase(found);
+                demand_queue_[drive].push_back(window);
+                moved = true;
+            }
+        }
+        if (moved) pool_cv_.notify_all();
     }
     // Blocks until the window's read completed; used by the demand path.
     void wait_window(int window) {

@@ -453,6 +453,8 @@ __global__ __launch_bounds__(256) void kda_conv_silu3_kernel(
     }
 }
 
+constexpr int kMlaExactContext = 256;
+
 __global__ __launch_bounds__(256) void mla_decode_kernel(
     const float *__restrict__ query,
     const float *__restrict__ kv,
@@ -470,17 +472,12 @@ __global__ __launch_bounds__(256) void mla_decode_kernel(
     value_cache[position * cache_stride + vector_offset] = kv[head * (2 * head_dim) + head_dim + element];
     __syncthreads();
 
-    // Online softmax: the two-pass form needs logits[kMlaMaxContext] shared
-    // memory, which no longer fits now that the window is 8192.
-    __shared__ float broadcast;
+    __shared__ float logits[kMlaExactContext];
     __shared__ float partial[8];
     const int lane = element & 31;
     const int warp = element >> 5;
     const float q = query[vector_offset];
     const float scale = rsqrtf((float)head_dim);
-    float maximum = -3.402823466e38F;
-    float denominator = 0.0f;
-    float result = 0.0f;
     for (int token = 0; token <= position; ++token) {
         float dot = warp_sum(q * key_cache[token * cache_stride + vector_offset]);
         if (!lane) partial[warp] = dot;
@@ -489,18 +486,26 @@ __global__ __launch_bounds__(256) void mla_decode_kernel(
             float total = 0.0f;
 #pragma unroll 4
             for (int index = 0; index < warps; ++index) total += partial[index];
-            broadcast = total * scale;
+            logits[token] = total * scale;
         }
         __syncthreads();
-        const float score = broadcast;
-        const float maximum_new = fmaxf(maximum, score);
-        const float correction = expf(maximum - maximum_new);
-        const float weight = expf(score - maximum_new);
-        maximum = maximum_new;
-        denominator = denominator * correction + weight;
-        result = fmaf(weight, value_cache[token * cache_stride + vector_offset], result * correction);
     }
-    output[vector_offset] = result / denominator;
+    if (!element) {
+        float maximum = -3.402823466e38F;
+        for (int token = 0; token <= position; ++token) maximum = fmaxf(maximum, logits[token]);
+        float denominator = 0.0f;
+        for (int token = 0; token <= position; ++token) {
+            logits[token] = expf(logits[token] - maximum);
+            denominator += logits[token];
+        }
+        const float inverse = 1.0f / denominator;
+        for (int token = 0; token <= position; ++token) logits[token] *= inverse;
+    }
+    __syncthreads();
+    float result = 0.0f;
+    for (int token = 0; token <= position; ++token)
+        result = fmaf(logits[token], value_cache[token * cache_stride + vector_offset], result);
+    output[vector_offset] = result;
 }
 
 __global__ __launch_bounds__(256) void mla_store_kv_batch_kernel(
@@ -557,17 +562,8 @@ __global__ __launch_bounds__(256, 2) void mla_flash2_prefill_kernel(
     }
 
     __shared__ float partial[kQueries][8];
-    __shared__ float scores[kQueries];
+    __shared__ float logits[kQueries][kMlaExactContext];
     const int last_key = position_base + query_base + query_count - 1;
-
-    // Online softmax keeps the per-query state in registers; the old
-    // two-pass form needed logits[kQueries][kMlaMaxContext] shared memory.
-    float maximum[kQueries], denominator[kQueries];
-#pragma unroll
-    for (int slot = 0; slot < kQueries; ++slot) {
-        maximum[slot] = -3.402823466e38F;
-        denominator[slot] = 0.0f;
-    }
 
     for (int key = 0; key <= last_key; ++key) {
         const size_t cache_index = size_t(key) * width + head_offset;
@@ -585,29 +581,39 @@ __global__ __launch_bounds__(256, 2) void mla_flash2_prefill_kernel(
                 float dot = 0.0f;
 #pragma unroll 4
                 for (int part = 0; part < warps; ++part) dot += partial[slot][part];
-                scores[slot] = dot * scale;
+                logits[slot][key] = dot * scale;
             }
         }
         __syncthreads();
+    }
 
-        const float value = value_cache[cache_index];
-#pragma unroll
-        for (int slot = 0; slot < kQueries; ++slot) {
-            if (slot < query_count && key <= position_base + query_base + slot) {
-                const float score = scores[slot];
-                const float maximum_new = fmaxf(maximum[slot], score);
-                const float correction = expf(maximum[slot] - maximum_new);
-                const float weight = expf(score - maximum_new);
-                maximum[slot] = maximum_new;
-                denominator[slot] = denominator[slot] * correction + weight;
-                accumulator[slot] = fmaf(weight, value, accumulator[slot] * correction);
-            }
+    if (element < query_count) {
+        const int slot = element;
+        const int query_last_key = position_base + query_base + slot;
+        float maximum = -3.402823466e38F;
+        for (int key = 0; key <= query_last_key; ++key)
+            maximum = fmaxf(maximum, logits[slot][key]);
+        float denominator = 0.0f;
+        for (int key = 0; key <= query_last_key; ++key) {
+            logits[slot][key] = expf(logits[slot][key] - maximum);
+            denominator += logits[slot][key];
         }
+        const float inverse = 1.0f / denominator;
+        for (int key = 0; key <= query_last_key; ++key) logits[slot][key] *= inverse;
+    }
+    __syncthreads();
+
+    for (int key = 0; key <= last_key; ++key) {
+        const float value = value_cache[size_t(key) * width + head_offset];
+#pragma unroll
+        for (int slot = 0; slot < kQueries; ++slot)
+            if (slot < query_count && key <= position_base + query_base + slot)
+                accumulator[slot] = fmaf(logits[slot][key], value, accumulator[slot]);
     }
 #pragma unroll
     for (int slot = 0; slot < kQueries; ++slot)
         if (slot < query_count)
-            output[size_t(query_base + slot) * width + head_offset] = accumulator[slot] / denominator[slot];
+            output[size_t(query_base + slot) * width + head_offset] = accumulator[slot];
 }
 
 }  // namespace
@@ -724,7 +730,7 @@ cudaError_t mla_decode(
     int heads,
     int head_dim,
     cudaStream_t stream) {
-    if (position < 0 || position >= kMlaMaxContext) return cudaErrorInvalidValue;
+    if (position < 0 || position >= kMlaExactContext) return cudaErrorInvalidValue;
     if (head_dim < 32 || head_dim > 256 || head_dim % 32) return cudaErrorInvalidValue;
     mla_decode_kernel<<<heads, head_dim, 0, stream>>>(
         query, kv, key_cache, value_cache, output, position, heads * head_dim);
@@ -744,7 +750,7 @@ cudaError_t mla_flash2_prefill(
     cudaStream_t stream) {
     if (!query || !kv || !key_cache || !value_cache || !output ||
         tokens <= 0 || tokens > 32 || position_base < 0 ||
-        position_base + tokens > kMlaMaxContext || heads <= 0 ||
+        position_base + tokens > kMlaExactContext || heads <= 0 ||
         head_dim < 32 || head_dim > 256 || head_dim % 32)
         return cudaErrorInvalidValue;
     mla_store_kv_batch_kernel<<<dim3(heads, tokens), head_dim, 0, stream>>>(

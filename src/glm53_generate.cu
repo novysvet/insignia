@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -20,7 +21,9 @@
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
+#include <immintrin.h>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -30,9 +33,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -507,6 +512,29 @@ ExpertLocations locate_expert(ShardedIndex &model, int layer, int expert) {
              &model.tensor(stem + "up_proj.weight_scale_2")}};
 }
 
+struct PackedExpertFileHeader {
+    char magic[8];
+    uint32_t version, layers, experts, records;
+    uint64_t index_offset, data_offset, file_bytes, source_bytes, stored_bytes;
+};
+static_assert(sizeof(PackedExpertFileHeader) == 64);
+
+struct PackedExpertIndexEntry {
+    uint64_t offset;
+    uint32_t stored_bytes, padded_bytes;
+};
+static_assert(sizeof(PackedExpertIndexEntry) == 16);
+
+struct PackedExpertRecordHeader {
+    char magic[4];
+    uint16_t layer, expert;
+    uint32_t escapes[3];
+    float globals[3];
+    uint8_t codebooks[3][16];
+    uint8_t reserved[48];
+};
+static_assert(sizeof(PackedExpertRecordHeader) == 128);
+
 // One routed-expert record: 3 projections x (4 MiB nibbles + 512 KiB scales)
 // + 12 B globals, streamed with O_DIRECT into a 4096-aligned pinned window.
 // Windows double as a host-RAM LRU: completed records stay resident so a
@@ -559,6 +587,8 @@ public:
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
             vram_budget_mb_ = std::max(0, std::atoi(budget));
+        if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS"))
+            open_packed_experts(path);
         for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
         start_pool();
         load_pin_list();
@@ -577,6 +607,8 @@ public:
         for (cudaEvent_t &event : device_slot_reads_)
             if (event) cudaEventDestroy(event);
         if (device_) cudaFree(device_);
+        if (packed_direct_fd_ >= 0) ::close(packed_direct_fd_);
+        if (packed_fd_ >= 0) ::close(packed_fd_);
     }
     ExpertStager(const ExpertStager &) = delete;
     ExpertStager &operator=(const ExpertStager &) = delete;
@@ -674,7 +706,8 @@ public:
         batch_read_ends_.clear();
         for (int slot = 0; slot < count; ++slot)
             batch_populate_[size_t(slot)] = populate_cache && ((populate_mask >> slot) & 1u);
-        int hits = 0, adopted = 0, started = 0;
+        int hits = 0, adopted = 0;
+        uint64_t started_bytes = 0;
         for (int slot = 0; slot < count; ++slot) {
             const int expert = experts[slot];
             const uint32_t key = route_key(layer, expert);
@@ -713,6 +746,7 @@ public:
             const int window = take_window();
             start_read(window, key, layer, expert, true);
             batch_window_[slot] = window;
+            started_bytes += windows_[size_t(window)].source_bytes;
             // TinyLFU-style door: a record may enter the tier only once its
             // lifetime demand count beats the hit count of the coldest
             // resident (threshold 1 disables the door entirely).
@@ -732,7 +766,6 @@ public:
                 batch_admit_[slot] = victim < 0 || sightings >= unsigned(admit_threshold_) &&
                     sightings > windows_[size_t(victim)].hits;
             }
-            ++started;
         }
         cache_hits_ += hits;
         cache_lookups_ += count;
@@ -742,7 +775,7 @@ public:
         if (!overlap_reads_)
             for (int slot = 0; slot < count; ++slot)
                 if (batch_window_[slot] >= 0) wait_and_consume_error(batch_window_[slot]);
-        io_bytes_ += uint64_t(started) * (kBodyBytes + kScaleBytes + 3 * sizeof(float));
+        io_bytes_ += started_bytes;
         (void)adopted;
     }
     // Whole-layer demand read-ahead: puts every still-missing record of the
@@ -761,7 +794,7 @@ public:
             }
             const int window = take_window();
             start_read(window, key, layer, experts[index], true);
-            io_bytes_ += kBodyBytes + kScaleBytes + 3 * sizeof(float);
+            io_bytes_ += windows_[size_t(window)].source_bytes;
         }
     }
     void upload(int slot) {
@@ -890,6 +923,7 @@ private:
         bool demand = false, done = true, claimed = false, copy_issued = false;
         bool releasing = false, pinned = false;
         uint64_t stamp = 0;
+        uint64_t source_bytes = 0;
         unsigned hits = 0;
         Layout layout{};
         std::array<float, 3> globals{};
@@ -904,6 +938,149 @@ private:
 
     static uint32_t route_key(int layer, int expert) {
         return uint32_t(layer) * 4096u + uint32_t(expert);
+    }
+    static void pread_exact(int fd, uint64_t offset, void *destination, size_t bytes,
+                            const char *what) {
+        auto *output = static_cast<uint8_t *>(destination);
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t count = ::pread(fd, output + done, bytes - done, off_t(offset + done));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0)
+                throw std::system_error(count < 0 ? errno : EIO, std::generic_category(), what);
+            done += size_t(count);
+        }
+    }
+    void open_packed_experts(const std::filesystem::path &path) {
+        packed_fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (packed_fd_ < 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "open packed expert sidecar " + path.string());
+        PackedExpertFileHeader header{};
+        pread_exact(packed_fd_, 0, &header, sizeof(header), "read packed expert header");
+        require(std::memcmp(header.magic, "IG53XPK1", 8) == 0 && header.version == 1,
+                "bad packed expert sidecar header");
+        require(header.layers == model_.layers() && header.experts == model_.experts(),
+                "packed expert sidecar geometry does not match model");
+        std::error_code error;
+        const uint64_t actual_bytes = std::filesystem::file_size(path, error);
+        require(!error && actual_bytes == header.file_bytes,
+                "packed expert sidecar size does not match header");
+        packed_entries_.resize(size_t(header.layers) * header.experts);
+        pread_exact(packed_fd_, header.index_offset, packed_entries_.data(),
+                    packed_entries_.size() * sizeof(PackedExpertIndexEntry),
+                    "read packed expert index");
+        size_t populated = 0;
+        for (const PackedExpertIndexEntry &entry : packed_entries_) {
+            if (!entry.offset) {
+                require(entry.stored_bytes == 0 && entry.padded_bytes == 0,
+                        "malformed empty packed expert index entry");
+                continue;
+            }
+            require((entry.offset & (kAlignment - 1)) == 0 &&
+                    (entry.padded_bytes & (kAlignment - 1)) == 0 &&
+                    entry.stored_bytes <= entry.padded_bytes &&
+                    entry.offset <= header.file_bytes &&
+                    entry.padded_bytes <= header.file_bytes - entry.offset,
+                    "malformed packed expert index entry");
+            packed_scratch_bytes_ = std::max(packed_scratch_bytes_, size_t(entry.padded_bytes));
+            ++populated;
+        }
+        require(populated == header.records && packed_scratch_bytes_,
+                "packed expert index record count mismatch");
+#ifdef O_DIRECT
+        packed_direct_fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+#endif
+        const double fraction = header.source_bytes
+            ? double(header.stored_bytes) / double(header.source_bytes) : 1.0;
+        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + AVX2 expand\n",
+                    populated, header.stored_bytes / double(1ull << 30),
+                    100.0 * (1.0 - fraction),
+                    packed_direct_fd_ >= 0 ? "O_DIRECT" : "buffered I/O");
+    }
+    const PackedExpertIndexEntry &packed_entry(int layer, int expert) const {
+        const size_t index = size_t(layer) * model_.experts() + size_t(expert);
+        require(index < packed_entries_.size() && packed_entries_[index].offset,
+                "expert is missing from packed sidecar");
+        return packed_entries_[index];
+    }
+    uint64_t source_bytes(int layer, int expert) const {
+        return packed_fd_ >= 0 ? packed_entry(layer, expert).padded_bytes
+                               : kBodyBytes + kScaleBytes + 3 * sizeof(float);
+    }
+    static void expand_scale_nibbles(const uint8_t *packed, const uint8_t *escapes,
+                                     uint32_t escape_count, const uint8_t *codebook,
+                                     uint8_t *output) {
+        const __m128i lookup = _mm_loadu_si128(reinterpret_cast<const __m128i *>(codebook));
+        const __m128i nibble_mask = _mm_set1_epi8(15);
+        const __m128i escape_code = _mm_set1_epi8(15);
+        uint32_t escape_at = 0;
+        for (size_t index = 0; index < kScaleBytes; index += 32) {
+            const __m128i bytes =
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(packed + index / 2));
+            const __m128i low = _mm_and_si128(bytes, nibble_mask);
+            const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+            const __m128i first = _mm_unpacklo_epi8(low, high);
+            const __m128i second = _mm_unpackhi_epi8(low, high);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + index),
+                             _mm_shuffle_epi8(lookup, first));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + index + 16),
+                             _mm_shuffle_epi8(lookup, second));
+            uint32_t masks[2] = {
+                uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(first, escape_code))),
+                uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(second, escape_code))),
+            };
+            for (int half = 0; half < 2; ++half) {
+                uint32_t mask = masks[half];
+                while (mask) {
+                    if (escape_at >= escape_count)
+                        throw std::runtime_error("packed expert scale escape underflow");
+                    const unsigned bit = unsigned(__builtin_ctz(mask));
+                    output[index + size_t(half) * 16 + bit] = escapes[escape_at++];
+                    mask &= mask - 1;
+                }
+            }
+        }
+        require(escape_at == escape_count, "packed expert scale escape overflow");
+    }
+    void stage_packed(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                      uint8_t *window, int layer, int expert, void *scratch) {
+        const PackedExpertIndexEntry &entry = packed_entry(layer, expert);
+        require(scratch && entry.padded_bytes <= packed_scratch_bytes_,
+                "packed expert reader scratch is unavailable");
+        pread_exact(packed_direct_fd_ >= 0 ? packed_direct_fd_ : packed_fd_,
+                    entry.offset, scratch, entry.padded_bytes,
+                    "read packed expert record");
+        const auto *header = static_cast<const PackedExpertRecordHeader *>(scratch);
+        require(std::memcmp(header->magic, "XPR1", 4) == 0 &&
+                header->layer == layer && header->expert == expert,
+                "packed expert record key mismatch");
+        const uint8_t *input = static_cast<const uint8_t *>(scratch) + sizeof(*header);
+        const uint8_t *const input_end = static_cast<const uint8_t *>(scratch) + entry.stored_bytes;
+        size_t cursor = 0;
+        layout = {};
+        for (int projection = 0; projection < 3; ++projection) {
+            require(size_t(input_end - input) >= (4ull << 20) + (256ull << 10) +
+                                                header->escapes[projection],
+                    "truncated packed expert projection");
+            layout.body[projection] = cursor;
+            std::memcpy(window + cursor, input, 4ull << 20);
+            input += 4ull << 20;
+            cursor += 4ull << 20;
+            layout.scales[projection] = cursor;
+            const uint8_t *packed_scales = input;
+            const uint8_t *escape_values = input + (256ull << 10);
+            expand_scale_nibbles(packed_scales, escape_values,
+                                 header->escapes[projection], header->codebooks[projection],
+                                 window + cursor);
+            input = escape_values + header->escapes[projection];
+            cursor += 512ull << 10;
+            globals[projection] = header->globals[projection];
+        }
+        require(input == input_end && cursor == kBodyBytes + kScaleBytes,
+                "packed expert record has trailing bytes");
+        layout.bytes = cursor;
+        payload = window;
     }
     // Sizes and allocates the VRAM tier at first expert use, when every
     // startup allocation (dense FP8 residency, drafter, state buffers) has
@@ -991,6 +1168,7 @@ private:
         state.copy_issued = false;
         state.pinned = false;
         state.stamp = 0;
+        state.source_bytes = source_bytes(layer, expert);
         state.hits = 0;
         state.error = nullptr;
         state.payload = nullptr;
@@ -1113,6 +1291,7 @@ private:
     // physical drive). Cached per (layer,expert); the lookup walks 9 index
     // entries once per distinct key.
     int drive_of(uint32_t key, int layer, int expert) {
+        if (packed_fd_ >= 0) return 0;
         std::lock_guard<std::mutex> lock(pool_mutex_);
         const auto found = drive_cache_.find(key);
         if (found != drive_cache_.end()) return found->second;
@@ -1137,6 +1316,10 @@ private:
             const int workers = std::min<int>(drive ? readers_e : readers, window_count_);
             for (int index = 0; index < workers; ++index)
                 pool_.emplace_back([this, drive] {
+                    void *packed_scratch = nullptr;
+                    if (drive == 0 && packed_fd_ >= 0 &&
+                        ::posix_memalign(&packed_scratch, kAlignment, packed_scratch_bytes_))
+                        packed_scratch = nullptr;
                     for (;;) {
                         int window = -1;
                         {
@@ -1145,7 +1328,10 @@ private:
                                 return stop_ || !demand_queue_[drive].empty() ||
                                        !prefetch_queue_[drive].empty();
                             });
-                            if (stop_) return;
+                            if (stop_) {
+                                std::free(packed_scratch);
+                                return;
+                            }
                             // Demand records always jump ahead of speculative ones:
                             // a prefetch that delays the current layer's reads is a
                             // net loss no matter how good its prediction is.
@@ -1157,7 +1343,7 @@ private:
                                 prefetch_queue_[drive].pop_front();
                             }
                         }
-                        read_window(window);
+                        read_window(window, packed_scratch);
                         {
                             std::lock_guard<std::mutex> lock(pool_mutex_);
                             windows_[size_t(window)].done = true;
@@ -1189,13 +1375,19 @@ private:
         // record in a drive's queue waits forever.
         pool_cv_.notify_all();
     }
-    void read_window(int window) {
+    void read_window(int window, void *packed_scratch) {
         WindowState &state = windows_[size_t(window)];
         try {
-            const ExpertLocations tensors = locate_expert(model_, state.layer, state.expert);
-            stage(state.layout, state.globals, state.payload, tensors,
-                  host_ + size_t(window) * kWindowBytes, state);
-            if (!state.demand) prefetch_bytes_ += kBodyBytes + kScaleBytes + 3 * sizeof(float);
+            if (packed_fd_ >= 0) {
+                stage_packed(state.layout, state.globals, state.payload,
+                             host_ + size_t(window) * kWindowBytes,
+                             state.layer, state.expert, packed_scratch);
+            } else {
+                const ExpertLocations tensors = locate_expert(model_, state.layer, state.expert);
+                stage(state.layout, state.globals, state.payload, tensors,
+                      host_ + size_t(window) * kWindowBytes, state);
+            }
+            if (!state.demand) prefetch_bytes_ += state.source_bytes;
         } catch (...) {
             state.error = std::current_exception();
         }
@@ -1266,6 +1458,9 @@ private:
     }
 
     ShardedIndex &model_;
+    int packed_fd_ = -1, packed_direct_fd_ = -1;
+    std::vector<PackedExpertIndexEntry> packed_entries_;
+    size_t packed_scratch_bytes_ = 0;
     uint8_t *host_raw_ = nullptr, *host_ = nullptr, *device_ = nullptr;
     uint8_t *active_device_ = nullptr;
     Layout active_{};

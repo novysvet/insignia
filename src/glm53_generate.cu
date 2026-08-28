@@ -1504,6 +1504,7 @@ public:
             mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
             mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext *
                                     insignia::glm53::kMlaLatentGroups);
+            mla_exact_values_.reset(size_t(mla_layers_) * kLegacyMlaContext * q_b_rows_);
             mla_partial_.reset(size_t(mla_heads_) * (kMaxContext / 512) *
                                (size_t(kv_a_rows_) + 2));
             absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
@@ -1734,7 +1735,8 @@ private:
     // per-head absorb weights projected out of kv_b_proj, and flash-decode
     // merge scratch [heads, tiles, latent+2].
     DeviceBuffer<uint8_t> mla_latent_u8_;
-    DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_, w_uk_, w_uv_;
+    DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_exact_values_;
+    DeviceBuffer<float> mla_partial_, w_uk_, w_uv_;
     DeviceBuffer<float> mla_keys_, mla_values_;
     bool kv_fp8_ = true, mla_legacy_ = false;
     size_t absorb_per_layer_ = 0;
@@ -2106,11 +2108,19 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
         return;
     }
     const size_t layer_stride = size_t(kMaxContext) * kv_a_rows_;
+    const size_t exact_value_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+    const bool exact_value_prefix = position < kLegacyMlaContext;
+    if (exact_value_prefix)
+        linear(stem + "kv_b_proj.weight", small_b_, kv_, kv_b_rows_, kv_a_rows_);
     check(insignia::glm53::mla_decode_latent(mla_query_.get(), small_b_.get(),
+        exact_value_prefix ? kv_.get() : nullptr,
         kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr,
         mla_latent_scale_.get() + size_t(slot) * kMaxContext *
             insignia::glm53::kMlaLatentGroups,
         kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride,
+        exact_value_prefix
+            ? mla_exact_values_.get() + size_t(slot) * exact_value_stride
+            : nullptr,
         w_uk_.get() + size_t(slot) * absorb_per_layer_,
         w_uv_.get() + size_t(slot) * absorb_per_layer_,
         mla_partial_.get(), mla_output_, position,
@@ -2712,6 +2722,14 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
     float *cache_f32 = kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride;
     const float *w_uk = w_uk_.get() + size_t(slot) * absorb_per_layer_;
     const float *w_uv = w_uv_.get() + size_t(slot) * absorb_per_layer_;
+    const bool exact_value_prefix = position_base + tokens <= kLegacyMlaContext;
+    const size_t exact_value_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+    float *exact_value_cache = exact_value_prefix
+        ? mla_exact_values_.get() + size_t(slot) * exact_value_stride
+        : nullptr;
+    if (exact_value_prefix)
+        linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_, tokens,
+                     kv_b_rows_, kv_a_rows_);
     static const bool scalar_attention =
         std::getenv("INSIGNIA_GLM53_SCALAR_MLA_PREFILL") != nullptr;
     if (scalar_attention) {
@@ -2719,16 +2737,20 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
             check(insignia::glm53::mla_decode_latent(
                   c_mlaq_.get() + size_t(token) * q_b_rows_,
                   c_small_.get() + size_t(token) * kv_a_rows_,
+                  exact_value_prefix
+                      ? c_kv_.get() + size_t(token) * kv_b_rows_
+                      : nullptr,
                   cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext *
                       insignia::glm53::kMlaLatentGroups,
-                  cache_f32, w_uk, w_uv, mla_partial_.get(),
+                  cache_f32, exact_value_cache, w_uk, w_uv, mla_partial_.get(),
                   c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
                   mla_heads_, mla_head_dim_, kv_a_rows_), "scalar MLA attention (prefill)");
     } else {
         check(insignia::glm53::mla_prefill_latent(c_mlaq_.get(), c_small_.get(),
+              exact_value_prefix ? c_kv_.get() : nullptr,
               cache_u8, mla_latent_scale_.get() + size_t(slot) * kMaxContext *
                   insignia::glm53::kMlaLatentGroups,
-              cache_f32, w_uk, w_uv, c_mlao_, tokens,
+              cache_f32, exact_value_cache, w_uk, w_uv, c_mlao_, tokens,
               position_base, mla_heads_, mla_head_dim_, kv_a_rows_), "MLA latent prefill");
     }
     if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&

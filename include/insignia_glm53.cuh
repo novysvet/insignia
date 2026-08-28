@@ -238,14 +238,19 @@ cudaError_t mla_store_latent(
 
 // Single-token decode against the latent cache.  query is
 // [heads,head_dim]; latent is the current token's [latent_dim] pre-norm
-// latent, appended to the cache at `position` by this call.  partial
-// scratch holds [heads,tiles,latent_dim+2] FP32 merge data.
+// latent, appended to the cache at `position` by this call.  When
+// expanded_kv and exact_value_cache are both non-null (positions < 256), the
+// expanded FP32 V half is cached and consumed directly while scores remain
+// absorbed; otherwise partial scratch holds [heads,tiles,latent_dim+2] FP32
+// merge data for the fully latent path.
 cudaError_t mla_decode_latent(
     const float *query,
     const float *latent,
+    const float *expanded_kv,
     uint8_t *cache,
     float *scales,
     float *cache_f32,
+    float *exact_value_cache,
     const float *w_uk,
     const float *w_uv,
     float *partial,
@@ -258,13 +263,16 @@ cudaError_t mla_decode_latent(
 
 // Prefill `tokens` queries [tokens,heads,head_dim] against the latent
 // cache, appending the `tokens` latents [tokens,latent_dim] first (causal
-// mask inside the chunk mirrors the expanded flash2 path).
+// mask inside the chunk mirrors the expanded flash2 path).  Passing both
+// expanded_kv and exact_value_cache selects the prefix exact-value path.
 cudaError_t mla_prefill_latent(
     const float *query,
     const float *latents,
+    const float *expanded_kv,
     uint8_t *cache,
     float *scales,
     float *cache_f32,
+    float *exact_value_cache,
     const float *w_uk,
     const float *w_uv,
     float *output,

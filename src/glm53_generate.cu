@@ -3136,10 +3136,18 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                         if (batch[size_t(slot)] == expert)
                             populate_mask |= uint8_t(1u << slot);
                 populate = populate_mask != 0;
-            } else if (base_slot == 0) {
-                // Prompt prefill keeps its original one-token working set.
-                populate = true;
-                populate_mask = uint8_t((1u << batch_count) - 1u);
+            } else if (!kda_archive_) {
+                // Prompt prefill: retain a bounded per-layer slice of the
+                // chunk union so the next chunk's overlapping picks hit the
+                // pinned tier instead of re-reading disk. Zero disables.
+                static const int retain_quota = [] {
+                    const char *value = std::getenv("INSIGNIA_GLM53_PREFILL_RETAIN");
+                    return value ? std::max(0, std::atoi(value)) : 24;
+                }();
+                for (int slot = 0; slot < batch_count; ++slot)
+                    if (int(base_slot) + slot < retain_quota)
+                        populate_mask |= uint8_t(1u << slot);
+                populate = populate_mask != 0;
             }
             expert_stager_->load_batch(layer, batch, batch_count, populate, populate_mask);
             for (int slot = 0; slot < batch_count; ++slot) {
@@ -3628,6 +3636,15 @@ int main(int argc, char **argv) {
                     if (std::getenv("INSIGNIA_GLM53_DF_BATCH_VERIFY")) return 2;
                     return 0;
                 }();
+                // Adaptive draft length: on real text the acceptance EMA
+                // sits well below the block size, and every drafted position
+                // beyond it widens the verify expert union for tokens that
+                // get rejected. Cap the draft at EMA-driven headroom; the
+                // verify pass itself stays greedy-exact either way.
+                const bool adaptive_k_on = [] {
+                    const char *value = std::getenv("INSIGNIA_GLM53_DF_ADAPTIVE_K");
+                    return !value || std::atoi(value) != 0;
+                }();
                 double accept_ema = 0.0;
                 bool accept_ema_init = false;
                 const auto decode_begin = std::chrono::steady_clock::now();
@@ -3636,7 +3653,10 @@ int main(int argc, char **argv) {
                 std::printf("\n");
                 std::fflush(stdout);
                 while (int(generated.size()) < generate) {
-                    const int draft_k = std::min(verify_k, generate - int(generated.size()));
+                    int round_verify_k = verify_k;
+                    if (adaptive_k_on && accept_ema_init)
+                        round_verify_k = std::clamp(int(accept_ema * 1.3) + 1, 2, verify_k);
+                    const int draft_k = std::min(round_verify_k, generate - int(generated.size()));
                     if (std::getenv("INSIGNIA_GLM53_DF_DEBUG"))
                         std::fprintf(stderr, "df round %d: anchor %d pos %d truth0 %d\n",
                                      rounds, root, position, truth0);

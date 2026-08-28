@@ -586,6 +586,10 @@ public:
     // unreserved so a demand batch always finds free slots immediately.
     void prefetch(int layer, const int *experts, int count) {
         if (!overlap_reads_) return;
+        // Pass-through H2D copies complete between layers, but only demand's
+        // take_window() used to reclaim them. Without this nonblocking reap,
+        // the speculative path sees an empty free list and silently stops.
+        reap_released();
         for (int index = 0; index < count; ++index) {
             if (int(free_windows_.size()) <= 8) break;
             if (experts[index] < 0) continue;  // routing unknown (first token)

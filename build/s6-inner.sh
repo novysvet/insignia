@@ -4,6 +4,6 @@
 # Reads one line of benchmark_math.py arguments from /var/lib/insignia/s6-args:
 #   <output-dir> [--samples N --generate N --verify-k K ...]
 set -euo pipefail
-mapfile -t ARGS < /var/lib/insignia/s6-args
+read -ra ARGS < /var/lib/insignia/s6-args
 exec bash /mnt/c/coding/Insignia-glm53-dflash2/build/s6-bench.sh "${ARGS[@]}" \
     > /var/lib/insignia/s6-task.log 2>&1

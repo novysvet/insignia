@@ -697,13 +697,19 @@ public:
             if (flight_index_.count(key)) continue;
             const int window = take_window();
             start_read(window, key, layer, experts[index], true);
+            io_bytes_ += kBodyBytes + kScaleBytes + 3 * sizeof(float);
         }
     }
     void upload(int slot) {
         const int window = batch_window_[slot];
         require(window >= 0, "expert slot has no record in flight");
         WindowState &state = windows_[size_t(window)];
-        if (!window_done(window)) wait_window(window);
+        if (!window_done(window)) {
+            const auto wait_begin = std::chrono::steady_clock::now();
+            wait_window(window);
+            read_wait_seconds_ +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_begin).count();
+        }
         if (!batch_cached_[slot]) record_batch_read_end(state.end);
         if (state.error) {
             std::exception_ptr error = state.error;
@@ -803,6 +809,7 @@ public:
     uint64_t prefetch_useful() const { return prefetch_useful_; }
     uint64_t prefetch_wasted_observable() const { return prefetch_wasted_; }
     int cache_slots() const { return window_count_; }
+    double read_wait_seconds() const { return read_wait_seconds_; }
     uint64_t device_hits() const { return device_hits_; }
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
@@ -1204,6 +1211,7 @@ private:
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
+    double read_wait_seconds_ = 0.0;
     // VRAM tier: an arena of per-record device slots acts as an LRU above the
     // pinned host windows. A device hit skips both the NVMe read and the PCIe
     // H2D entirely; a miss streams into its own slot, so copies for different
@@ -3517,6 +3525,9 @@ std::vector<std::pair<int, float>> Runner::step(
                     100.0 * expert_stager_->device_hits() / expert_stager_->device_lookups(),
                     expert_stager_->device_hits() * ExpertStager::kPayloadCapacity / double(1ull << 30),
                     expert_stager_->device_slots());
+    if (expert_stager_ && expert_stager_->cache_lookups())
+        std::printf("  expert read-wait %.3f s of %.3f s expert wall (demand blocks on NVMe/pool)\n",
+                    expert_stager_->read_wait_seconds(), expert_io_seconds());
     if (expert_stager_ && expert_stager_->prefetch_started())
         std::printf("  expert prefetch %llu started, %llu adopted, %llu wasted (%.3f GiB speculative)\n",
                     (unsigned long long)expert_stager_->prefetch_started(),

@@ -584,12 +584,13 @@ public:
     // Speculative read-ahead keyed on the previous token's routing. Cheap to
     // call: resident or in-flight experts are skipped, and 8 windows stay
     // unreserved so a demand batch always finds free slots immediately.
-    void prefetch(int layer, const int *experts, int count) {
-        if (!overlap_reads_) return;
+    int prefetch(int layer, const int *experts, int count) {
+        if (!overlap_reads_) return 0;
         // Pass-through H2D copies complete between layers, but only demand's
         // take_window() used to reclaim them. Without this nonblocking reap,
         // the speculative path sees an empty free list and silently stops.
         reap_released();
+        int started = 0;
         for (int index = 0; index < count; ++index) {
             if (int(free_windows_.size()) <= 8) break;
             if (experts[index] < 0) continue;  // routing unknown (first token)
@@ -599,7 +600,9 @@ public:
             free_windows_.pop_back();
             start_read(window, key, layer, experts[index], false);
             ++prefetch_started_;
+            ++started;
         }
+        return started;
     }
 
     // Static hot-set pinning: a trace-derived list of the hottest experts
@@ -1972,6 +1975,7 @@ private:
     int early_multi_n_ = 4, early_multi_max_ = 64;
     uint64_t early_multi_batch_ = 0, early_multi_hits_ = 0;
     uint64_t early_multi_predicted_ = 0, early_multi_actual_ = 0;
+    uint64_t early_multi_hints_ = 0, early_multi_started_ = 0;
     std::vector<std::vector<std::array<int, 8>>> early_multi_rows_;
 
     void route_trace(int layer, const std::vector<int> &selected, const std::vector<float> &scores);
@@ -2521,7 +2525,10 @@ void Runner::early_route_multi(int layer, const float *input, int tokens) {
             if (std::find(picks.begin(), picks.end(), expert) == picks.end())
                 picks.push_back(expert);
         }
-    if (!picks.empty()) expert_stager_->prefetch(layer, picks.data(), int(picks.size()));
+    early_multi_hints_ += picks.size();
+    if (!picks.empty())
+        early_multi_started_ +=
+            expert_stager_->prefetch(layer, picks.data(), int(picks.size()));
 }
 
 // Routing-locality trace: one line per (token, sparse layer) after CPU routing,
@@ -3797,12 +3804,14 @@ std::vector<std::pair<int, float>> Runner::step(
                     100.0 * early_route_hits_ / early_route_total_);
     if (early_multi_actual_)
         std::printf("  batched pre-attention union recall %.1f%%, precision %.1f%% "
-                    "(%llu useful / %llu predicted / %llu actual)\n",
+                    "(%llu useful / %llu predicted / %llu actual; %llu/%llu hints started)\n",
                     100.0 * early_multi_hits_ / early_multi_actual_,
                     100.0 * early_multi_hits_ / early_multi_predicted_,
                     (unsigned long long)early_multi_hits_,
                     (unsigned long long)early_multi_predicted_,
-                    (unsigned long long)early_multi_actual_);
+                    (unsigned long long)early_multi_actual_,
+                    (unsigned long long)early_multi_started_,
+                    (unsigned long long)early_multi_hints_);
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",
                     q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8",

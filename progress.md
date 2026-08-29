@@ -1,5 +1,31 @@
 # progress
 
+### 2026-08-29 (session 7) — 27-agent optimization wave; packed sidecar validated; s6 problems resolved on paper
+
+Full findings and the unsolved-problems list: `audits/s7-optimization-wave.md`.
+Landed (23a041a): packed-expert scale-expansion fix (loop was 3x too large),
+packed expand instrumentation, empty-round EMA update, prev_routing_ re-keyed
+on the accepted anchor row, drafter window guard + commit clamp (OOB KV writes
+past 264). Overnight on glm-box: packed sidecar parity 5/5 green (codec is
+bit-exact; driver fixes greedy-exact); packed A/B within cold-process noise;
+route-trace campaign 13/17 prompts (~16k trace tokens, replaces the 5-token
+pin-list evidence). Established: d(k) measured 4-9% below the union curve;
+P7 80%-vs-28% = LRU retention-horizon law (verify inserts 6.3x faster); the
+pin list was built from 5 tokens (top-28 91.5% is a 5-token artifact, 84.3%
+at 60); P6 bound: 20 tok/s unreachable on 16 GB (PCIe carries all off-VRAM
+bytes, oracle cap 12.4 tok/s, realistic 3.5-4.7 real text); prefill is in a
+chunk-constant regime (~11.4 s/chunk, T=128 ≈ 90-120 ms/tok); zstd on
+records dead (bodies 1.0000x at zstd-19, entropy 3.968/4 bits); cross-layer
+routing MI ≈ 0-0.14 bits; drafter 264-window is an engine artifact
+(checkpoint trained at window 2047 — prompts >263 tokens run pure scalar).
+P1/P2/P3/P5/P6/P7/P8/P11 resolved on paper with implementations drafted in
+scratch/ (host-tier SLRU, VRAM static fill, adaptive-k argmax, drafter
+window, prefill-128, unified MLA kernel, KDA fusion, graphs). Open math:
+U1 routing-regime inconsistency (exchangeable-model impossibility), U2
+online survival estimation under policy feedback, U3 cost-decomposition
+identifiability, U4 quant→router-flip model (P9, untouched), U5 cross-prompt
+shift ν, U6 sequential-mode revival threshold, U7 the 32 GB frontier.
+
 ### 2026-08-28 (session 6) — speed campaign: I/O engineering round; 256K unblocked at P0
 
 Open problems handed to a math-focused follow-up: `audits/s6-open-problems.md`

@@ -375,6 +375,26 @@ cudaError_t mla_decode_latent(
     int latent_dim = kMlaLatentDim,
     cudaStream_t stream = nullptr);
 
+// Exact on-consumption variant: reconstructs the absorbed W_uk/W_uv
+// coefficients directly from the named resident E4M3FN kv_b_proj tensor and
+// FP16 group-64 scales. This removes the 64 MiB FP32 duplicate per MLA layer
+// without changing either FMA chain.
+cudaError_t mla_decode_latent_fp8_absorb(
+    const float *query,
+    const float *latent,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    const uint8_t *kv_b_fp8,
+    const uint16_t *kv_b_scales,
+    float *partial,
+    float *output,
+    int position,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    int latent_dim = kMlaLatentDim,
+    cudaStream_t stream = nullptr);
+
 // Prefill `tokens` queries [tokens,heads,head_dim] against the latent
 // cache, appending the `tokens` latents [tokens,latent_dim] first (causal
 // mask inside the chunk mirrors the expanded flash2 path).  Passing both
@@ -389,6 +409,22 @@ cudaError_t mla_prefill_latent(
     float *exact_value_cache,
     const float *w_uk,
     const float *w_uv,
+    float *output,
+    int tokens,
+    int position_base,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    int latent_dim = kMlaLatentDim,
+    cudaStream_t stream = nullptr);
+
+cudaError_t mla_prefill_latent_fp8_absorb(
+    const float *query,
+    const float *latents,
+    uint8_t *cache,
+    float *scales,
+    float *cache_f32,
+    const uint8_t *kv_b_fp8,
+    const uint16_t *kv_b_scales,
     float *output,
     int tokens,
     int position_base,

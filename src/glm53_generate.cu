@@ -2218,6 +2218,10 @@ class Q8Stager {
 public:
     static constexpr size_t kWeightCapacity = 128ull << 20;
     static constexpr size_t kScaleCapacity = 4ull << 20;
+    struct ResidentView {
+        const uint8_t *weights = nullptr;
+        const uint16_t *scales = nullptr;
+    };
 
     explicit Q8Stager(Q8Index &index) : index_(index) {
         check(cudaHostAlloc(&host_weights_, kWeightCapacity, cudaHostAllocDefault),
@@ -2292,6 +2296,13 @@ public:
     uint64_t resident_budget() const { return resident_budget_; }
     bool is_resident(std::string_view name) const {
         return resident_.find(std::string(name)) != resident_.end();
+    }
+    bool resident_view(std::string_view name, ResidentView *out) const {
+        const auto found = resident_.find(std::string(name));
+        if (found == resident_.end() || !out) return false;
+        out->weights = found->second.weights;
+        out->scales = reinterpret_cast<const uint16_t *>(found->second.scales);
+        return true;
     }
     // Pins the whole 8-bit cache up front, reading the data file in on-disk
     // order with O_DIRECT. Lazy per-tensor pinning interleaves buffered
@@ -2693,9 +2704,19 @@ public:
             mla_partial_.reset(size_t(mla_heads_) * ((kMaxContext() + 511) / 512) *
                                (size_t(kv_a_rows_) + 2));
             absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
-            w_uk_.reset(absorb_per_layer_ * mla_layers_);
-            w_uv_.reset(absorb_per_layer_ * mla_layers_);
-            extract_mla_absorb();
+            const char *compact_absorb = std::getenv("INSIGNIA_GLM53_MLA_FP8_ABSORB");
+            mla_fp8_absorb_ = compact_absorb && std::atoi(compact_absorb) != 0 &&
+                              bind_mla_absorb_fp8();
+            if (!mla_fp8_absorb_) {
+                w_uk_.reset(absorb_per_layer_ * mla_layers_);
+                w_uv_.reset(absorb_per_layer_ * mla_layers_);
+                extract_mla_absorb();
+            } else {
+                const double removed_mib =
+                    2.0 * absorb_per_layer_ * mla_layers_ * sizeof(float) / double(1 << 20);
+                std::printf("MLA absorb: exact on-consumption resident FP8 "
+                            "(%.0f MiB FP32 duplicate removed)\n", removed_mib);
+            }
         }
         c_stream_a_.reset(size_t(kMaxChunk()) * kStreams * hidden_);
         c_stream_b_.reset(c_stream_a_.size());
@@ -2898,6 +2919,7 @@ private:
              const float *streams, float *normalized);
     void kda(int layer, const float *input, float *output, int position);
     void mla(int layer, const float *input, float *output, int position);
+    bool bind_mla_absorb_fp8();
     void extract_mla_absorb();
     void compute_mlp(std::string_view stem, const float *input, float *output, int intermediate);
     void dense_mlp(std::string_view stem, const float *input, float *output, int intermediate);
@@ -3016,7 +3038,8 @@ private:
     DeviceBuffer<uint8_t> mla_latent_u8_;
     DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_, w_uk_, w_uv_;
     DeviceBuffer<float> mla_keys_, mla_values_;
-    bool kv_fp8_ = true, mla_legacy_ = false;
+    std::vector<Q8Stager::ResidentView> mla_absorb_fp8_views_;
+    bool kv_fp8_ = true, mla_legacy_ = false, mla_fp8_absorb_ = false;
     size_t absorb_per_layer_ = 0;
     const uint32_t *chunk_bf16_weights_ = nullptr;
     DeviceBuffer<float> c_stream_a_, c_stream_b_, c_collapsed_, c_normalized_, c_attn_, c_ffn_;
@@ -3279,6 +3302,30 @@ void Runner::kda(int layer, const float *input, float *output, int position) {
     linear(stem + "o_proj.weight", projected_8192_, output, hidden_, kda_width_);
 }
 
+bool Runner::bind_mla_absorb_fp8() {
+    // The diagnostic exports materialized W_uk/W_uv arrays; retain its old
+    // contract instead of silently changing the dump surface.
+    if (!q8_index_ || !q8_stager_ ||
+        q8_index_->format() != Cache8Format::fp8_e4m3 ||
+        std::getenv("INSIGNIA_GLM53_MLA_BF16_ABSORB") ||
+        std::getenv("INSIGNIA_GLM53_MLA_DUMP"))
+        return false;
+    mla_absorb_fp8_views_.assign(size_t(mla_layers_), {});
+    for (int slot = 0; slot < mla_layers_; ++slot) {
+        const std::string name =
+            layer_stem(mla_slot_[size_t(slot)]) + "self_attn.kv_b_proj.weight";
+        const Q8TensorLocation *quantized = q8_index_->find(name);
+        if (!quantized || quantized->rows != uint32_t(kv_b_rows_) ||
+            quantized->cols != uint32_t(kv_a_rows_))
+            return false;
+        if (!q8_stager_->is_resident(name) && !q8_stager_->try_pin(name, *quantized))
+            return false;
+        if (!q8_stager_->resident_view(name, &mla_absorb_fp8_views_[size_t(slot)]))
+            return false;
+    }
+    return true;
+}
+
 // Extracts per-head absorb weights from kv_b_proj. With the normal dense FP8
 // cache, widen the exact e4m3*FP16 values used by fp8_tc_gemv so absorbed MLA
 // remains the same quantized model. Raw BF16 is only the cache-less fallback.
@@ -3409,13 +3456,21 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
               mla_output_, position, mla_heads_, mla_head_dim_),
               "exact MLA prefix attention");
     } else {
-        check(insignia::glm53::mla_decode_latent(
-              mla_query_.get(), small_b_.get(), nullptr, cache_u8, cache_scale,
-              cache_f32, nullptr,
-              w_uk_.get() + size_t(slot) * absorb_per_layer_,
-              w_uv_.get() + size_t(slot) * absorb_per_layer_,
-              mla_partial_.get(), mla_output_, position,
-              mla_heads_, mla_head_dim_, kv_a_rows_), "MLA attention");
+        if (mla_fp8_absorb_) {
+            const Q8Stager::ResidentView &view = mla_absorb_fp8_views_[size_t(slot)];
+            check(insignia::glm53::mla_decode_latent_fp8_absorb(
+                  mla_query_.get(), small_b_.get(), cache_u8, cache_scale, cache_f32,
+                  view.weights, view.scales, mla_partial_.get(), mla_output_, position,
+                  mla_heads_, mla_head_dim_, kv_a_rows_), "MLA compact absorb attention");
+        } else {
+            check(insignia::glm53::mla_decode_latent(
+                  mla_query_.get(), small_b_.get(), nullptr, cache_u8, cache_scale,
+                  cache_f32, nullptr,
+                  w_uk_.get() + size_t(slot) * absorb_per_layer_,
+                  w_uv_.get() + size_t(slot) * absorb_per_layer_,
+                  mla_partial_.get(), mla_output_, position,
+                  mla_heads_, mla_head_dim_, kv_a_rows_), "MLA attention");
+        }
     }
     if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&
         position >= 4 && position <= 6) {
@@ -4117,8 +4172,12 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
     const size_t layer_stride = size_t(kMaxContext()) * kv_a_rows_;
     uint8_t *cache_u8 = kv_fp8_ ? mla_latent_u8_.get() + size_t(slot) * layer_stride : nullptr;
     float *cache_f32 = kv_fp8_ ? nullptr : mla_latent_f32_.get() + size_t(slot) * layer_stride;
-    const float *w_uk = w_uk_.get() + size_t(slot) * absorb_per_layer_;
-    const float *w_uv = w_uv_.get() + size_t(slot) * absorb_per_layer_;
+    const float *w_uk = mla_fp8_absorb_ ? nullptr :
+        w_uk_.get() + size_t(slot) * absorb_per_layer_;
+    const float *w_uv = mla_fp8_absorb_ ? nullptr :
+        w_uv_.get() + size_t(slot) * absorb_per_layer_;
+    const Q8Stager::ResidentView *absorb_view = mla_fp8_absorb_ ?
+        &mla_absorb_fp8_views_[size_t(slot)] : nullptr;
     float *cache_scale = mla_latent_scale_.get() + size_t(slot) * kMaxContext() *
                          insignia::glm53::kMlaLatentGroups;
     const bool exact_prefix = position_base + tokens <= kLegacyMlaContext;
@@ -4139,19 +4198,39 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
     static const bool scalar_attention =
         std::getenv("INSIGNIA_GLM53_SCALAR_MLA_PREFILL") != nullptr;
     if (!exact_prefix && scalar_attention) {
-        for (int token = 0; token < tokens; ++token)
-            check(insignia::glm53::mla_decode_latent(
-                  c_mlaq_.get() + size_t(token) * q_b_rows_,
-                  c_small_.get() + size_t(token) * kv_a_rows_,
-                  nullptr, cache_u8, cache_scale, cache_f32, nullptr,
-                  w_uk, w_uv, mla_partial_.get(),
-                  c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
-                  mla_heads_, mla_head_dim_, kv_a_rows_), "scalar MLA attention (prefill)");
+        for (int token = 0; token < tokens; ++token) {
+            if (mla_fp8_absorb_)
+                check(insignia::glm53::mla_decode_latent_fp8_absorb(
+                      c_mlaq_.get() + size_t(token) * q_b_rows_,
+                      c_small_.get() + size_t(token) * kv_a_rows_,
+                      cache_u8, cache_scale, cache_f32,
+                      absorb_view->weights, absorb_view->scales, mla_partial_.get(),
+                      c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
+                      mla_heads_, mla_head_dim_, kv_a_rows_),
+                      "scalar compact-absorb MLA attention (prefill)");
+            else
+                check(insignia::glm53::mla_decode_latent(
+                      c_mlaq_.get() + size_t(token) * q_b_rows_,
+                      c_small_.get() + size_t(token) * kv_a_rows_,
+                      nullptr, cache_u8, cache_scale, cache_f32, nullptr,
+                      w_uk, w_uv, mla_partial_.get(),
+                      c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
+                      mla_heads_, mla_head_dim_, kv_a_rows_),
+                      "scalar MLA attention (prefill)");
+        }
     } else if (!exact_prefix) {
-        check(insignia::glm53::mla_prefill_latent(c_mlaq_.get(), c_small_.get(),
-              nullptr, cache_u8, cache_scale, cache_f32, nullptr,
-              w_uk, w_uv, c_mlao_, tokens,
-              position_base, mla_heads_, mla_head_dim_, kv_a_rows_), "MLA latent prefill");
+        if (mla_fp8_absorb_)
+            check(insignia::glm53::mla_prefill_latent_fp8_absorb(
+                  c_mlaq_.get(), c_small_.get(), cache_u8, cache_scale, cache_f32,
+                  absorb_view->weights, absorb_view->scales, c_mlao_, tokens,
+                  position_base, mla_heads_, mla_head_dim_, kv_a_rows_),
+                  "compact-absorb MLA latent prefill");
+        else
+            check(insignia::glm53::mla_prefill_latent(c_mlaq_.get(), c_small_.get(),
+                  nullptr, cache_u8, cache_scale, cache_f32, nullptr,
+                  w_uk, w_uv, c_mlao_, tokens,
+                  position_base, mla_heads_, mla_head_dim_, kv_a_rows_),
+                  "MLA latent prefill");
     }
     if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&
         position_base == 0 && tokens > 1) {

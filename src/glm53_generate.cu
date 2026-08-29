@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -911,6 +912,11 @@ public:
     uint64_t device_hits() const { return device_hits_; }
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
+    bool packed_experts() const { return packed_fd_ >= 0; }
+    uint64_t packed_expanded_bytes() const { return packed_expanded_bytes_.load(); }
+    double packed_expand_seconds() const {
+        return packed_expand_nanoseconds_.load() * 1.0e-9;
+    }
 private:
     struct Layout {
         std::array<size_t, 3> body{};
@@ -1010,12 +1016,12 @@ private:
     }
     static void expand_scale_nibbles(const uint8_t *packed, const uint8_t *escapes,
                                      uint32_t escape_count, const uint8_t *codebook,
-                                     uint8_t *output) {
+                                     uint8_t *output, size_t bytes) {
         const __m128i lookup = _mm_loadu_si128(reinterpret_cast<const __m128i *>(codebook));
         const __m128i nibble_mask = _mm_set1_epi8(15);
         const __m128i escape_code = _mm_set1_epi8(15);
         uint32_t escape_at = 0;
-        for (size_t index = 0; index < kScaleBytes; index += 32) {
+        for (size_t index = 0; index < bytes; index += 32) {
             const __m128i bytes =
                 _mm_loadu_si128(reinterpret_cast<const __m128i *>(packed + index / 2));
             const __m128i low = _mm_and_si128(bytes, nibble_mask);
@@ -1051,6 +1057,7 @@ private:
         pread_exact(packed_direct_fd_ >= 0 ? packed_direct_fd_ : packed_fd_,
                     entry.offset, scratch, entry.padded_bytes,
                     "read packed expert record");
+        const auto expand_begin = std::chrono::steady_clock::now();
         const auto *header = static_cast<const PackedExpertRecordHeader *>(scratch);
         require(std::memcmp(header->magic, "XPR1", 4) == 0 &&
                 header->layer == layer && header->expert == expert,
@@ -1072,7 +1079,7 @@ private:
             const uint8_t *escape_values = input + (256ull << 10);
             expand_scale_nibbles(packed_scales, escape_values,
                                  header->escapes[projection], header->codebooks[projection],
-                                 window + cursor);
+                                 window + cursor, kScaleBytes / 3);
             input = escape_values + header->escapes[projection];
             cursor += 512ull << 10;
             globals[projection] = header->globals[projection];
@@ -1081,6 +1088,9 @@ private:
                 "packed expert record has trailing bytes");
         layout.bytes = cursor;
         payload = window;
+        packed_expanded_bytes_.fetch_add(kBodyBytes + kScaleBytes, std::memory_order_relaxed);
+        packed_expand_nanoseconds_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - expand_begin).count()), std::memory_order_relaxed);
     }
     // Sizes and allocates the VRAM tier at first expert use, when every
     // startup allocation (dense FP8 residency, drafter, state buffers) has
@@ -1461,6 +1471,7 @@ private:
     int packed_fd_ = -1, packed_direct_fd_ = -1;
     std::vector<PackedExpertIndexEntry> packed_entries_;
     size_t packed_scratch_bytes_ = 0;
+    std::atomic<uint64_t> packed_expanded_bytes_{0}, packed_expand_nanoseconds_{0};
     uint8_t *host_raw_ = nullptr, *host_ = nullptr, *device_ = nullptr;
     uint8_t *active_device_ = nullptr;
     Layout active_{};
@@ -1868,6 +1879,7 @@ public:
         }
         prev_routing_.assign(size_t(layer_count),
                              {-1, -1, -1, -1, -1, -1, -1, -1});
+        row_routing_.assign(size_t(layer_count), {});
         early_routing_.assign(size_t(layer_count),
                               {-1, -1, -1, -1, -1, -1, -1, -1});
         if (const char *prefetch = std::getenv("INSIGNIA_GLM53_PREFETCH"))
@@ -2094,6 +2106,17 @@ public:
     // append `rows` verify-captured tokens to the drafter K/V cache.
     std::vector<int> df_draft(int anchor, int position);
     void df_commit(int rows, int pos0) { df_->commit(rows, pos0); }
+    // Re-key prev_routing_ on the accepted anchor row of the last multi-row
+    // verify: moe_multi stored the chunk's LAST row (a rejected draft
+    // position after partial acceptance), which then keyed every
+    // prev-routing prefetch for the next round.
+    void adopt_anchor_routing(int row) {
+        if (row < 0) return;
+        for (size_t layer = 0; layer < prev_routing_.size(); ++layer)
+            for (int slot = 0; slot < moe_topk_; ++slot)
+                prev_routing_[layer][size_t(slot)] =
+                    row_routing_[layer][size_t(row * moe_topk_ + slot)];
+    }
     // Verifies candidate tokens at position_base+1.. against the target and
     // returns (accepted_count, argmax rows) — see the caller in main().
     int verify_token(int token, int position);
@@ -2142,6 +2165,7 @@ private:
     TensorStager stager_;
     std::unique_ptr<ExpertStager> expert_stager_;
     std::vector<std::array<int, 8>> prev_routing_;
+    std::vector<std::array<int, 64>> row_routing_;  // [layer][row*8+slot], last multi-row chunk
     std::vector<std::array<int, 8>> early_routing_;
     DeviceBuffer<float> expert_scratch_;
     FILE *route_trace_ = nullptr;
@@ -3475,6 +3499,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         // batches run; speculative queues can never jump a demand record.
         for (int slot = 0; slot < topk; ++slot)
             prev_routing_[size_t(layer)][size_t(slot)] = selection[size_t(tokens - 1)][size_t(slot)].first;
+        for (int row = 0; row < tokens && row < 8; ++row)
+            for (int slot = 0; slot < topk; ++slot)
+                row_routing_[size_t(layer)][size_t(row * topk + slot)] =
+                    selection[size_t(row)][size_t(slot)].first;
         expert_stager_->stage_layer(layer, distinct.data(), int(distinct.size()));
         if (prefetch_on_ && size_t(layer) + 1 < prev_routing_.size() &&
             is_sparse_[size_t(layer) + 1])
@@ -3995,6 +4023,16 @@ std::vector<std::pair<int, float>> Runner::step(
                     (unsigned long long)expert_stager_->prefetch_useful(),
                     (unsigned long long)expert_stager_->prefetch_wasted_observable(),
                     expert_stager_->prefetch_bytes() / double(1ull << 30));
+    if (expert_stager_ && expert_stager_->packed_experts() &&
+        expert_stager_->packed_expanded_bytes())
+        std::printf("  packed expand %.3f GiB in %.3f s (%.2f GiB/s; %.3f ms/record)\n",
+                    expert_stager_->packed_expanded_bytes() / double(1ull << 30),
+                    expert_stager_->packed_expand_seconds(),
+                    expert_stager_->packed_expanded_bytes() /
+                        (expert_stager_->packed_expand_seconds() * double(1ull << 30)),
+                    expert_stager_->packed_expand_seconds() * 1.0e3 /
+                        double(expert_stager_->packed_expanded_bytes() /
+                               (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes)));
     if (early_route_total_)
         std::printf("  pre-attention route recall %llu/%llu (%.1f%%)\n",
                     (unsigned long long)early_route_hits_,
@@ -4132,10 +4170,12 @@ int main(int argc, char **argv) {
                 std::printf("\n");
                 std::fflush(stdout);
                 while (int(generated.size()) < generate) {
-                    // The drafter attends over a fixed 264-position KV window;
-                    // past it the block proposals have no context, so fall
-                    // back to plain greedy steps for the remainder.
-                    if (position + 1 >= insignia::glm53::DFlash2Drafter::kMaxCtx) break;
+                    // The drafter attends over a fixed 264-position KV window
+                    // and the block adds kBlock keys on top of the anchor, so
+                    // the last safe anchor leaves room for the whole block;
+                    // past it, fall back to plain greedy steps.
+                    if (position + 1 + insignia::glm53::DFlash2Drafter::kBlock >
+                        insignia::glm53::DFlash2Drafter::kMaxCtx) break;
                     int round_verify_k = verify_k;
                     if (adaptive_k_on && accept_ema_init)
                         round_verify_k = std::clamp(int(accept_ema * 1.3) + 1, 2, verify_k);
@@ -4158,6 +4198,12 @@ int main(int argc, char **argv) {
                         generated.push_back(truth0);
                         ++rounds;
                         accept_total += 1;
+                        // Empty rounds are matched=0 samples; skipping the
+                        // EMA update leaves k inflated through empty streaks,
+                        // widening verify unions exactly when acceptance is
+                        // worst.
+                        accept_ema = accept_ema_init ? 0.75 * accept_ema : 0.0;
+                        accept_ema_init = true;
                         if (int(generated.size()) < generate) {
                             const auto fallback_begin = std::chrono::steady_clock::now();
                             top = runner.step(truth0, position + 1, layers, true);
@@ -4218,6 +4264,7 @@ int main(int argc, char **argv) {
                         runner.rollback_kda(matched, position + 1);
                     // The verify captures cover the candidates; append the
                     // accepted prefix (step() commits its own token).
+                    runner.adopt_anchor_routing(df_seq_verify ? 0 : matched - 1);
                     runner.df_commit(matched, position + 1);
                     root = candidates[size_t(matched - 1)];
                     truth0 = arg[size_t(matched - 1)];

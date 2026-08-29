@@ -577,6 +577,11 @@ void DFlash2Drafter::forward(int anchor, int anchor_position) {
 }
 
 void DFlash2Drafter::commit(int count, int pos0) {
+    // kcache/vcache only hold kMaxCtx rows; prompt-prefill and post-window
+    // commits arrive with unbounded pos0 and would write past layer 4's
+    // cache into the next layer's rows.
+    if (pos0 >= kMaxCtx) return;
+    if (count > kMaxCtx - pos0) count = kMaxCtx - pos0;
     if (FILE *dump = df_dump_file()) {
         // Oracle record: every committed token's five captured target
         // features, packed token-major. capture_ itself is layer-major with a

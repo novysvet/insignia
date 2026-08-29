@@ -143,7 +143,7 @@ __global__ void df_norm_rope_kernel(float *__restrict__ x, const float *__restri
 // never bites below 2048 context). One warp per (position, q head); each warp
 // scores ctx_len+8 keys. GQA: q head h reads kv head h>>2.
 __global__ void df_attn_kernel(const float *__restrict__ q,      // [8, 32*128]
-                               const float *__restrict__ kcache, // [5][264][8*128]
+                               const float *__restrict__ kcache, // [5][kMaxCtx][8*128]
                                const float *__restrict__ vcache,
                                const float *__restrict__ kblk,    // [8, 8*128]
                                const float *__restrict__ vblk,
@@ -154,34 +154,35 @@ __global__ void df_attn_kernel(const float *__restrict__ q,      // [8, 32*128]
     const int t = warp_id >> 5, h = warp_id & 31;
     const int kvh = h >> 2;
     const int keys = ctx_len + DFlash2Drafter::kBlock;
-    __shared__ float tile[8][DFlash2Drafter::kMaxCtx];
+    extern __shared__ float tile[];
     __shared__ float scale_inv;
     if (threadIdx.x == 0) scale_inv = rsqrtf(128.f);
     __syncthreads();
 
     const float *qh = q + size_t(t) * 4096 + size_t(h) * 128;
     const float qv[4] = {qh[lane], qh[lane + 32], qh[lane + 64], qh[lane + 96]};
-    // Every warp scores ALL keys itself (its shared tile row is private);
-    // 264 dots per warp, no cross-warp reduction needed until softmax.
+    // Every warp scores ALL keys itself (its dynamic-shared row is private);
+    // no cross-warp reduction is needed until softmax.
     const int warp = threadIdx.x >> 5;
+    float *const scores = tile + size_t(warp) * keys;
     for (int j = 0; j < keys; ++j) {
         const float *kh = j < ctx_len
-            ? kcache + (size_t(layer) * 264 + j) * 1024 + size_t(kvh) * 128
+            ? kcache + (size_t(layer) * DFlash2Drafter::kMaxCtx + j) * 1024 + size_t(kvh) * 128
             : kblk + size_t(j - ctx_len) * 1024 + size_t(kvh) * 128;
         const float k0 = kh[lane], k1 = kh[lane + 32], k2 = kh[lane + 64], k3 = kh[lane + 96];
         float dot = qv[0] * k0 + qv[1] * k1 + qv[2] * k2 + qv[3] * k3;
         for (int off = 16; off; off >>= 1) dot += __shfl_down_sync(~0u, dot, off);
-        tile[warp][j] = __shfl_sync(~0u, dot, 0) * scale_inv;
+        scores[j] = __shfl_sync(~0u, dot, 0) * scale_inv;
     }
     __syncthreads();
     float m = -1e30f;
-    for (int j = lane; j < keys; j += 32) m = fmaxf(m, tile[warp][j]);
+    for (int j = lane; j < keys; j += 32) m = fmaxf(m, scores[j]);
     for (int off = 16; off; off >>= 1) m = fmaxf(m, __shfl_down_sync(~0u, m, off));
     m = __shfl_sync(~0u, m, 0);
     float denom = 0.f;
     for (int j = lane; j < keys; j += 32) {
-        const float e = __expf(tile[warp][j] - m);
-        tile[warp][j] = e;
+        const float e = __expf(scores[j] - m);
+        scores[j] = e;
         denom += e;
     }
     for (int off = 16; off; off >>= 1) denom += __shfl_down_sync(~0u, denom, off);
@@ -190,9 +191,9 @@ __global__ void df_attn_kernel(const float *__restrict__ q,      // [8, 32*128]
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int j = 0; j < keys; ++j) {
-        const float p = tile[warp][j] * inv_denom;
+        const float p = scores[j] * inv_denom;
         const float *vh = j < ctx_len
-            ? vcache + (size_t(layer) * 264 + j) * 1024 + size_t(kvh) * 128
+            ? vcache + (size_t(layer) * DFlash2Drafter::kMaxCtx + j) * 1024 + size_t(kvh) * 128
             : vblk + size_t(j - ctx_len) * 1024 + size_t(kvh) * 128;
         acc[0] = fmaf(p, vh[lane], acc[0]);
         acc[1] = fmaf(p, vh[lane + 32], acc[1]);
@@ -258,13 +259,15 @@ __global__ void df_kv_append_kernel(const float *__restrict__ k, const float *__
     const float pos = float(pos0 + t);
     const float a0 = pos * c_rope_freq[lane], a1 = pos * c_rope_freq[lane + 32];
     const float c0 = __cosf(a0), s0 = __sinf(a0), c1 = __cosf(a1), s1 = __sinf(a1);
-    float *krow = kcache + (size_t(layer) * 264 + pos0 + t) * 1024 + size_t(kvh) * 128;
+    float *krow = kcache +
+        (size_t(layer) * DFlash2Drafter::kMaxCtx + pos0 + t) * 1024 + size_t(kvh) * 128;
     krow[lane] = v0 * c0 - v2 * s0;
     krow[lane + 64] = v2 * c0 + v0 * s0;
     krow[lane + 32] = v1 * c1 - v3 * s1;
     krow[lane + 96] = v3 * c1 + v1 * s1;
     const float *vr = v + size_t(t) * 1024 + size_t(kvh) * 128;
-    float *vrow = vcache + (size_t(layer) * 264 + pos0 + t) * 1024 + size_t(kvh) * 128;
+    float *vrow = vcache +
+        (size_t(layer) * DFlash2Drafter::kMaxCtx + pos0 + t) * 1024 + size_t(kvh) * 128;
     vrow[lane] = vr[lane];
     vrow[lane + 32] = vr[lane + 32];
     vrow[lane + 64] = vr[lane + 64];
@@ -366,9 +369,12 @@ DFlash2Drafter::DFlash2Drafter(const std::string &index_path, const std::string 
     auto alloc = [](float **p, size_t floats) {
         check(cudaMalloc(p, floats * sizeof(float)), "df workspace alloc");
     };
-    check(cudaMalloc(&kcache_, size_t(kLayers) * 264 * 1024 * sizeof(float)), "df kcache");
-    check(cudaMalloc(&vcache_, size_t(kLayers) * 264 * 1024 * sizeof(float)), "df vcache");
-    check(cudaMemset(kcache_, 0, size_t(kLayers) * 264 * 1024 * sizeof(float)), "df kcache zero");
+    check(cudaMalloc(&kcache_, size_t(kLayers) * kMaxCtx * 1024 * sizeof(float)), "df kcache");
+    check(cudaMalloc(&vcache_, size_t(kLayers) * kMaxCtx * 1024 * sizeof(float)), "df vcache");
+    check(cudaMemset(kcache_, 0, size_t(kLayers) * kMaxCtx * 1024 * sizeof(float)), "df kcache zero");
+    check(cudaFuncSetAttribute(df_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               kBlock * kMaxCtx * int(sizeof(float))),
+          "df attention dynamic shared opt-in");
     alloc(&x_block_, kBlock * kHidden);
     alloc(&xn_, kBlock * kHidden);
     alloc(&branch_, kBlock * kHidden);
@@ -500,11 +506,12 @@ void DFlash2Drafter::forward(int anchor, int anchor_position) {
         check(cudaGetLastError(), "df norm rope");
         trace_stage(l, 6, qbuf_, kBlock, kQHeads * kHeadDim);
         trace_stage(l, 7, kblk_, kBlock, kKVHeads * kHeadDim);
-        trace_stage(l, 21, kcache_ + size_t(l) * 264 * 1024, ctx_len,
+        trace_stage(l, 21, kcache_ + size_t(l) * kMaxCtx * 1024, ctx_len,
                     kKVHeads * kHeadDim);
-        trace_stage(l, 22, vcache_ + size_t(l) * 264 * 1024, ctx_len,
+        trace_stage(l, 22, vcache_ + size_t(l) * kMaxCtx * 1024, ctx_len,
                     kKVHeads * kHeadDim);
-        df_attn_kernel<<<32, 256>>>(qbuf_, kcache_, vcache_, kblk_, vblk_, branch_, l, ctx_len);
+        df_attn_kernel<<<32, 256, size_t(kBlock) * (ctx_len + kBlock) * sizeof(float)>>>(
+            qbuf_, kcache_, vcache_, kblk_, vblk_, branch_, l, ctx_len);
         check(cudaGetLastError(), "df attn");
         trace_stage(l, 8, branch_, kBlock, kHidden);
         check(fp8_tc_gemv_batch(o_[l].w, o_[l].s, branch_, sub_, kBlock, o_[l].rows,

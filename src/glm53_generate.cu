@@ -4182,7 +4182,7 @@ int main(int argc, char **argv) {
                 std::printf("\n");
                 std::fflush(stdout);
                 while (int(generated.size()) < generate) {
-                    // The drafter attends over a fixed 264-position KV window
+                    // The drafter attends over its checkpoint's 2048-position window
                     // and the block adds kBlock keys on top of the anchor, so
                     // the last safe anchor leaves room for the whole block;
                     // past it, fall back to plain greedy steps.

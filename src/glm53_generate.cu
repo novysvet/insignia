@@ -2787,6 +2787,10 @@ public:
     bool dflash2_on() const { return dflash2_on_; }
 
     std::vector<std::pair<int, float>> step(int token, int position, int layer_limit, bool produce_logits);
+    // Initial prompt only: preserve the proven <=128-row kernels and their
+    // arithmetic order, but visit every chunk of a layer before advancing to
+    // the next layer so the complete 288-record expert layer stays hot.
+    void prefill_prompt_full_layer_major(const std::vector<int> &tokens);
     void prefill(const std::vector<int> &tokens, int position_base, bool capture = false);
     // MTP speculative decoding surface.
     int mtp_k() const { return mtp_draft_total_; }
@@ -2889,6 +2893,8 @@ private:
     void mla_multi(int layer, const float *input, float *output, int tokens, int position_base);
     void mlp_multi(std::string_view stem, const float *input, float *output, int tokens, int intermediate);
     void moe_multi(int layer, const float *input, float *output, int tokens);
+    void prefill_layer_chunk_exact(int layer, float *in_place, float *scratch,
+                                   int count, int position_base, float *dflash_capture);
     const float *device_f32(std::string_view name);
     const std::vector<float> &host_f32(std::string_view name);
     void archive_kda_rows(int layer, const float *src, int rows, int slot);
@@ -2930,6 +2936,7 @@ private:
     int seam_layer_ = 0;
     std::vector<float> seam_host_;
     bool prefetch_on_ = true, deep_checks_ = false, trace_layers_ = false;
+    bool full_layer_major_active_ = false;
     bool early_route_on_ = false, early_route_prefetch_ = false;
     int early_route_prefetch_n_ = 8;
     uint64_t early_route_hits_ = 0, early_route_total_ = 0;
@@ -4248,11 +4255,12 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     selection[size_t(row)][size_t(slot)].first;
         }
         expert_stager_->stage_layer(layer, distinct.data(), int(distinct.size()));
-        if (prefetch_on_ && size_t(layer) + 1 < prev_routing_.size() &&
+        if (!full_layer_major_active_ && prefetch_on_ &&
+            size_t(layer) + 1 < prev_routing_.size() &&
             is_sparse_[size_t(layer) + 1])
             expert_stager_->prefetch(int(layer) + 1, prev_routing_[size_t(layer) + 1].data(),
                                      moe_topk_);
-        if (prefetch_on_ && !cct_.empty())
+        if (!full_layer_major_active_ && prefetch_on_ && !cct_.empty())
             cct_prefetch(layer);
         // The shared expert is dense-resident FP8; running it first lets its
         // GEMVs hide under the routed records' disk reads (same ordering as
@@ -4315,7 +4323,14 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             const int batch_count = int(std::min<size_t>(8, distinct.size() - base_slot));
             bool populate = false;
             uint8_t populate_mask = 0;
-            if (verify_populate_) {
+            if (full_layer_major_active_) {
+                // All chunks of this layer execute consecutively and the
+                // complete layer has at most 288 records, far below the
+                // 2,425-slot production host tier. Admit the whole union so
+                // later chunks become RAM hits; arithmetic order is unchanged.
+                populate = true;
+                populate_mask = uint8_t((1u << batch_count) - 1u);
+            } else if (verify_populate_) {
                 // Explicit legacy A/B: admit the entire verify union.
                 populate = true;
                 populate_mask = uint8_t((1u << batch_count) - 1u);
@@ -4453,6 +4468,232 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     check(cudaGetLastError(), "MoE combine launch (prefill)");
 }
 
+void Runner::prefill_layer_chunk_exact(int layer, float *in_place, float *scratch,
+                                       int count, int position_base,
+                                       float *dflash_capture) {
+    require(count >= 1 && count <= kMaxChunk(), "prefill layer chunk out of range");
+    const auto begin = std::chrono::steady_clock::now();
+    const std::string base = layer_stem(layer);
+    float *streams = in_place;
+    float *next_streams = scratch;
+
+    mhc_multi(base + "hc_attn", streams, c_collapsed_, count);
+    rms(base + "input_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
+    if (early_multi_route_on_ && is_sparse_[size_t(layer)])
+        early_route_multi(layer, c_normalized_, count);
+    if (is_mla_[layer])
+        mla_multi(layer, c_normalized_, c_attn_, count, position_base);
+    else
+        kda_multi(layer, c_normalized_, c_attn_, count, position_base);
+    for (int token = 0; token < count; ++token)
+        check(insignia::glm53::mhc_mix(streams + size_t(token) * kStreams * hidden_,
+            c_attn_.get() + size_t(token) * hidden_, c_post_.get() + size_t(token) * 4,
+            c_comb_.get() + size_t(token) * 16,
+            next_streams + size_t(token) * kStreams * hidden_, hidden_),
+            "attention mHC mix (prefill)");
+    std::swap(streams, next_streams);
+
+    mhc_multi(base + "hc_ffn", streams, c_collapsed_, count);
+    rms(base + "post_attention_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
+    if (is_sparse_[layer])
+        moe_multi(layer, c_normalized_, c_ffn_, count);
+    else
+        mlp_multi(base + "mlp.", c_normalized_, c_ffn_, count, dense_intermediate_);
+    for (int token = 0; token < count; ++token)
+        check(insignia::glm53::mhc_mix(streams + size_t(token) * kStreams * hidden_,
+            c_ffn_.get() + size_t(token) * hidden_, c_post_.get() + size_t(token) * 4,
+            c_comb_.get() + size_t(token) * 16,
+            next_streams + size_t(token) * kStreams * hidden_, hidden_),
+            "FFN mHC mix (prefill)");
+    std::swap(streams, next_streams);
+    // Two mHC swaps deliberately return the result to the caller's in-place
+    // buffer. The full-prompt scheduler depends on this exact ownership rule.
+    require(streams == in_place, "prefill layer changed residual-buffer parity");
+
+    if (dflash_capture)
+        for (int token = 0; token < count; ++token)
+            average_streams_kernel<<<16, 256>>>(
+                streams + size_t(token) * kStreams * hidden_,
+                dflash_capture + size_t(token) * hidden_, hidden_);
+    if (deep_checks_) {
+        const int one = 1;
+        int valid = 0;
+        check(cudaMemcpy(finite_, &one, sizeof(one), cudaMemcpyHostToDevice),
+              "initialize finite flag");
+        finite_kernel<<<16, 256>>>(streams, count * kStreams * hidden_, finite_);
+        check(cudaMemcpy(&valid, finite_.get(), sizeof(valid), cudaMemcpyDeviceToHost),
+              "read finite flag");
+        require(valid, "non-finite residual stream after prefill layer " +
+                       std::to_string(layer));
+    }
+    if (trace_layers_) {
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::printf("prefill layer %02d %-3s %d tokens %.3f s\n", layer,
+                    is_mla_[layer] ? "MLA" : "KDA", count, seconds);
+        std::fflush(stdout);
+    }
+}
+
+void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
+    const int prompt_tokens = int(tokens.size());
+    require(prompt_tokens >= 1 && prompt_tokens < kMaxContext(),
+            "full-layer-major prompt out of range");
+    require(!full_layer_major_active_, "nested full-layer-major prefill");
+
+    const char *store_arg = std::getenv("INSIGNIA_GLM53_PREFILL_STORE");
+    const std::string store = store_arg ? store_arg : "host";
+    require(store == "host" || store == "vram",
+            "INSIGNIA_GLM53_PREFILL_STORE must be host or vram");
+    const bool vram_store = store == "vram";
+    const size_t stream_stride = size_t(kStreams) * hidden_;
+    const size_t prompt_floats = size_t(prompt_tokens) * stream_stride;
+    const int df_tokens = df_ ? std::min(
+        prompt_tokens, insignia::glm53::DFlash2Drafter::kMaxCtx) : 0;
+    const size_t capture_floats = size_t(5) * df_tokens * hidden_;
+
+    // Every persistent allocation happens before embedding or recurrent-state
+    // mutation. A failed explicit mode therefore leaves the Runner untouched.
+    DeviceBuffer<float> prompt_device(vram_store ? prompt_floats : 0);
+    DeviceBuffer<float> capture_device(vram_store ? capture_floats : 0);
+    std::vector<float> prompt_host(vram_store ? 0 : prompt_floats);
+    std::vector<float> capture_host(vram_store ? 0 : capture_floats);
+
+    const TensorLocation &embedding = model_.tensor("model.language_model.embed_tokens.weight");
+    require(embedding.type == TensorType::bf16 && embedding.shape.size() == 2 &&
+            embedding.shape[1] == uint32_t(hidden_), "wrong embedding geometry");
+    for (int token : tokens)
+        require(token >= 0 && token < int(model_.vocab_size()),
+                "prefill token is outside the vocabulary");
+
+    struct ActiveScope {
+        bool &active;
+        explicit ActiveScope(bool &flag) : active(flag) { active = true; }
+        ~ActiveScope() { active = false; }
+    } active_scope(full_layer_major_active_);
+
+    const uint64_t records_before = expert_stager_ ? expert_stager_->records_read() : 0;
+    const uint64_t io_before = expert_stager_ ? expert_stager_->io_bytes() : 0;
+    const uint64_t h2d_records_before = expert_stager_ ?
+        expert_stager_->packed_h2d_records() : 0;
+    uint64_t prompt_h2d = 0, prompt_d2h = 0;
+    const auto all_begin = std::chrono::steady_clock::now();
+    const int layers = int(model_.layers());
+
+    for (int layer = 0; layer < layers; ++layer) {
+        const auto layer_begin = std::chrono::steady_clock::now();
+        for (int pos0 = 0; pos0 < prompt_tokens; pos0 += kMaxChunk()) {
+            const int count = std::min(kMaxChunk(), prompt_tokens - pos0);
+            if (early_multi_route_on_) ++early_multi_batch_;
+            float *in_place = vram_store ?
+                prompt_device.get() + size_t(pos0) * stream_stride : c_stream_a_.get();
+            if (layer == 0) {
+                for (int row = 0; row < count; ++row) {
+                    uint16_t *device_row = reinterpret_cast<uint16_t *>(stager_.load(
+                        embedding, uint64_t(tokens[size_t(pos0 + row)]) * hidden_ * 2,
+                        hidden_ * 2));
+                    embed_repeat_kernel<<<16, 256>>>(
+                        device_row, in_place + size_t(row) * stream_stride, hidden_);
+                }
+                check(cudaGetLastError(), "embedding repeat launch (full layer-major)");
+            } else if (!vram_store) {
+                const size_t bytes = size_t(count) * stream_stride * sizeof(float);
+                check(cudaMemcpy(in_place,
+                                 prompt_host.data() + size_t(pos0) * stream_stride,
+                                 bytes, cudaMemcpyHostToDevice),
+                      "restore prompt streams");
+                prompt_h2d += bytes;
+            }
+
+            int capture_idx = -1;
+            if (df_ && pos0 < df_tokens)
+                for (int ci = 0; ci < 5; ++ci)
+                    if (kDfCaptureLayers[ci] == layer) capture_idx = ci;
+            prefill_layer_chunk_exact(layer, in_place, c_stream_b_.get(), count, pos0,
+                                      capture_idx >= 0 ? c_collapsed_.get() : nullptr);
+
+            if (capture_idx >= 0) {
+                const int valid = std::min(count, df_tokens - pos0);
+                const size_t bytes = size_t(valid) * hidden_ * sizeof(float);
+                const size_t offset =
+                    (size_t(capture_idx) * df_tokens + size_t(pos0)) * hidden_;
+                if (vram_store) {
+                    check(cudaMemcpy(capture_device.get() + offset, c_collapsed_.get(), bytes,
+                                     cudaMemcpyDeviceToDevice),
+                          "retain full-layer-major DFlash capture");
+                } else {
+                    check(cudaMemcpy(capture_host.data() + offset, c_collapsed_.get(), bytes,
+                                     cudaMemcpyDeviceToHost),
+                          "spill full-layer-major DFlash capture");
+                    prompt_d2h += bytes;
+                }
+            }
+
+            if (!vram_store && layer + 1 < layers) {
+                const size_t bytes = size_t(count) * stream_stride * sizeof(float);
+                check(cudaMemcpy(prompt_host.data() + size_t(pos0) * stream_stride,
+                                 in_place, bytes, cudaMemcpyDeviceToHost),
+                      "spill prompt streams");
+                prompt_d2h += bytes;
+            }
+            if (!deep_checks_ && layer + 1 == layers) {
+                const int one = 1;
+                int valid = 0;
+                check(cudaMemcpy(finite_, &one, sizeof(one), cudaMemcpyHostToDevice),
+                      "initialize finite flag");
+                finite_kernel<<<16, 256>>>(in_place, count * kStreams * hidden_, finite_);
+                check(cudaMemcpy(&valid, finite_.get(), sizeof(valid), cudaMemcpyDeviceToHost),
+                      "read finite flag");
+                require(valid, "non-finite residual stream after full-layer-major prefill");
+            }
+        }
+        if (trace_layers_) {
+            std::printf("prefill full-lm layer %02d/%02d %.3f s\n", layer + 1, layers,
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - layer_begin).count());
+            std::fflush(stdout);
+        }
+    }
+
+    // DFlash target captures are independent of target prefill state. Replay
+    // the exact five planes through the original <=128-row commit surface in
+    // the original ascending chunk order after the target stack is complete.
+    if (df_)
+        for (int pos0 = 0; pos0 < df_tokens; pos0 += kMaxChunk()) {
+            const int count = std::min(kMaxChunk(), df_tokens - pos0);
+            const size_t bytes = size_t(count) * hidden_ * sizeof(float);
+            for (int ci = 0; ci < 5; ++ci) {
+                const size_t offset = (size_t(ci) * df_tokens + size_t(pos0)) * hidden_;
+                if (vram_store) {
+                    check(cudaMemcpy(df_->capture_row(ci, 0), capture_device.get() + offset,
+                                     bytes, cudaMemcpyDeviceToDevice),
+                          "replay full-layer-major DFlash capture");
+                } else {
+                    check(cudaMemcpy(df_->capture_row(ci, 0), capture_host.data() + offset,
+                                     bytes, cudaMemcpyHostToDevice),
+                          "restore full-layer-major DFlash capture");
+                    prompt_h2d += bytes;
+                }
+            }
+            df_->commit(count, pos0);
+        }
+
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - all_begin).count();
+    const uint64_t records_after = expert_stager_ ? expert_stager_->records_read() : 0;
+    const uint64_t io_after = expert_stager_ ? expert_stager_->io_bytes() : 0;
+    const uint64_t h2d_records_after = expert_stager_ ?
+        expert_stager_->packed_h2d_records() : 0;
+    std::printf("prefill_full_lm store=%s tokens=%d prompt_h2d=%llu prompt_d2h=%llu "
+                "records_read=%llu io_bytes=%llu expert_h2d_records=%llu wall=%.3f s\n",
+                store.c_str(), prompt_tokens,
+                (unsigned long long)prompt_h2d, (unsigned long long)prompt_d2h,
+                (unsigned long long)(records_after - records_before),
+                (unsigned long long)(io_after - io_before),
+                (unsigned long long)(h2d_records_after - h2d_records_before), seconds);
+    std::fflush(stdout);
+}
+
 void Runner::prefill(const std::vector<int> &tokens, int position_base, bool capture) {
     const int count = int(tokens.size());
     require(count >= 1 && count <= kMaxChunk(), "prefill chunk out of range");
@@ -4496,57 +4737,13 @@ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool cap
     float *next_streams = c_stream_b_;
     const int layers = int(model_.layers());
     for (int layer = 0; layer < layers; ++layer) {
-        const auto begin = std::chrono::steady_clock::now();
-        const std::string base = layer_stem(layer);
-        mhc_multi(base + "hc_attn", streams, c_collapsed_, count);
-        rms(base + "input_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
-        if (early_multi_route_on_ && is_sparse_[size_t(layer)])
-            early_route_multi(layer, c_normalized_, count);
-        if (is_mla_[layer])
-            mla_multi(layer, c_normalized_, c_attn_, count, position_base);
-        else
-            kda_multi(layer, c_normalized_, c_attn_, count, position_base);
-        for (int token = 0; token < count; ++token)
-            check(insignia::glm53::mhc_mix(streams + size_t(token) * kStreams * hidden_,
-                c_attn_.get() + size_t(token) * hidden_, c_post_.get() + size_t(token) * 4,
-                c_comb_.get() + size_t(token) * 16,
-                next_streams + size_t(token) * kStreams * hidden_, hidden_), "attention mHC mix (prefill)");
-        std::swap(streams, next_streams);
-
-        mhc_multi(base + "hc_ffn", streams, c_collapsed_, count);
-        rms(base + "post_attention_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
-        if (is_sparse_[layer])
-            moe_multi(layer, c_normalized_, c_ffn_, count);
-        else
-            mlp_multi(base + "mlp.", c_normalized_, c_ffn_, count, dense_intermediate_);
-        for (int token = 0; token < count; ++token)
-            check(insignia::glm53::mhc_mix(streams + size_t(token) * kStreams * hidden_,
-                c_ffn_.get() + size_t(token) * hidden_, c_post_.get() + size_t(token) * 4,
-                c_comb_.get() + size_t(token) * 16,
-                next_streams + size_t(token) * kStreams * hidden_, hidden_), "FFN mHC mix (prefill)");
-        std::swap(streams, next_streams);
-        if (df_) {
+        float *dflash_capture = nullptr;
+        if (df_)
             for (int ci = 0; ci < 5; ++ci)
                 if (kDfCaptureLayers[ci] == layer)
-                    for (int token = 0; token < count; ++token)
-                        average_streams_kernel<<<16, 256>>>(
-                            streams + size_t(token) * kStreams * hidden_,
-                            df_->capture_row(ci, capture_offset_ + token), hidden_);
-        }
-        if (deep_checks_) {
-            const int one = 1;
-            int valid = 0;
-            check(cudaMemcpy(finite_, &one, sizeof(one), cudaMemcpyHostToDevice), "initialize finite flag");
-            finite_kernel<<<16, 256>>>(streams, count * kStreams * hidden_, finite_);
-            check(cudaMemcpy(&valid, finite_.get(), sizeof(valid), cudaMemcpyDeviceToHost), "read finite flag");
-            require(valid, "non-finite residual stream after prefill layer " + std::to_string(layer));
-        }
-        if (trace_layers_) {
-            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-            std::printf("prefill layer %02d %-3s %d tokens %.3f s\n", layer,
-                        is_mla_[layer] ? "MLA" : "KDA", count, seconds);
-            std::fflush(stdout);
-        }
+                    dflash_capture = df_->capture_row(ci, capture_offset_);
+        prefill_layer_chunk_exact(layer, streams, next_streams, count, position_base,
+                                  dflash_capture);
     }
     if (!deep_checks_) {
         const int one = 1;
@@ -4898,13 +5095,20 @@ int main(int argc, char **argv) {
         // logits.
         if (tokens.size() > 1) {
             const size_t prefill_count = tokens.size() - 1;
-            for (size_t consumed = 0; consumed < prefill_count; ) {
-                const size_t take = std::min<size_t>(Runner::kMaxChunk(), prefill_count - consumed);
-                std::vector<int> chunk(tokens.begin() + int(consumed), tokens.begin() + int(consumed + take));
-                runner.prefill(chunk, int(consumed));
-                consumed += take;
-                std::printf("prompt %zu/%zu tokens prefilled\n", consumed, tokens.size());
-                std::fflush(stdout);
+            const char *full_lm = std::getenv("INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR");
+            if (full_lm && std::atoi(full_lm)) {
+                std::vector<int> prompt(tokens.begin(), tokens.end() - 1);
+                runner.prefill_prompt_full_layer_major(prompt);
+            } else {
+                for (size_t consumed = 0; consumed < prefill_count; ) {
+                    const size_t take = std::min<size_t>(Runner::kMaxChunk(), prefill_count - consumed);
+                    std::vector<int> chunk(tokens.begin() + int(consumed),
+                                           tokens.begin() + int(consumed + take));
+                    runner.prefill(chunk, int(consumed));
+                    consumed += take;
+                    std::printf("prompt %zu/%zu tokens prefilled\n", consumed, tokens.size());
+                    std::fflush(stdout);
+                }
             }
         }
         top = runner.step(tokens.back(), int(tokens.size()) - 1, layers, true);

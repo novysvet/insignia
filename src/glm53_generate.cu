@@ -1881,6 +1881,8 @@ public:
                                     insignia::glm53::DFlash2Drafter::kRank * sizeof(float),
                                 cudaHostAllocDefault),
                   "pin DFlash2 hp buffer");
+            require(kMaxChunk() <= insignia::glm53::DFlash2Drafter::kMaxTokens,
+                    "prefill chunk exceeds the DFlash2 capture batch");
         }
         // Dense layer -> KDA archive row (recurrent-state replay indexing).
         kda_row_.assign(size_t(layer_count) + 1, -1);
@@ -2011,32 +2013,32 @@ public:
             w_uv_.reset(absorb_per_layer_ * mla_layers_);
             extract_mla_absorb();
         }
-        c_stream_a_.reset(size_t(kMaxChunk) * kStreams * hidden_);
+        c_stream_a_.reset(size_t(kMaxChunk()) * kStreams * hidden_);
         c_stream_b_.reset(c_stream_a_.size());
-        c_collapsed_.reset(size_t(kMaxChunk) * hidden_);
-        c_normalized_.reset(size_t(kMaxChunk) * hidden_);
-        c_attn_.reset(size_t(kMaxChunk) * hidden_);
-        c_ffn_.reset(size_t(kMaxChunk) * hidden_);
-        c_routed_.reset(size_t(kMaxChunk) * hidden_);
+        c_collapsed_.reset(size_t(kMaxChunk()) * hidden_);
+        c_normalized_.reset(size_t(kMaxChunk()) * hidden_);
+        c_attn_.reset(size_t(kMaxChunk()) * hidden_);
+        c_ffn_.reset(size_t(kMaxChunk()) * hidden_);
+        c_routed_.reset(size_t(kMaxChunk()) * hidden_);
         c_expert_out_.reset(size_t(kMaxVerify) * moe_topk_ * hidden_);
-        c_q_.reset(size_t(kMaxChunk) * kda_width_);
-        c_k_.reset(size_t(kMaxChunk) * kda_width_);
-        c_v_.reset(size_t(kMaxChunk) * kda_width_);
-        c_gate_.reset(size_t(kMaxChunk) * kda_width_);
-        c_core_.reset(size_t(kMaxChunk) * kda_width_);
-        c_proj_.reset(size_t(kMaxChunk) * kda_width_);
-        c_small_.reset(size_t(kMaxChunk) * std::max({f_a_rows_, q_a_rows_, kv_a_rows_}));
-        c_kv_.reset(size_t(kMaxChunk) * kv_b_rows_);
-        c_mlaq_.reset(size_t(kMaxChunk) * q_b_rows_);
-        c_mlao_.reset(size_t(kMaxChunk) * q_b_rows_);
-        c_gateu_.reset(size_t(kMaxChunk) * std::max({dense_intermediate_, moe_intermediate_,
+        c_q_.reset(size_t(kMaxChunk()) * kda_width_);
+        c_k_.reset(size_t(kMaxChunk()) * kda_width_);
+        c_v_.reset(size_t(kMaxChunk()) * kda_width_);
+        c_gate_.reset(size_t(kMaxChunk()) * kda_width_);
+        c_core_.reset(size_t(kMaxChunk()) * kda_width_);
+        c_proj_.reset(size_t(kMaxChunk()) * kda_width_);
+        c_small_.reset(size_t(kMaxChunk()) * std::max({f_a_rows_, q_a_rows_, kv_a_rows_}));
+        c_kv_.reset(size_t(kMaxChunk()) * kv_b_rows_);
+        c_mlaq_.reset(size_t(kMaxChunk()) * q_b_rows_);
+        c_mlao_.reset(size_t(kMaxChunk()) * q_b_rows_);
+        c_gateu_.reset(size_t(kMaxChunk()) * std::max({dense_intermediate_, moe_intermediate_,
                                                     shared_intermediate_}));
         c_up_.reset(c_gateu_.size());
         c_act_.reset(c_gateu_.size());
-        c_router_.reset(size_t(kMaxChunk) * moe_experts_);
-        c_post_.reset(size_t(kMaxChunk) * 4);
-        c_comb_.reset(size_t(kMaxChunk) * 16);
-        c_beta_.reset(size_t(kMaxChunk) * kda_heads_);
+        c_router_.reset(size_t(kMaxChunk()) * moe_experts_);
+        c_post_.reset(size_t(kMaxChunk()) * 4);
+        c_comb_.reset(size_t(kMaxChunk()) * 16);
+        c_beta_.reset(size_t(kMaxChunk()) * kda_heads_);
         if (nvfp4_experts_) {
             nv_workspace_4096_.reset(insignia::glm53::nvfp4_workspace_rows_bytes(hidden_, kMaxVerify));
             nv_workspace_2048_.reset(
@@ -2044,7 +2046,7 @@ public:
         }
         if (q8_index_)
             q8_workspace_.reset(q8_index_->format() == Cache8Format::fp8_e4m3 ?
-                insignia::glm53::fp8_batch_workspace_bytes(16384, kMaxChunk) :
+                insignia::glm53::fp8_batch_workspace_bytes(16384, kMaxChunk()) :
                 insignia::glm53::q8_workspace_bytes(16384));
         last_avg_.reset(hidden_);
         last_normed_.reset(hidden_);
@@ -2094,7 +2096,14 @@ public:
     }
 
     int layer_count() const { return int(model_.layers()); }
-    static constexpr int kMaxChunk = 64;
+    static constexpr int kMaxChunkCap = 128;
+    static int kMaxChunk() {
+        static const int chunk = [] {
+            const char *value = std::getenv("INSIGNIA_GLM53_PREFILL_CHUNK");
+            return std::clamp(value ? std::atoi(value) : 64, 8, kMaxChunkCap);
+        }();
+        return chunk;
+    }
     // Verify passes are hard-capped by the drafter (DFlash2 kDrafts=7, MTP
     // clamp 8); sizing their scratch by kMaxChunk would burn ~240 MiB per
     // chunk-size doubling for nothing.
@@ -2389,7 +2398,7 @@ void Runner::linear_pair(std::string_view name_a, std::string_view name_b,
 // prompt chunk costs one streaming pass per matrix instead of one per token.
 void Runner::linear_multi(std::string_view name, const float *inputs, float *outputs,
                           int tokens, int rows, int cols) {
-    require(tokens >= 1 && tokens <= kMaxChunk, "prefill chunk out of range");
+    require(tokens >= 1 && tokens <= kMaxChunk(), "prefill chunk out of range");
     const TensorLocation &weight = model_.tensor(name);
     require(weight.type == TensorType::bf16 && weight.shape.size() == 2 &&
             weight.shape[0] == uint32_t(rows) && weight.shape[1] == uint32_t(cols),
@@ -3634,8 +3643,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 // group of up to 8 rows in one weight pass. The batched
                 // kernels preserve every per-row accumulation chain, so the
                 // routed-sum rounding is untouched.
-                std::array<int, kMaxChunk> users{}, out_ids{};
-                std::array<float, kMaxChunk> combine{};
+                std::array<int, kMaxChunkCap> users{}, out_ids{};
+                std::array<float, kMaxChunkCap> combine{};
                 int total = 0;
                 for (int token = 0; token < tokens; ++token)
                     for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
@@ -3697,7 +3706,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
 
 void Runner::prefill(const std::vector<int> &tokens, int position_base, bool capture) {
     const int count = int(tokens.size());
-    require(count >= 1 && count <= kMaxChunk, "prefill chunk out of range");
+    require(count >= 1 && count <= kMaxChunk(), "prefill chunk out of range");
     if (early_multi_route_on_) ++early_multi_batch_;
     if (capture) {
         require(mtp_draft_total_, "verify capture requested with MTP disabled");
@@ -4123,7 +4132,7 @@ int main(int argc, char **argv) {
         if (tokens.size() > 1) {
             const size_t prefill_count = tokens.size() - 1;
             for (size_t consumed = 0; consumed < prefill_count; ) {
-                const size_t take = std::min<size_t>(Runner::kMaxChunk, prefill_count - consumed);
+                const size_t take = std::min<size_t>(Runner::kMaxChunk(), prefill_count - consumed);
                 std::vector<int> chunk(tokens.begin() + int(consumed), tokens.begin() + int(consumed + take));
                 runner.prefill(chunk, int(consumed));
                 consumed += take;

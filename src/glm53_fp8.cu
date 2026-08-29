@@ -516,7 +516,7 @@ cudaError_t fp8_tc_gemv_batch(
     int output_stride,
     void *workspace,
     cudaStream_t stream) {
-    if (!weights || !scales || !x || !y || !workspace || tokens <= 0 || tokens > 64 ||
+    if (!weights || !scales || !x || !y || !workspace || tokens <= 0 || tokens > 128 ||
         rows <= 0 || cols <= 0 || output_stride < rows ||
         (cols & (kFp8GroupSize - 1)) || cols / kFp8GroupSize > 256)
         return cudaErrorInvalidValue;
@@ -566,7 +566,7 @@ cudaError_t fp8_tc_gemv2_batch(
     void *workspace,
     cudaStream_t stream) {
     if (!weights_a || !scales_a || !weights_b || !scales_b || !x || !y_a || !y_b ||
-        !workspace || tokens <= 0 || tokens > 64 || rows <= 0 || cols <= 0 ||
+        !workspace || tokens <= 0 || tokens > 128 || rows <= 0 || cols <= 0 ||
         output_stride < rows || (cols & (kFp8GroupSize - 1)) ||
         cols / kFp8GroupSize > 256)
         return cudaErrorInvalidValue;

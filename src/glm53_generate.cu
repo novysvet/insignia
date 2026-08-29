@@ -615,6 +615,7 @@ public:
         // the admission-stamp ordering the scanner selected, so eviction
         // choice is unchanged outside stamp-0 (never-admitted) ties.
         tier_o1_ = std::getenv("INSIGNIA_GLM53_TIER_O1") != nullptr;
+        tier_slru_ = std::getenv("INSIGNIA_GLM53_TIER_SLRU") != nullptr;
         lru_prev_.assign(size_t(window_count_), -1);
         lru_next_.assign(size_t(window_count_), -1);
         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS")) {
@@ -654,6 +655,29 @@ public:
     ExpertStager(const ExpertStager &) = delete;
     ExpertStager &operator=(const ExpertStager &) = delete;
 
+    // Verify-round epoch for acceptance-prefix demotion (Runner calls this at
+    // the head of every verify round; demote_round rejects foreign epochs).
+    void set_epoch(uint32_t epoch) { round_epoch_ = epoch; }
+    static uint32_t route_key_public(int layer, int expert) { return route_key(layer, expert); }
+    // Acceptance-prefix demote (insert-then-demote): keys staged at `epoch`
+    // whose rows were all rejected are pushed to the cold end of
+    // probationary so the protected half survives verify bursts (P7 fix).
+    uint64_t demote_round(const std::unordered_set<uint32_t> &rejected_keys, uint32_t epoch) {
+        if (!tier_slru_) return 0;
+        uint64_t moved = 0;
+        for (const uint32_t key : rejected_keys) {
+            const auto found = flight_index_.find(key);
+            if (found == flight_index_.end()) continue;
+            WindowState &state = windows_[size_t(found->second)];
+            if (!state.done || state.claimed || state.releasing || state.pinned) continue;
+            if (state.round_epoch != epoch) continue;  // not this round's residue
+            slru_demote_cold(found->second);
+            ++moved;
+        }
+        demoted_cold_ += moved;
+        return moved;
+    }
+    uint64_t demoted_cold() const { return demoted_cold_; }
     // Speculative read-ahead keyed on the previous token's routing. Cheap to
     // call: resident or in-flight experts are skipped, and 8 windows stay
     // unreserved so a demand batch always finds free slots immediately.
@@ -729,7 +753,7 @@ public:
         for (int window : staged)
             if (windows_[size_t(window)].error) {
                 windows_[size_t(window)].pinned = false;
-                lru_push_back(window);
+                seg_push_back(window, 1);
             }
         if (pinned_count)
             std::printf("pin list: %d hot records pinned in host tier (%zu VRAM keys)\n",
@@ -777,6 +801,7 @@ public:
             if (resident != flight_index_.end()) {
                 WindowState &state = windows_[size_t(resident->second)];
                 state.claimed = true;
+                state.round_epoch = round_epoch_;
                 batch_window_[slot] = resident->second;
                 if (window_done(resident->second)) {
                     // Host-tier hit: the record is already pinned in RAM and
@@ -785,6 +810,7 @@ public:
                     ++state.hits;
                     ++hits;
                     if (!state.demand) ++prefetch_useful_;
+                    if (tier_slru_) slru_hit(resident->second);
                 } else {
                     // A prefetch for exactly this (layer, expert) is in
                     // flight; promote it instead of reading bytes twice.
@@ -861,6 +887,7 @@ public:
             const auto resident = flight_index_.find(key);
             if (resident != flight_index_.end()) {
                 windows_[size_t(resident->second)].claimed = true;
+                windows_[size_t(resident->second)].round_epoch = round_epoch_;
                 if (!window_done(resident->second)) promote_read(resident->second);
                 continue;
             }
@@ -989,7 +1016,7 @@ public:
                 model_.evict_span_cache(uint16_t(state.l2_shard), state.l2_offset, state.l2_bytes);
             state.claimed = false;
             state.stamp = ++stamp_;
-            lru_move_front(window);
+            seg_move_front(window, 1);
         } else {
             // Passed through: drop it from the resident index immediately so
             // later lookups re-read, and free the window once the async copy
@@ -1052,6 +1079,8 @@ private:
         int layer = -1, expert = -1;
         bool demand = false, done = true, claimed = false, copy_issued = false;
         bool releasing = false, pinned = false;
+        uint8_t segment = 0;    // 0=unlisted, 1=probationary, 2=protected
+        uint32_t round_epoch = 0;
         uint64_t stamp = 0;
         uint64_t source_bytes = 0;
         unsigned hits = 0;
@@ -1651,8 +1680,9 @@ private:
         state.layout = Layout{};
         state.globals = {};
         state.l2_shard = -1;
+        state.round_epoch = round_epoch_;
         flight_index_.emplace(key, window);
-        lru_push_back(window);
+        seg_push_back(window, 1);
         if (demand) ++records_read_;
         submit_window(window, demand);
     }
@@ -1697,33 +1727,84 @@ private:
         for (const auto &stamp : batch_read_ends_) latest = std::max(latest, stamp);
         io_seconds_ += std::chrono::duration<double>(latest - batch_read_begin_).count();
     }
-    // Intrusive LRU over evictable windows: start_read pushes at the back
-    // (oldest candidates), admission moves to the front, eviction/pass-through
-    // unlink. Pinned windows leave the list entirely so the tail walk never
-    // crosses a pin prefix. Order mirrors the old min-stamp scan.
+    // Intrusive (segmented) LRU over evictable windows. Two segments share
+    // the link arrays; WindowState::segment records membership:
+    //   1 = probationary: new reads (never-admitted) arrive at the back
+    //       (oldest candidates), admission moves to the front.
+    //   2 = protected:    probationary hits promote here (soft cap 50%);
+    //       protected hits move to the front; overflow demotes the tail
+    //       back to probationary-front.
+    // Eviction/pass-through unlinks; pinned windows leave the lists entirely
+    // so the tail walk never crosses a pin prefix. With INSIGNIA_GLM53_TIER_O1
+    // only (no SLRU), the protected segment stays empty and the probationary
+    // order mirrors the old min-stamp scan exactly.
+    int &seg_head(int segment) { return segment == 2 ? pt_head_ : pb_head_; }
+    int &seg_tail(int segment) { return segment == 2 ? pt_tail_ : pb_tail_; }
     void lru_unlink(int window) {
+        WindowState &state = windows_[size_t(window)];
+        const int segment = state.segment;
+        if (segment == 0) return;
         const int p = lru_prev_[size_t(window)], n = lru_next_[size_t(window)];
         if (p >= 0) lru_next_[size_t(p)] = n;
-        else if (lru_head_ == window) lru_head_ = n;
+        else if (seg_head(segment) == window) seg_head(segment) = n;
         if (n >= 0) lru_prev_[size_t(n)] = p;
-        else if (lru_tail_ == window) lru_tail_ = p;
+        else if (seg_tail(segment) == window) seg_tail(segment) = p;
         lru_prev_[size_t(window)] = lru_next_[size_t(window)] = -1;
+        state.segment = 0;
+        if (segment == 2) --protected_count_;
     }
-    void lru_push_back(int window) {
-        lru_prev_[size_t(window)] = lru_tail_;
+    void seg_push_back(int window, int segment) {
+        WindowState &state = windows_[size_t(window)];
+        lru_prev_[size_t(window)] = seg_tail(segment);
         lru_next_[size_t(window)] = -1;
-        if (lru_tail_ >= 0) lru_next_[size_t(lru_tail_)] = window;
-        else lru_head_ = window;
-        lru_tail_ = window;
+        if (seg_tail(segment) >= 0) lru_next_[size_t(seg_tail(segment))] = window;
+        else seg_head(segment) = window;
+        seg_tail(segment) = window;
+        state.segment = uint8_t(segment);
+        if (segment == 2) ++protected_count_;
     }
-    void lru_move_front(int window) {
-        if (lru_head_ == window) return;
+    void seg_move_front(int window, int segment) {
+        if (seg_head(segment) == window) return;
         lru_unlink(window);
+        WindowState &state = windows_[size_t(window)];
         lru_prev_[size_t(window)] = -1;
-        lru_next_[size_t(window)] = lru_head_;
-        if (lru_head_ >= 0) lru_prev_[size_t(lru_head_)] = window;
-        else lru_tail_ = window;
-        lru_head_ = window;
+        lru_next_[size_t(window)] = seg_head(segment);
+        if (seg_head(segment) >= 0) lru_prev_[size_t(seg_head(segment))] = window;
+        else seg_tail(segment) = window;
+        seg_head(segment) = window;
+        state.segment = uint8_t(segment);
+        if (segment == 2) ++protected_count_;
+    }
+    // SLRU soft cap: demote the protected tail to the probationary front
+    // until the protected segment holds at most half the tier.
+    void slru_enqueue_capacity() {
+        while (protected_count_ > window_count_ / 2) {
+            const int window = pt_tail_;
+            require(window >= 0, "protected expert segment lost its tail");
+            lru_unlink(window);
+            seg_move_front(window, 1);
+        }
+    }
+    // Host-tier hit: probationary members promote to the protected front;
+    // protected members refresh to their front.
+    void slru_hit(int window) {
+        WindowState &state = windows_[size_t(window)];
+        if (state.segment == 2) {
+            seg_move_front(window, 2);
+            return;
+        }
+        if (state.segment == 1) {
+            lru_unlink(window);
+            seg_move_front(window, 2);
+            slru_enqueue_capacity();
+        }
+    }
+    // Acceptance-prefix demote (insert-then-demote): a record staged for the
+    // verify union that only served rejected rows gets pushed to the cold
+    // (tail) end of probationary instead of riding the protected segment.
+    void slru_demote_cold(int window) {
+        lru_unlink(window);         // leaves whichever segment it rode
+        seg_push_back(window, 1);   // re-enter at the cold end of probationary
     }
     // Returns windows whose async H2D finished to the free list.
     void reap_released() {
@@ -1749,21 +1830,34 @@ private:
             free_windows_.pop_back();
             return window;
         }
-        if (tier_o1_) {
-            // O(1) victim: first eligible window from the LRU tail (ioaudit:
-            // the 2425-wide scans cost 10-12 ms per verify round; the list
-            // order mirrors the admission-stamp recency the scan below used).
-            for (int walk = lru_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
+        if (tier_o1_ || tier_slru_) {
+            // O(1) victim: first eligible window from the probationary tail,
+            // then the protected tail (SLRU). The probationary order mirrors
+            // the admission-stamp recency the legacy scan below used; the
+            // protected fallback only exists when SLRU promoted records.
+            const auto evict = [&](int walk) {
                 WindowState &state = windows_[size_t(walk)];
-                if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
-                    state.pinned)
-                    continue;
                 if (state.copy_issued) {
                     check(cudaEventSynchronize(state.copy_done), "drain evicted expert copy");
                     state.copy_issued = false;
                 }
                 if (!state.demand) ++prefetch_wasted_;
                 release_window(walk);
+            };
+            for (int walk = pb_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
+                const WindowState &state = windows_[size_t(walk)];
+                if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
+                    state.pinned)
+                    continue;
+                evict(walk);
+                return take_window();
+            }
+            for (int walk = pt_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
+                const WindowState &state = windows_[size_t(walk)];
+                if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
+                    state.pinned)
+                    continue;
+                evict(walk);
                 return take_window();
             }
         }
@@ -2052,10 +2146,16 @@ private:
     bool f3_device_consult_ = false;
     std::array<bool, 8> batch_device_{};
     uint64_t f3_rescued_ = 0;
-    // O(1) intrusive LRU state (INSIGNIA_GLM53_TIER_O1).
+    // O(1) intrusive LRU state (INSIGNIA_GLM53_TIER_O1) plus the segmented
+    // variant (INSIGNIA_GLM53_TIER_SLRU): probationary + protected lists,
+    // hit-promotion, soft 50% protected cap, verify-rejection demotions.
     bool tier_o1_ = false;
+    bool tier_slru_ = false;
     std::vector<int> lru_prev_, lru_next_;
-    int lru_head_ = -1, lru_tail_ = -1;
+    int pb_head_ = -1, pb_tail_ = -1, pt_head_ = -1, pt_tail_ = -1;
+    int protected_count_ = 0;
+    uint64_t demoted_cold_ = 0;
+    uint32_t round_epoch_ = 0;
 };
 
 class Q8Stager {
@@ -2415,6 +2515,7 @@ public:
         prev_routing_.assign(size_t(layer_count),
                              {-1, -1, -1, -1, -1, -1, -1, -1});
         row_routing_.assign(size_t(layer_count), {});
+        row_vein_.assign(size_t(layer_count), {});
         early_routing_.assign(size_t(layer_count),
                               {-1, -1, -1, -1, -1, -1, -1, -1});
         if (const char *prefetch = std::getenv("INSIGNIA_GLM53_PREFETCH"))
@@ -2665,6 +2766,39 @@ public:
                 prev_routing_[layer][size_t(slot)] =
                     row_routing_[layer][size_t(row * moe_topk_ + slot)];
     }
+    // Marks the start of a verify round: the stager round-epoch advances so
+    // acceptance-prefix demotion can tell this round's residue from residue
+    // that earned earlier-term residency (INSIGNIA_GLM53_TIER_SLRU).
+    void begin_verify_epoch() {
+        if (expert_stager_) expert_stager_->set_epoch(++verify_epoch_);
+    }
+    // Acceptance-prefix demote after a verified round: experts whose verify
+    // rows were entirely in the rejected tail (and never in an accepted row
+    // this round) get pushed to the cold end of the host tier's probationary
+    // segment, turning verify-burst insert pressure into early eviction
+    // candidates instead of protected-segment residents (P7 fix).
+    void demote_rejected_routing(int matched, int drafted) {
+        if (!expert_stager_ || matched >= drafted) return;
+        std::unordered_set<uint32_t> accepted, rejected;
+        for (size_t layer = 0; layer < row_routing_.size(); ++layer) {
+            if (row_routing_[layer].empty() || !is_sparse_[layer]) continue;
+            for (int row = 0; row < drafted && row < 8; ++row) {
+                // Vein guard: rows not routed by THIS round's verify chunks
+                // (stale leftovers, seq-verify's never-forwarded tail) are
+                // out of scope entirely.
+                if (row_vein_[layer][size_t(row)] != verify_epoch_) continue;
+                for (int slot = 0; slot < moe_topk_; ++slot) {
+                    const int expert = row_routing_[layer][size_t(row * moe_topk_ + slot)];
+                    if (expert < 0) continue;
+                    const uint32_t key =
+                        ExpertStager::route_key_public(int(layer), expert);
+                    (row < matched ? accepted : rejected).insert(key);
+                }
+            }
+        }
+        for (const uint32_t key : accepted) rejected.erase(key);
+        slru_demoted_total_ += expert_stager_->demote_round(rejected, verify_epoch_);
+    }
     // Verifies candidate tokens at position_base+1.. against the target and
     // returns (accepted_count, argmax rows) — see the caller in main().
     int verify_token(int token, int position);
@@ -2718,6 +2852,12 @@ private:
     std::unique_ptr<ExpertStager> expert_stager_;
     std::vector<std::array<int, 8>> prev_routing_;
     std::vector<std::array<int, 64>> row_routing_;  // [layer][row*8+slot], last multi-row chunk
+    // Per-row freshness vein for acceptance-prefix demotion: moe_multi stamps
+    // rows it routed with the current verify epoch; demote only trusts rows
+    // carrying the live epoch (seq-verify tails and stale chunks are shut out).
+    std::vector<std::array<uint32_t, 8>> row_vein_;
+    uint32_t verify_epoch_ = 0;
+    uint64_t slru_demoted_total_ = 0;
     std::vector<std::array<int, 8>> early_routing_;
     DeviceBuffer<float> expert_scratch_;
     FILE *route_trace_ = nullptr;
@@ -4051,10 +4191,14 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         // batches run; speculative queues can never jump a demand record.
         for (int slot = 0; slot < topk; ++slot)
             prev_routing_[size_t(layer)][size_t(slot)] = selection[size_t(tokens - 1)][size_t(slot)].first;
-        for (int row = 0; row < tokens && row < 8; ++row)
+        for (int row = 0; row < tokens && row < 8; ++row) {
+            // Freshness vein for acceptance-prefix demotion: this round's
+            // verify chunks stamp the rows they actually routed.
+            row_vein_[size_t(layer)][size_t(row)] = verify_epoch_;
             for (int slot = 0; slot < topk; ++slot)
                 row_routing_[size_t(layer)][size_t(row * topk + slot)] =
                     selection[size_t(row)][size_t(slot)].first;
+        }
         expert_stager_->stage_layer(layer, distinct.data(), int(distinct.size()));
         if (prefetch_on_ && size_t(layer) + 1 < prev_routing_.size() &&
             is_sparse_[size_t(layer) + 1])
@@ -4598,6 +4742,9 @@ std::vector<std::pair<int, float>> Runner::step(
                     expert_stager_->f3_rescued() *
                         (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes) /
                         double(1ull << 30));
+    if (expert_stager_ && expert_stager_->demoted_cold())
+        std::printf("  SLRU demoted %llu rejected-row records to the probationary tail\n",
+                    (unsigned long long)expert_stager_->demoted_cold());
     if (expert_stager_ && expert_stager_->cache_lookups())
         std::printf("  expert read-wait %.3f s of %.3f s expert wall (demand blocks on NVMe/pool)\n",
                     expert_stager_->read_wait_seconds(), expert_io_seconds());
@@ -4887,6 +5034,7 @@ int main(int argc, char **argv) {
 
                     const auto verify_begin = std::chrono::steady_clock::now();
                     const uint64_t verify_records_before = runner.expert_records_read();
+                    runner.begin_verify_epoch();
                     std::vector<int> arg(static_cast<size_t>(draft_k), 0);
                     int matched = 1;
                     bool df_seq_verify =
@@ -4967,6 +5115,11 @@ int main(int argc, char **argv) {
                     // accepted prefix (step() commits its own token).
                     runner.adopt_anchor_routing(df_seq_verify ? 0 : matched - 1);
                     runner.df_commit(matched, position + 1);
+                    // SLRU insert-then-demote: batch verify read the whole
+                    // union; experts that served only the rejected tail get
+                    // pushed to the cold end of the host tier.
+                    if (!df_seq_verify)
+                        runner.demote_rejected_routing(matched, draft_k);
                     root = candidates[size_t(matched - 1)];
                     truth0 = arg[size_t(matched - 1)];
                     position += matched;

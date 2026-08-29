@@ -610,6 +610,13 @@ public:
         // upload time, after the bytes had already been re-read from disk.
         if (const char *f3 = std::getenv("INSIGNIA_GLM53_F3"))
             f3_device_consult_ = std::atoi(f3) != 0;
+        // O(1) intrusive LRU for the host tier: the ioaudit measured 10-12
+        // ms/verify-round in the O(2425) victim scans. The list order mirrors
+        // the admission-stamp ordering the scanner selected, so eviction
+        // choice is unchanged outside stamp-0 (never-admitted) ties.
+        tier_o1_ = std::getenv("INSIGNIA_GLM53_TIER_O1") != nullptr;
+        lru_prev_.assign(size_t(window_count_), -1);
+        lru_next_.assign(size_t(window_count_), -1);
         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS")) {
             const char *gpu = std::getenv("INSIGNIA_GLM53_PACKED_GPU");
             packed_gpu_scales_ = !gpu || std::atoi(gpu) != 0;
@@ -710,6 +717,7 @@ public:
             free_windows_.pop_back();
             start_read(window, key, layer, parsed_expert, false);
             windows_[size_t(window)].pinned = true;
+            lru_unlink(window);
             staged.push_back(window);
             if (taken < per_layer_device) pinned_device_keys_.insert(key);
             ++taken;
@@ -719,8 +727,10 @@ public:
         std::fclose(file);
         for (int window : staged) wait_and_consume_error(window);
         for (int window : staged)
-            if (windows_[size_t(window)].error)
+            if (windows_[size_t(window)].error) {
                 windows_[size_t(window)].pinned = false;
+                lru_push_back(window);
+            }
         if (pinned_count)
             std::printf("pin list: %d hot records pinned in host tier (%zu VRAM keys)\n",
                         pinned_count, pinned_device_keys_.size());
@@ -979,6 +989,7 @@ public:
                 model_.evict_span_cache(uint16_t(state.l2_shard), state.l2_offset, state.l2_bytes);
             state.claimed = false;
             state.stamp = ++stamp_;
+            lru_move_front(window);
         } else {
             // Passed through: drop it from the resident index immediately so
             // later lookups re-read, and free the window once the async copy
@@ -987,6 +998,7 @@ public:
             state.key = kNoKey;
             state.releasing = true;
             releasing_.push_back(window);
+            lru_unlink(window);
             if (!state.demand) ++prefetch_wasted_;
         }
     }
@@ -1637,6 +1649,7 @@ private:
         state.globals = {};
         state.l2_shard = -1;
         flight_index_.emplace(key, window);
+        lru_push_back(window);
         submit_window(window, demand);
     }
     // Relabeling an adopted prefetch is insufficient: if it has not started,
@@ -1680,6 +1693,34 @@ private:
         for (const auto &stamp : batch_read_ends_) latest = std::max(latest, stamp);
         io_seconds_ += std::chrono::duration<double>(latest - batch_read_begin_).count();
     }
+    // Intrusive LRU over evictable windows: start_read pushes at the back
+    // (oldest candidates), admission moves to the front, eviction/pass-through
+    // unlink. Pinned windows leave the list entirely so the tail walk never
+    // crosses a pin prefix. Order mirrors the old min-stamp scan.
+    void lru_unlink(int window) {
+        const int p = lru_prev_[size_t(window)], n = lru_next_[size_t(window)];
+        if (p >= 0) lru_next_[size_t(p)] = n;
+        else if (lru_head_ == window) lru_head_ = n;
+        if (n >= 0) lru_prev_[size_t(n)] = p;
+        else if (lru_tail_ == window) lru_tail_ = p;
+        lru_prev_[size_t(window)] = lru_next_[size_t(window)] = -1;
+    }
+    void lru_push_back(int window) {
+        lru_prev_[size_t(window)] = lru_tail_;
+        lru_next_[size_t(window)] = -1;
+        if (lru_tail_ >= 0) lru_next_[size_t(lru_tail_)] = window;
+        else lru_head_ = window;
+        lru_tail_ = window;
+    }
+    void lru_move_front(int window) {
+        if (lru_head_ == window) return;
+        lru_unlink(window);
+        lru_prev_[size_t(window)] = -1;
+        lru_next_[size_t(window)] = lru_head_;
+        if (lru_head_ >= 0) lru_prev_[size_t(lru_head_)] = window;
+        else lru_tail_ = window;
+        lru_head_ = window;
+    }
     // Returns windows whose async H2D finished to the free list.
     void reap_released() {
         size_t out = 0;
@@ -1703,6 +1744,24 @@ private:
             const int window = free_windows_.back();
             free_windows_.pop_back();
             return window;
+        }
+        if (tier_o1_) {
+            // O(1) victim: first eligible window from the LRU tail (ioaudit:
+            // the 2425-wide scans cost 10-12 ms per verify round; the list
+            // order mirrors the admission-stamp recency the scan below used).
+            for (int walk = lru_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
+                WindowState &state = windows_[size_t(walk)];
+                if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
+                    state.pinned)
+                    continue;
+                if (state.copy_issued) {
+                    check(cudaEventSynchronize(state.copy_done), "drain evicted expert copy");
+                    state.copy_issued = false;
+                }
+                if (!state.demand) ++prefetch_wasted_;
+                release_window(walk);
+                return take_window();
+            }
         }
         // Evict the least-recently-used completed, unclaimed record. A batch
         // claims at most 8 windows and releases them at upload, so with a
@@ -1747,6 +1806,7 @@ private:
         flight_index_.erase(state.key);
         state.key = kNoKey;
         state.demand = false;
+        lru_unlink(window);
         free_windows_.push_back(window);
     }
     // Drive of a routing target: 0 = main store, 1 = ALT_SHARD_DIR (second
@@ -1987,6 +2047,10 @@ private:
     bool f3_device_consult_ = false;
     std::array<bool, 8> batch_device_{};
     uint64_t f3_rescued_ = 0;
+    // O(1) intrusive LRU state (INSIGNIA_GLM53_TIER_O1).
+    bool tier_o1_ = false;
+    std::vector<int> lru_prev_, lru_next_;
+    int lru_head_ = -1, lru_tail_ = -1;
 };
 
 class Q8Stager {

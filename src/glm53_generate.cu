@@ -586,6 +586,10 @@ public:
             admit_threshold_ = std::max(1, std::atoi(filter));
         else if (const char *filter = std::getenv("INSIGNIA_GLM53_ADMIT"))
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
+        if (const char *segments = std::getenv("INSIGNIA_GLM53_TIER_SEGMENTS"))
+            slru_on_ = std::atoi(segments) != 0;
+        if (const char *ratio = std::getenv("INSIGNIA_GLM53_SLRU_PROTECTED_PCT"))
+            slru_protected_pct_ = std::clamp(std::atoi(ratio), 10, 95);
         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
             vram_budget_mb_ = std::max(0, std::atoi(budget));
         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS"))
@@ -688,6 +692,8 @@ public:
         for (int window : staged)
             if (windows_[size_t(window)].error)
                 windows_[size_t(window)].pinned = false;
+        pinned_window_count_ = pinned_count;
+        rebalance_segments();
         if (pinned_count)
             std::printf("pin list: %d hot records pinned in host tier (%zu VRAM keys)\n",
                         pinned_count, pinned_device_keys_.size());
@@ -707,6 +713,14 @@ public:
         batch_read_ends_.clear();
         for (int slot = 0; slot < count; ++slot)
             batch_populate_[size_t(slot)] = populate_cache && ((populate_mask >> slot) & 1u);
+        // Claim every resident member before any miss chooses a victim. This
+        // makes a batch atomic with respect to eviction and, critically for
+        // SLRU, prevents a promotion rebalance from exposing a later slot in
+        // the same batch as probation.
+        for (int slot = 0; slot < count; ++slot) {
+            const auto found = flight_index_.find(route_key(layer, experts[slot]));
+            if (found != flight_index_.end()) windows_[size_t(found->second)].claimed = true;
+        }
         int hits = 0, adopted = 0;
         uint64_t started_bytes = 0;
         for (int slot = 0; slot < count; ++slot) {
@@ -731,6 +745,7 @@ public:
                 if (window_done(resident->second)) {
                     // Host-tier hit: the record is already pinned in RAM and
                     // only owes the 13.5 MiB H2D copy.
+                    promote_segment(resident->second);
                     batch_cached_[slot] = true;
                     ++state.hits;
                     ++hits;
@@ -738,9 +753,12 @@ public:
                 } else {
                     // A prefetch for exactly this (layer, expert) is in
                     // flight; promote it instead of reading bytes twice.
+                    const bool speculative = !state.demand;
                     promote_read(resident->second);
-                    ++adopted;
-                    ++prefetch_useful_;
+                    if (speculative) {
+                        ++adopted;
+                        ++prefetch_useful_;
+                    }
                 }
                 continue;
             }
@@ -790,11 +808,13 @@ public:
             const uint32_t key = route_key(layer, experts[index]);
             const auto resident = flight_index_.find(key);
             if (resident != flight_index_.end()) {
+                windows_[size_t(resident->second)].claimed = true;
                 if (!window_done(resident->second)) promote_read(resident->second);
                 continue;
             }
             const int window = take_window();
             start_read(window, key, layer, experts[index], true);
+            windows_[size_t(window)].claimed = true;
             io_bytes_ += windows_[size_t(window)].source_bytes;
         }
     }
@@ -884,6 +904,7 @@ public:
             // later lookups re-read, and free the window once the async copy
             // has drained (reap_released polls the event).
             if (state.key != kNoKey) flight_index_.erase(state.key);
+            forget_segment(state);
             state.key = kNoKey;
             state.releasing = true;
             releasing_.push_back(window);
@@ -917,6 +938,12 @@ public:
     double packed_expand_seconds() const {
         return packed_expand_nanoseconds_.load() * 1.0e-9;
     }
+    bool slru_on() const { return slru_on_; }
+    uint64_t slru_promotions() const { return slru_promotions_; }
+    uint64_t slru_probation_evictions() const { return slru_probation_evictions_; }
+    uint64_t slru_protected_evictions() const { return slru_protected_evictions_; }
+    int slru_protected_count() const { return slru_protected_count_; }
+    int slru_protected_target() const { return protected_target(); }
 private:
     struct Layout {
         std::array<size_t, 3> body{};
@@ -928,6 +955,7 @@ private:
         int layer = -1, expert = -1;
         bool demand = false, done = true, claimed = false, copy_issued = false;
         bool releasing = false, pinned = false;
+        bool probation = true;
         uint64_t stamp = 0;
         uint64_t source_bytes = 0;
         unsigned hits = 0;
@@ -944,6 +972,42 @@ private:
 
     static uint32_t route_key(int layer, int expert) {
         return uint32_t(layer) * 4096u + uint32_t(expert);
+    }
+    int protected_target() const {
+        const int usable = std::max(1, window_count_ - pinned_window_count_ - 16);
+        return std::max(1, usable * slru_protected_pct_ / 100);
+    }
+    void rebalance_segments() {
+        if (!slru_on_) return;
+        while (slru_protected_count_ > protected_target()) {
+            int oldest = -1;
+            for (int window = 0; window < window_count_; ++window) {
+                const WindowState &state = windows_[size_t(window)];
+                if (state.key == kNoKey || state.probation || state.pinned ||
+                    !state.done || state.claimed || state.releasing)
+                    continue;
+                if (oldest < 0 || state.stamp < windows_[size_t(oldest)].stamp)
+                    oldest = window;
+            }
+            if (oldest < 0) break;  // active batch may temporarily exceed the target
+            windows_[size_t(oldest)].probation = true;
+            --slru_protected_count_;
+        }
+    }
+    void promote_segment(int window) {
+        WindowState &state = windows_[size_t(window)];
+        if (!slru_on_ || !state.probation || state.pinned) return;
+        state.probation = false;
+        ++slru_protected_count_;
+        ++slru_promotions_;
+        rebalance_segments();
+    }
+    void forget_segment(WindowState &state) {
+        if (slru_on_ && !state.probation && !state.pinned) {
+            require(slru_protected_count_ > 0, "SLRU protected count underflow");
+            --slru_protected_count_;
+        }
+        state.probation = true;
     }
     static void pread_exact(int fd, uint64_t offset, void *destination, size_t bytes,
                             const char *what) {
@@ -1177,6 +1241,7 @@ private:
         state.claimed = false;
         state.copy_issued = false;
         state.pinned = false;
+        state.probation = true;
         state.stamp = 0;
         state.source_bytes = source_bytes(layer, expert);
         state.hits = 0;
@@ -1258,14 +1323,18 @@ private:
         // tier larger than one token's 336 records a victim always exists.
         // (Measured: frequency-based eviction churns newcomers and halves
         // the hit rate on this near-uniform routing; plain LRU wins.)
-        int victim = -1;
+        int protected_victim = -1, probation_victim = -1;
         for (int window = 0; window < window_count_; ++window) {
             const WindowState &state = windows_[size_t(window)];
             if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
                 state.pinned)
                 continue;
-            if (victim < 0 || state.stamp < windows_[size_t(victim)].stamp) victim = window;
+            int &candidate = slru_on_ && state.probation ? probation_victim : protected_victim;
+            if (candidate < 0 || state.stamp < windows_[size_t(candidate)].stamp)
+                candidate = window;
         }
+        const int victim = slru_on_ && probation_victim >= 0
+            ? probation_victim : protected_victim;
         if (victim < 0) {
             // Everything is claimed or draining: wait out the oldest copy.
             for (int window = 0; window < window_count_; ++window) {
@@ -1288,13 +1357,19 @@ private:
             victim_state.copy_issued = false;
         }
         if (!victim_state.demand) ++prefetch_wasted_;
+        if (slru_on_) {
+            if (victim_state.probation) ++slru_probation_evictions_;
+            else ++slru_protected_evictions_;
+        }
         release_window(victim);
         return take_window();
     }
     void release_window(int window) {
-        flight_index_.erase(windows_[size_t(window)].key);
-        windows_[size_t(window)].key = kNoKey;
-        windows_[size_t(window)].demand = false;
+        WindowState &state = windows_[size_t(window)];
+        flight_index_.erase(state.key);
+        forget_segment(state);
+        state.key = kNoKey;
+        state.demand = false;
         free_windows_.push_back(window);
     }
     // Drive of a routing target: 0 = main store, 1 = ALT_SHARD_DIR (second
@@ -1502,6 +1577,10 @@ private:
     int batch_layer_ = -1, batch_count_ = 0, batch_demand_count_ = 0;
     uint64_t stamp_ = 0;
     bool overlap_reads_ = true, batch_io_recorded_ = true;
+    bool slru_on_ = false;
+    int slru_protected_pct_ = 70, slru_protected_count_ = 0, pinned_window_count_ = 0;
+    uint64_t slru_promotions_ = 0, slru_probation_evictions_ = 0,
+             slru_protected_evictions_ = 0;
     uint64_t cache_hits_ = 0, cache_lookups_ = 0;
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
@@ -3582,12 +3661,19 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     return value ? std::max(0, std::atoi(value)) : 0;
                 }();
                 const int chosen_token = std::min(cache_token, tokens - 1);
+                static const int retain_positions = [] {
+                    const char *value = std::getenv("INSIGNIA_GLM53_VERIFY_RETAIN_POS");
+                    return value ? std::max(0, std::atoi(value)) : 0;
+                }();
+                const int position_cap = retain_positions > 0
+                    ? std::min(tokens, retain_positions) : tokens;
                 const int sparse_layers = int(std::count(is_sparse_.begin(), is_sparse_.end(), true));
                 const int quota = std::max(1, (expert_stager_->cache_slots() - 16) /
                                                    std::max(1, sparse_layers));
                 std::vector<int> retained;
                 retained.reserve(size_t(quota));
-                for (int offset = 0; offset < tokens && int(retained.size()) < quota; ++offset) {
+                for (int offset = 0; offset < position_cap &&
+                                   int(retained.size()) < quota; ++offset) {
                     const int token = (chosen_token + offset) % tokens;
                     for (const auto &[expert, weight] : selection[size_t(token)]) {
                         if (std::find(retained.begin(), retained.end(), expert) == retained.end())
@@ -4007,6 +4093,13 @@ std::vector<std::pair<int, float>> Runner::step(
                         (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes + 3 * sizeof(float)) /
                         double(1ull << 30),
                     expert_stager_->cache_slots());
+    if (expert_stager_ && expert_stager_->slru_on())
+        std::printf("  host SLRU %d/%d protected, %llu promotions, evictions %llu probation / %llu protected\n",
+                    expert_stager_->slru_protected_count(),
+                    expert_stager_->slru_protected_target(),
+                    (unsigned long long)expert_stager_->slru_promotions(),
+                    (unsigned long long)expert_stager_->slru_probation_evictions(),
+                    (unsigned long long)expert_stager_->slru_protected_evictions());
     if (expert_stager_ && expert_stager_->device_lookups())
         std::printf("  VRAM expert tier %llu/%llu hits (%.1f%%, %.3f GiB PCIe avoided; %d slots)\n",
                     (unsigned long long)expert_stager_->device_hits(),

@@ -596,6 +596,10 @@ public:
         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS")) {
             const char *gpu = std::getenv("INSIGNIA_GLM53_PACKED_GPU");
             packed_gpu_scales_ = !gpu || std::atoi(gpu) != 0;
+            if (const char *merge = std::getenv("INSIGNIA_GLM53_PACKED_V2"))
+                packed_merge_h2d_ = std::atoi(merge) != 0;
+            if (const char *kernel = std::getenv("INSIGNIA_GLM53_PACKED_KERNEL"))
+                packed_kernel_v2_ = std::atoi(kernel) == 2;
             open_packed_experts(path);
             if (packed_gpu_scales_)
                 check(cudaMalloc(&packed_scale_device_, kPackedDeviceCapacity),
@@ -947,6 +951,7 @@ private:
         std::array<size_t, 3> packed_body{}, packed_blob{}, packed_device{};
         std::array<size_t, 3> packed_escapes{}, packed_codebook{}, packed_prefix{};
         std::array<size_t, 3> packed_blob_bytes{};
+        size_t packed_blob_span = 0;
         size_t bytes = 0;
         bool packed_scales = false;
     };
@@ -1115,6 +1120,17 @@ private:
         require(std::memcmp(header->magic, "XPR1", 4) == 0 &&
                 header->layer == layer && header->expert == expert,
                 "packed expert record key mismatch");
+        // A corrupt-but-plausible sidecar can claim huge escape tails; bound
+        // them before any window write so a bad record fails loudly instead
+        // of spilling past this window into a neighbouring live record.
+        constexpr size_t kBlobOverhead = kPackedScaleBytes + 16 +
+                                         kScalePrefixEntries * sizeof(uint32_t) +
+                                         alignof(uint32_t);
+        constexpr size_t kMaxProjectionEscapes =
+            (kPayloadCapacity - kBodyBytes - 3 * kBlobOverhead) / 3;
+        for (int projection = 0; projection < 3; ++projection)
+            require(header->escapes[projection] <= kMaxProjectionEscapes,
+                    "packed expert scale escape tail exceeds staging capacity");
         const uint8_t *input = static_cast<const uint8_t *>(scratch) + sizeof(*header);
         const uint8_t *const input_end = static_cast<const uint8_t *>(scratch) + entry.stored_bytes;
         std::array<const uint8_t *, 3> bodies{}, packed_scales{}, escape_values{};
@@ -1166,6 +1182,7 @@ private:
         require(cursor <= kPayloadCapacity && device_cursor <= kPackedDeviceCapacity,
                 "packed GPU scale transport exceeds staging capacity");
         layout.bytes = cursor;
+        layout.packed_blob_span = device_cursor;
         layout.packed_scales = true;
         payload = window;
     }
@@ -1228,32 +1245,86 @@ private:
         }
         require(packed_scale_device_, "packed GPU scale scratch is unavailable");
         uint64_t transported = 0;
-        for (int projection = 0; projection < 3; ++projection) {
-            check(cudaMemcpyAsync(destination + state.layout.body[projection],
-                                  state.payload + state.layout.packed_body[projection],
-                                  kProjectionBodyBytes, cudaMemcpyHostToDevice, copy_stream_),
-                  "packed expert body H2D");
-            transported += kProjectionBodyBytes;
-            uint8_t *blob = packed_scale_device_ + state.layout.packed_device[projection];
-            check(cudaMemcpyAsync(blob,
-                                  state.payload + state.layout.packed_blob[projection],
-                                  state.layout.packed_blob_bytes[projection],
+        constexpr size_t kSlotPitch = kProjectionBodyBytes + kProjectionScaleBytes;
+        if (packed_merge_h2d_) {
+            // v2 transport: the three 4 MiB bodies are contiguous in the
+            // window and land at kSlotPitch strides in the destination slot,
+            // so one pitched 2D copy replaces three; the three scale blobs
+            // are contiguous on both sides by construction (device_cursor
+            // accumulation), so one linear copy replaces three; and the
+            // per-projection expansions fuse into a single launch. Six
+            // memcpy calls plus three launches become two plus one.
+            check(cudaMemcpy2DAsync(destination + state.layout.body[0], kSlotPitch,
+                                    state.payload + state.layout.packed_body[0],
+                                    kProjectionBodyBytes, kProjectionBodyBytes, 3,
+                                    cudaMemcpyHostToDevice, copy_stream_),
+                  "packed expert bodies H2D (2D)");
+            transported += kBodyBytes;
+            check(cudaMemcpyAsync(packed_scale_device_,
+                                  state.payload + state.layout.packed_blob[0],
+                                  state.layout.packed_blob_span,
                                   cudaMemcpyHostToDevice, copy_stream_),
-                  "packed expert scales H2D");
-            transported += state.layout.packed_blob_bytes[projection];
-        }
-        for (int projection = 0; projection < 3; ++projection) {
-            const uint8_t *blob =
-                packed_scale_device_ + state.layout.packed_device[projection];
-            check(insignia::glm53::expand_nvfp4_scale_nibbles(
-                      blob,
-                      blob + state.layout.packed_escapes[projection],
-                      blob + state.layout.packed_codebook[projection],
-                      reinterpret_cast<const uint32_t *>(
-                          blob + state.layout.packed_prefix[projection]),
-                      destination + state.layout.scales[projection],
-                      kProjectionScaleBytes, copy_stream_),
-                  "expand packed expert scales on GPU");
+                  "packed expert scales H2D (merged)");
+            transported += state.layout.packed_blob_span;
+            std::array<size_t, 3> packed{}, escapes{}, codebooks{}, prefixes{};
+            for (int projection = 0; projection < 3; ++projection) {
+                packed[projection] = state.layout.packed_device[projection];
+                escapes[projection] = state.layout.packed_device[projection] +
+                                      state.layout.packed_escapes[projection];
+                codebooks[projection] = state.layout.packed_device[projection] +
+                                        state.layout.packed_codebook[projection];
+                prefixes[projection] = state.layout.packed_device[projection] +
+                                       state.layout.packed_prefix[projection];
+            }
+            check(packed_kernel_v2_
+                      ? insignia::glm53::expand_nvfp4_scale_nibbles3_v2(
+                            packed_scale_device_, packed.data(), escapes.data(),
+                            codebooks.data(), prefixes.data(), destination,
+                            kSlotPitch, kProjectionBodyBytes, kProjectionScaleBytes,
+                            copy_stream_)
+                      : insignia::glm53::expand_nvfp4_scale_nibbles3(
+                            packed_scale_device_, packed.data(), escapes.data(),
+                            codebooks.data(), prefixes.data(), destination,
+                            kSlotPitch, kProjectionBodyBytes, kProjectionScaleBytes,
+                            copy_stream_),
+                  "expand packed expert scales on GPU (fused)");
+        } else {
+            for (int projection = 0; projection < 3; ++projection) {
+                check(cudaMemcpyAsync(destination + state.layout.body[projection],
+                                      state.payload + state.layout.packed_body[projection],
+                                      kProjectionBodyBytes, cudaMemcpyHostToDevice, copy_stream_),
+                      "packed expert body H2D");
+                transported += kProjectionBodyBytes;
+                uint8_t *blob = packed_scale_device_ + state.layout.packed_device[projection];
+                check(cudaMemcpyAsync(blob,
+                                      state.payload + state.layout.packed_blob[projection],
+                                      state.layout.packed_blob_bytes[projection],
+                                      cudaMemcpyHostToDevice, copy_stream_),
+                      "packed expert scales H2D");
+                transported += state.layout.packed_blob_bytes[projection];
+            }
+            for (int projection = 0; projection < 3; ++projection) {
+                const uint8_t *blob =
+                    packed_scale_device_ + state.layout.packed_device[projection];
+                check(packed_kernel_v2_
+                          ? insignia::glm53::expand_nvfp4_scale_nibbles_v2(
+                                blob,
+                                blob + state.layout.packed_escapes[projection],
+                                blob + state.layout.packed_codebook[projection],
+                                reinterpret_cast<const uint32_t *>(
+                                    blob + state.layout.packed_prefix[projection]),
+                                destination + state.layout.scales[projection],
+                                kProjectionScaleBytes, copy_stream_)
+                          : insignia::glm53::expand_nvfp4_scale_nibbles(
+                                blob,
+                                blob + state.layout.packed_escapes[projection],
+                                blob + state.layout.packed_codebook[projection],
+                                reinterpret_cast<const uint32_t *>(
+                                    blob + state.layout.packed_prefix[projection]),
+                                destination + state.layout.scales[projection],
+                                kProjectionScaleBytes, copy_stream_),
+                      "expand packed expert scales on GPU");
+            }
         }
         packed_h2d_bytes_.fetch_add(transported, std::memory_order_relaxed);
         packed_h2d_records_.fetch_add(1, std::memory_order_relaxed);
@@ -1656,6 +1727,7 @@ private:
     std::unordered_map<uint32_t, int> drive_cache_;
     cudaStream_t copy_stream_ = nullptr;
     bool stop_ = false, packed_gpu_scales_ = false;
+    bool packed_merge_h2d_ = false, packed_kernel_v2_ = false;
     std::array<int, 8> batch_experts_{};
     std::array<bool, 8> batch_cached_{};
     std::array<bool, 8> batch_admit_{};
@@ -2022,9 +2094,11 @@ public:
                 index ? index : "/var/lib/insignia/glm53-dflash2.index";
             const std::string root = std::filesystem::path(index_path).parent_path().string();
             const char *fp8 = std::getenv("INSIGNIA_GLM53_DFLASH2_FP8");
+            // The superseded default cache (glm53-dflash2-fp8, FC layout bug)
+            // no longer exists on disk; -fixed is the only valid target.
             df_ = std::make_unique<insignia::glm53::DFlash2Drafter>(
                 index_path, root,
-                fp8 ? fp8 : "/var/lib/insignia/glm53-dflash2-fp8",
+                fp8 ? fp8 : "/var/lib/insignia/glm53-dflash2-fp8-fixed",
                 int(model_.vocab_size()));
             dflash2_on_ = true;
             mtp_draft_total_ = insignia::glm53::DFlash2Drafter::kDrafts;
@@ -4492,7 +4566,7 @@ int main(int argc, char **argv) {
                     ++rounds;
                     std::fflush(stdout);
                 }
-                // Drafter window exhausted (position >= 263): plain greedy
+                // Drafter window exhausted (position >= 2040): plain greedy
                 // steps for the remainder, same shape as the empty-round
                 // fallback.
                 while (int(generated.size()) < generate) {

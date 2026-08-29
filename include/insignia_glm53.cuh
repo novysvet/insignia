@@ -24,6 +24,49 @@ cudaError_t expand_nvfp4_scale_nibbles(
     size_t output_bytes,
     cudaStream_t stream = nullptr);
 
+// Warp uint32 batch variant: one thread per packed word (8 codes, one
+// 64-bit store). Same bytes, requires output_bytes % 4096 == 0 and natural
+// alignment (packed % 4, block_prefix % 4, output % 8 — all guaranteed by
+// the expert staging arena).
+cudaError_t expand_nvfp4_scale_nibbles_v2(
+    const uint8_t *packed,
+    const uint8_t *escapes,
+    const uint8_t *codebook,
+    const uint32_t *block_prefix,
+    uint8_t *output,
+    size_t output_bytes,
+    cudaStream_t stream = nullptr);
+
+// Fused three-projection variants for the merged H2D transport: one launch
+// expands all three scale planes from the contiguous device scratch blob
+// into the interleaved destination slot (bodies at output_pitch strides,
+// scale plane at scale_offset inside each). Offsets are absolute bytes into
+// `scratch`; *_v2 is the warp uint32 worker. Output is byte-identical to
+// three single-projection calls.
+cudaError_t expand_nvfp4_scale_nibbles3(
+    const uint8_t *scratch,
+    const size_t *packed_offsets,
+    const size_t *escape_offsets,
+    const size_t *codebook_offsets,
+    const size_t *prefix_offsets,
+    uint8_t *output_base,
+    size_t output_pitch,
+    size_t scale_offset,
+    size_t projection_bytes,
+    cudaStream_t stream = nullptr);
+
+cudaError_t expand_nvfp4_scale_nibbles3_v2(
+    const uint8_t *scratch,
+    const size_t *packed_offsets,
+    const size_t *escape_offsets,
+    const size_t *codebook_offsets,
+    const size_t *prefix_offsets,
+    uint8_t *output_base,
+    size_t output_pitch,
+    size_t scale_offset,
+    size_t projection_bytes,
+    cudaStream_t stream = nullptr);
+
 // Exact checkpoint decode: packed E2M1 x E4M3-per-16 x global FP32.
 cudaError_t nvfp4_gemv_f32(
     const uint8_t *weights,

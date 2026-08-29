@@ -419,6 +419,27 @@ cudaError_t mla_decode_latent_fp8_absorb(
     int latent_dim = kMlaLatentDim,
     cudaStream_t stream = nullptr);
 
+// Approximate Ada decode path for long contexts. q_eff is quantized once per
+// head, then one CTA shares each latent tile across eight heads and evaluates
+// scores with m16n8k32 E4M3 tensor-core MMA. qeff_* are caller-owned scratch
+// [heads,latent_dim] and [heads,latent_dim/64]. The partial ABI is unchanged.
+cudaError_t mla_decode_latent_cross_head_fp8_absorb(
+    const float *query,
+    const float *latent,
+    uint8_t *cache,
+    float *scales,
+    const uint8_t *kv_b_fp8,
+    const uint16_t *kv_b_scales,
+    uint8_t *qeff_fp8,
+    float *qeff_scales,
+    float *partial,
+    float *output,
+    int position,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    int latent_dim = kMlaLatentDim,
+    cudaStream_t stream = nullptr);
+
 // Prefill `tokens` queries [tokens,heads,head_dim] against the latent
 // cache, appending the `tokens` latents [tokens,latent_dim] first (causal
 // mask inside the chunk mirrors the expanded flash2 path).  Passing both

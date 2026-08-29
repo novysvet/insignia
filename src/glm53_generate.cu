@@ -575,11 +575,17 @@ public:
         // A full decode token needs 336 records; default the tier just above
         // that and let the environment shrink it on smaller hosts.
         window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / kWindowBytes, 64, 4096));
+        // Write-combined host arena (ioaudit #5): windows are pread-written
+        // and H2D-read, never CPU-read except the tiny v2 prefix tripwire, so
+        // WC pages are safe and may reclaim 5-15% H2D efficiency. A/B only.
+        const unsigned arena_flags = std::getenv("INSIGNIA_GLM53_TIER_WC")
+                                         ? cudaHostAllocWriteCombined
+                                         : cudaHostAllocDefault;
         size_t attempt = size_t(window_count_);
         while (attempt >= 64) {
             void *block = nullptr;
             const cudaError_t status = cudaHostAlloc(&block, attempt * kWindowBytes + kAlignment - 1,
-                                                     cudaHostAllocDefault);
+                                                     arena_flags);
             if (status == cudaSuccess) {
                 host_raw_ = static_cast<uint8_t *>(block);
                 window_count_ = int(attempt);

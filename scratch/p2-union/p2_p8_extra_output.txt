@@ -1,0 +1,76 @@
+=== U(K) per model at K = 6,7,8,16,32,64,128,256,512 ===
+K:               6       7       8      16      32      64     128     256     512
+naive             44.3    51.0    57.5   103.5   169.8   239.5   279.8   287.8   288.0
+a1(76.7)          35.8    39.9    43.6    62.4    74.0    76.6    76.7    76.7    76.7
+b DM90            36.2    40.7    44.8    69.9    99.4   129.5   157.4   181.5   201.8
+b* DM56x          35.3    39.3    42.9    64.2    88.1   112.5   135.6   156.7   175.5
+c1                38.8    44.5    50.1    90.6   152.0   223.5   273.5   287.3   288.0
+c2(0.277)         37.1    42.3    47.4    83.4   135.1   189.0   219.7   225.7   225.8
+e1(95.5,.098)     36.4    40.9    45.0    68.6    87.8    94.9    95.5    95.5    95.5
+pl capped         37.0    42.2    47.2    85.2   153.7   277.2   288.0   288.0   288.0
+
+=== typical entropy of persistent Dirichlet(beta per expert) realizations ===
+(does the Polya model ALSO reproduce the measured 4.54-5.22 bit access entropy?)
+  alpha= 40.0 beta=0.1389: median H= 5.88 b (5-95%: 5.59..6.14) median 1/sum p^2=  37.1
+  alpha= 56.0 beta=0.1944: median H= 6.25 b (5-95%: 6.01..6.46) median 1/sum p^2=  49.1
+  alpha= 70.0 beta=0.2431: median H= 6.49 b (5-95%: 6.28..6.67) median 1/sum p^2=  58.7
+  alpha= 90.0 beta=0.3125: median H= 6.72 b (5-95%: 6.55..6.88) median 1/sum p^2=  70.3
+  alpha=120.0 beta=0.4167: median H= 6.98 b (5-95%: 6.84..7.11) median 1/sum p^2=  86.4
+
+=== max U(5) subject to access entropy <= Hmax (two-level marginals) ===
+  Hmax= 4.54: max U(5)= 19.23  at k=21, a=0.379, H=4.45b
+  Hmax= 5.22: max U(5)= 25.79  at k=36, a=0.222, H=5.19b
+  Hmax= 5.37: max U(5)= 25.79  at k=36, a=0.222, H=5.19b
+  Hmax= 6.50: max U(5)= 33.23  at k=86, a=0.093, H=6.43b
+  Hmax= 7.00: max U(5)= 34.96  at k=113, a=0.069, H=7.00b
+
+=== flat references ===
+  flat N=41.4: U(5)=27.25  E[I]=1.546  H=5.37b
+  flat N=66.0: U(5)=31.41  E[I]=0.970  H=6.04b
+
+=== moment-bound extremal (sum q=8, sum q^2=1.544) ===
+  max U(5)=32.25 at k=2 hot experts q=0.838, rest q=0.0221, access H=7.40 bits
+
+=== d(k) = 42*U(k) verify-union records (context for P1) ===
+  k=1: DM90    320  DM56x    336  c1    336  (k*336 naive 336)
+  k=2: DM90    607  DM56x    625  c1    607  (k*336 naive 672)
+  k=4: DM90   1104  DM56x   1101  c1   1130  (k*336 naive 1344)
+  k=6: DM90   1522  DM56x   1483  c1   1630  (k*336 naive 2016)
+  k=8: DM90   1881  DM56x   1800  c1   2106  (k*336 naive 2688)
+
+=== P8: warm-anchored physical model ===
+implied hits h from the two warm points as function of (f, BW):
+  f=1.0s BW=5.45: reads32=  94.8 (h32=  -6.7)  reads64=  96.0 (h64=  16.5)
+  f=1.0s BW=5.80: reads32= 100.9 (h32= -12.8)  reads64= 102.2 (h64=  10.3)
+  f=1.6s BW=5.45: reads32=  89.4 (h32=  -1.2)  reads64=  90.5 (h64=  21.9)
+  f=1.6s BW=5.80: reads32=  95.1 (h32=  -7.0)  reads64=  96.3 (h64=  16.1)
+  f=2.2s BW=5.45: reads32=  83.9 (h32=   4.2)  reads64=  85.1 (h64=  27.4)
+  f=2.2s BW=5.80: reads32=  89.3 (h32=  -1.1)  reads64=  90.5 (h64=  21.9)
+
+banded predictions (ms/token), DM56x central U-model:
+scenario                                     T=16w  T=64   T=128  T=256  T=512
+optimistic h=82 sat, f=1.0                     62.9   65.0   51.3   34.3   21.1
+central  h(16..512)=0,22,50,65,75, f=1.6      513.4  141.9   81.7   43.5   23.7
+pessimistic h=0 (cold-tier), f=1.6            513.4  206.3  121.9   69.6   38.8
+c1-high U, h=82, f=1.6                        155.7  253.0  166.9   89.2   44.9
+
+central scenario with KDA-fusion (a=0) and packed records (12.75 MiB):
+  T= 64: base= 141.9 +fused= 141.6 +packed= 135.0 both= 134.6
+  T=128: base=  81.7 +fused=  81.3 +packed=  77.6 both=  77.2
+  T=256: base=  43.5 +fused=  43.1 +packed=  41.3 both=  40.9
+  T=512: base=  23.7 +fused=  23.3 +packed=  22.5 both=  22.1
+
+T* (model-interior): with m(T)=a+c/T+alpha*T/2, T*=sqrt(2c/alpha):
+  optimistic c=6.5s: T* = 1,339 tokens (attention-quadratic only)
+  central c=10.4s: T* = 1,694 tokens (attention-quadratic only)
+  pessimistic c=13.2s: T* = 1,908 tokens (attention-quadratic only)
+  VRAM staging per layer = U(T)*13.56 MiB;  U(512) DM56x = 176 -> 2.32 GiB; c1 288 -> 3.81 GiB
+
+=== P2(2) prefill chunk IO (records read per layer per chunk, band) ===
+    K   DM56x    DM90      c2      e1      pl      c1 |  GiB(42U)@13.56 ms/tok@5.8full   dedup
+    8   42.9   44.8   47.4   45.0   47.2   50.1 |            27.9          645.4   21.6%
+   16   64.2   69.9   83.4   68.6   85.2   90.6 |            50.4          583.1   29.2%
+   32   88.1   99.4  135.1   87.8  153.7  152.0 |            85.5          494.4   40.0%
+   64  112.5  129.5  189.0   94.9  277.2  223.5 |           154.1          445.9   45.9%
+  128  135.6  157.4  219.7   95.5  288.0  273.5 |           160.2          231.7   71.9%
+  256  156.7  181.5  225.7   95.5  288.0  287.3 |           160.2          115.8   85.9%

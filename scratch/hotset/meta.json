@@ -1,0 +1,65 @@
+{
+ "route-realtext": {
+  "file": "/var/lib/insignia/route-realtext.txt",
+  "lines": 210,
+  "field_counts": {
+   "18": 210
+  },
+  "bad_lines": 0,
+  "dup_experts_in_line": 0,
+  "n_tokens": 5,
+  "token_min": 1,
+  "token_max": 5,
+  "n_layers": 42,
+  "layer_min": 3,
+  "layer_max": 44,
+  "lines_per_token_min": 42,
+  "lines_per_token_max": 42,
+  "expert_min": 0,
+  "expert_max": 287,
+  "overlap_col_present": false,
+  "overlap_col_check_sum": -1
+ },
+ "route-campaign": {
+  "file": "/var/lib/insignia/route-campaign.txt",
+  "lines": 2520,
+  "field_counts": {
+   "18": 2520
+  },
+  "bad_lines": 0,
+  "dup_experts_in_line": 0,
+  "n_tokens": 60,
+  "token_min": 1,
+  "token_max": 60,
+  "n_layers": 42,
+  "layer_min": 3,
+  "layer_max": 44,
+  "lines_per_token_min": 42,
+  "lines_per_token_max": 42,
+  "expert_min": 0,
+  "expert_max": 287,
+  "overlap_col_present": false,
+  "overlap_col_check_sum": -1
+ },
+ "early-route-math": {
+  "file": "/var/lib/insignia/early-route-math.txt",
+  "lines": 504,
+  "field_counts": {
+   "19": 504
+  },
+  "bad_lines": 0,
+  "dup_experts_in_line": 0,
+  "n_tokens": 12,
+  "token_min": 1,
+  "token_max": 12,
+  "n_layers": 42,
+  "layer_min": 3,
+  "layer_max": 44,
+  "lines_per_token_min": 42,
+  "lines_per_token_max": 42,
+  "expert_min": 0,
+  "expert_max": 287,
+  "overlap_col_present": true,
+  "overlap_col_check_sum": 2415
+ }
+}

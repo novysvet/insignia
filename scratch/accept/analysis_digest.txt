@@ -1,0 +1,50 @@
+== P(m|k) pools ==
+k4_gsm8k                         n=124 E[m]=2.34 E[len]=3.34 hist={0: 30, 1: 13, 2: 15, 3: 17, 4: 49}
+k7_gsm8k_math500                 n= 76 E[m]=3.08 E[len]=4.08 hist={0: 22, 1: 4, 2: 8, 3: 10, 4: 6, 5: 6, 6: 10, 7: 10}
+k7_baseline_gen4                 n=  6 E[m]=0.67 E[len]=1.67 hist={0: 4, 1: 1, 3: 1}
+r12_fixed_k7_m_if_verified       n=  6 E[m]=2.00 E[len]=3.00 hist={1: 3, 2: 1, 3: 1, 4: 1}
+r12_fixed_k7_m_if_empty          n=  6 E[m]=1.50 E[len]=2.50 hist={0: 3, 2: 1, 3: 1, 4: 1}
+campaign_fixed_k4                n= 27 E[m]=3.67 E[len]=4.67 hist={0: 1, 1: 1, 2: 1, 4: 24}
+campaign_fixed_k7                n= 17 E[m]=5.82 E[len]=6.82 hist={0: 1, 1: 1, 2: 1, 5: 1, 7: 13}
+
+== mixed-round T (empty rounds pay draft+fallback) ==
+k4_gsm8k                 P0=0.242 W= 1610.1 ms/round  T_mixed=2.07 tok/s (482 ms/tok) vs scalar 570.9 -> WINS
+k7_gsm8k_math500         P0=0.289 W= 2179.6 ms/round  T_mixed=1.87 tok/s (534 ms/tok) vs scalar 570.9 -> WINS
+
+== dfdump r12 rounds (52-tok prompt, k7) ==
+{'round': 1, 'draft_k': 7, 'commit_count': 1, 'm_if_verified': 1, 'm_if_empty': 0, 'ambiguity': 'm=0(empty) or m=1(verified)', 'pos0': '53', 'anchor': '25'}
+{'round': 2, 'draft_k': 7, 'commit_count': 1, 'm_if_verified': 1, 'm_if_empty': 0, 'ambiguity': 'm=0(empty) or m=1(verified)', 'pos0': '54', 'anchor': '6771'}
+{'round': 3, 'draft_k': 7, 'commit_count': 4, 'm_if_verified': 4, 'm_if_empty': 4, 'ambiguity': '', 'pos0': '55', 'anchor': '594'}
+{'round': 4, 'draft_k': 7, 'commit_count': 3, 'm_if_verified': 3, 'm_if_empty': 3, 'ambiguity': '', 'pos0': '59', 'anchor': '3019'}
+{'round': 5, 'draft_k': 7, 'commit_count': 1, 'm_if_verified': 1, 'm_if_empty': 0, 'ambiguity': 'm=0(empty) or m=1(verified)', 'pos0': '62', 'anchor': '382'}
+{'round': 6, 'draft_k': 7, 'commit_count': 2, 'm_if_verified': 2, 'm_if_empty': 2, 'ambiguity': '', 'pos0': '63', 'anchor': '8303'}
+
+== d(k) ==
+{'k': 1, 'ratio_model': 1.0, 'd_model': 336.0, 'd_measured': '', 'd_blend': 336.0, 'ratio_measured': ''}
+{'k': 2, 'ratio_model': 0.903, 'd_model': 606.8, 'd_measured': '', 'd_blend': 583.8, 'ratio_measured': ''}
+{'k': 3, 'ratio_model': 0.859, 'd_model': 865.9, 'd_measured': '', 'd_blend': 833.0, 'ratio_measured': ''}
+{'k': 4, 'ratio_model': 0.825, 'd_model': 1108.8, 'd_measured': 1067.0, 'd_blend': 1067.0, 'ratio_measured': 0.7939}
+{'k': 5, 'ratio_model': 0.785, 'd_model': 1318.8, 'd_measured': '', 'd_blend': 1268.7, 'ratio_measured': ''}
+{'k': 6, 'ratio_model': 0.7457, 'd_model': 1503.3, 'd_measured': '', 'd_blend': 1446.2, 'ratio_measured': ''}
+{'k': 7, 'ratio_model': 0.7064, 'd_model': 1661.5, 'd_measured': 1506.2, 'd_blend': 1506.2, 'ratio_measured': 0.6404}
+{'k': 8, 'ratio_model': 0.6671, 'd_model': 1793.2, 'd_measured': '', 'd_blend': 1626.4, 'ratio_measured': ''}
+
+== calibration ==
+a_drafter_ms                                   17.5  mean draft ms/round over gen>=32 dflash runs (n=18)
+fallback_step_ms_median                       643.2  fallback_total_ms/empty_rounds, n=18 empty rounds
+verify_ms_k4_mean                            1895.7  math variant k=4, n=94 verified rounds-pools (10 runs)
+verify_ms_k7_mean                            2781.0  c64+vramtier k=7 gen32, n=54 verified rounds (8 runs)
+b_two_point_ms_per_record                     2.016  (V7-V4)/(d7-d4) = (2781-1896)/(1506-1067)
+a_two_point_ms                               -255.1  intercept V4 - b*d4 (can be ~0; dense verify cost folds into b)
+b_k7_constrained_ms_per_record                1.835  (V7 - a_drafter)/d7 with a=17.4
+b_k4_constrained_ms_per_record                 1.76  (V4 - a_drafter)/d4 with a=17.4
+b_pcie_floor_ms_per_record                    0.613  13.56 MiB / 23.2 GB/s pinned H2D (all-resident floor)
+b_nvme_ms_per_record_range                2.93-3.88  13.56 MiB / measured 3.66-4.85 GB/s O_DIRECT (nvme_gbps n=12: 1.63-4.8
+b_effective_recommended                         1.8  constrained fits 1.76-1.83 agree; fallback step 640ms/336rec=1.9 corro
+scalar_ms_per_token                           570.9  s6 documented; local re-parse median 578 (gen32 subset 566)
+
+== T(k) highlights (b=1.8) ==
+optimal for gsm8k: k*=1 T=3.042 tok/s (speedup 1.736x, E[m]=0.758)
+optimal for campaign: k*=1 T=3.358 tok/s (speedup 1.917x, E[m]=0.941)
+
+outputs in E:\coding\Insignia\scratch\accept\out

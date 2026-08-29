@@ -1,0 +1,80 @@
+[
+ {
+  "dataset": "gsm8k",
+  "index": 895,
+  "prompt_tokens": 84,
+  "problem": "Martin's weight is 55 kg. Carl\u2019s weight is 16 kg more than Martin\u2019s weight. Christian\u2019s weight is 8 kg more than Carl\u2019s weight. Harry is 5 kg less than Christian\u2019s weight. What is the weight of Harry, in kg?",
+  "scalar": {
+   "decode_ms_per_token": 634.4999999999992,
+   "prompt_tokens": 84,
+   "prompt_seconds": 43.831,
+   "prefill_tokens_per_second": 1.9164518263329606,
+   "generated_tokens": 4,
+   "wall_seconds": 151.26493309599982,
+   "ids": [
+    1986,
+    374,
+    264,
+    4285
+   ]
+  },
+  "dflash": {
+   "rounds": 2,
+   "verify_k": 7,
+   "accepted_per_round": 2.0,
+   "accepted_histogram": "0:1 3:1",
+   "decode_ms_per_token": 1838.3,
+   "prompt_tokens": 84,
+   "prompt_seconds": 99.465,
+   "prefill_tokens_per_second": 0.8445181722213844,
+   "generated_tokens": 4,
+   "wall_seconds": 250.07388107299994,
+   "ids": [
+    1986,
+    374,
+    264,
+    4285
+   ]
+  },
+  "parity": true
+ },
+ {
+  "dataset": "math500",
+  "index": 162,
+  "prompt_tokens": 78,
+  "problem": "What is the probability that a randomly selected integer in the set $$\\{1,2,3,\\ldots,100\\}$$  is divisible by 2 and not divisible by 3? Express your answer as a common fraction.",
+  "dflash": {
+   "rounds": 4,
+   "verify_k": 7,
+   "accepted_per_round": 1.0,
+   "accepted_histogram": "0:3 1:1",
+   "decode_ms_per_token": 862.2,
+   "prompt_tokens": 78,
+   "prompt_seconds": 98.584,
+   "prefill_tokens_per_second": 0.7912034407206038,
+   "generated_tokens": 4,
+   "wall_seconds": 247.29992301200036,
+   "ids": [
+    1654,
+    1184,
+    18893,
+    429
+   ]
+  },
+  "scalar": {
+   "decode_ms_per_token": 1669.7500000000005,
+   "prompt_tokens": 78,
+   "prompt_seconds": 99.352,
+   "prefill_tokens_per_second": 0.7850873661325388,
+   "generated_tokens": 4,
+   "wall_seconds": 233.53530069199996,
+   "ids": [
+    1654,
+    1184,
+    18893,
+    429
+   ]
+  },
+  "parity": true
+ }
+]

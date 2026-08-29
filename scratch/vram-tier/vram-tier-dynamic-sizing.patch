@@ -1,0 +1,103 @@
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -1098,44 +1098,81 @@
+     void ensure_device_arena() {
+         if (device_arena_ready_) return;
+         device_arena_ready_ = true;
+         size_t budget = 0;
+         if (vram_budget_mb_ >= 0) {
+             budget = size_t(vram_budget_mb_) << 20;
+         } else {
+             size_t free_bytes = 0, total_bytes = 0;
+             if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                 cudaGetLastError();
+                 return;  // stay on the legacy single-scratch path
+             }
+-            // Leave headroom for context growth and activation spikes.
+-            budget = free_bytes > (768ull << 20) ? free_bytes - (768ull << 20) : 0;
+-        }
+-        const size_t stride = (kPayloadCapacity + kAlignment - 1) & ~(kAlignment - 1);
+-        size_t attempt = budget / stride;
+-        while (attempt > 1) {
+-            if (cudaMalloc(&device_arena_, attempt * stride) == cudaSuccess) break;
+-            cudaGetLastError();  // clear the sticky error and retry smaller
+-            attempt /= 2;
+-        }
+-        if (attempt < 2) {
+-            // A one-slot arena cannot recycle (the active slot is never its
+-            // own victim); stay on the legacy single-scratch path instead.
+-            if (device_arena_) {
+-                cudaFree(device_arena_);
+-                device_arena_ = nullptr;
+-            }
+-            return;
+-        }
++            // Headroom needs to cover only what still allocates AFTER this
++            // point: lazily resident BF16 metadata (<= the 128 MiB TensorStager
++            // budget: ~90 mHC _fn projections, conv taps, norms; ~78 MiB
++            // observed) plus first-use f32_cache_ tensors (~2 MiB) and driver
++            // slack. Everything else (dense FP8 pin_all, drafter, verify and
++            // chunk scratch, latent caches) is allocated before the first
++            // expert record reaches upload(). 256 MiB keeps >3x margin; the
++            // old flat 768 MiB strand cost 512 MiB = 38 slots on this box.
++            uint64_t headroom = 256ull << 20;
++            if (const char *env = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_HEADROOM_MB"))
++                headroom = uint64_t(std::max(0, std::atoi(env))) << 20;
++            budget = free_bytes > headroom ? free_bytes - headroom : 0;
++        }
++        const size_t stride = (kPayloadCapacity + kAlignment - 1) & ~(kAlignment - 1);
++        size_t attempt = budget / stride;
++        while (attempt > 1) {
++            if (cudaMalloc(&device_arena_, attempt * stride) == cudaSuccess) break;
++            cudaGetLastError();  // clear the sticky error and retry smaller
++            // Halving cliffs (362 -> 181 -> 90 ...); step down by 1/16 so a
++            // fragmented allocation loses a few slots, not half the tier.
++            attempt -= std::max<size_t>(attempt >> 4, 1);
++        }
++        if (attempt < 2) {
++            // A one-slot arena cannot recycle (the active slot is never its
++            // own victim); stay on the legacy single-scratch path instead.
++            if (device_arena_) {
++                cudaFree(device_arena_);
++                device_arena_ = nullptr;
++            }
++            return;
++        }
++        // The legacy single-record scratch is dead once the arena owns the
++        // slots: upload() branches on device_arena_ and never reads device_
++        // again. Return its 13.5 MiB to the pool (+1 slot equivalent).
++        if (device_) {
++            cudaFree(device_);
++            device_ = nullptr;
++        }
++        // A per-layer segment must always keep one unpinned, non-active slot
++        // or take_device_slot()'s victim scan throws on a demand record.
++        // Shed static pin keys that no longer fit instead of crashing later.
++        const int segments = std::max(1, std::min(46, int(attempt)));
++        bool shed = false;
++        while (!pinned_device_keys_.empty() &&
++               pinned_device_keys_.size() + size_t(segments) + 16 > attempt) {
++            pinned_device_keys_.erase(pinned_device_keys_.begin());
++            shed = true;
++        }
++        if (shed)
++            std::printf("expert VRAM tier: pins shed to %zu keys (arena %zu slots)\n",
++                        pinned_device_keys_.size(), attempt);
++        std::printf("expert VRAM tier: %zu slots x %.3f MiB = %.0f MiB, %d segments "
++                    "(~%.2f slots/segment), %zu pinned keys\n",
++                    attempt, stride / double(1 << 20),
++                    attempt * stride / double(1 << 20), segments,
++                    double(attempt) / segments, pinned_device_keys_.size());
+         device_stride_ = stride;
+         device_slot_count_ = int(attempt);
+         device_slot_keys_.assign(attempt, kNoKey);
+         device_slot_stamps_.assign(attempt, 0);
+         device_slot_pinned_.assign(attempt, 0);
+         device_slot_reads_.resize(attempt, nullptr);
+         for (cudaEvent_t &event : device_slot_reads_)
+             check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                   "cudaEventCreate expert slot fence");
+         // Slots are individually owned now, so copies for different records
+         // no longer alias: swap the legacy-synchronizing copy stream for a
+         // real async one and let ordering live entirely in the events.
+         cudaStreamSynchronize(copy_stream_);

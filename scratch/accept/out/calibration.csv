@@ -1,0 +1,13 @@
+quantity,value,source
+a_drafter_ms,17.5,mean draft ms/round over gen>=32 dflash runs (n=18)
+fallback_step_ms_median,643.2,"fallback_total_ms/empty_rounds, n=18 empty rounds"
+verify_ms_k4_mean,1895.7,"math variant k=4, n=94 verified rounds-pools (10 runs)"
+verify_ms_k7_mean,2781.0,"c64+vramtier k=7 gen32, n=54 verified rounds (8 runs)"
+b_two_point_ms_per_record,2.016,(V7-V4)/(d7-d4) = (2781-1896)/(1506-1067)
+a_two_point_ms,-255.1,intercept V4 - b*d4 (can be ~0; dense verify cost folds into b)
+b_k7_constrained_ms_per_record,1.835,(V7 - a_drafter)/d7 with a=17.4
+b_k4_constrained_ms_per_record,1.76,(V4 - a_drafter)/d4 with a=17.4
+b_pcie_floor_ms_per_record,0.613,13.56 MiB / 23.2 GB/s pinned H2D (all-resident floor)
+b_nvme_ms_per_record_range,2.93-3.88,13.56 MiB / measured 3.66-4.85 GB/s O_DIRECT (nvme_gbps n=12: 1.63-4.85)
+b_effective_recommended,1.8,constrained fits 1.76-1.83 agree; fallback step 640ms/336rec=1.9 corroborates
+scalar_ms_per_token,570.9,s6 documented; local re-parse median 578 (gen32 subset 566)

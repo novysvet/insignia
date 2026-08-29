@@ -1,0 +1,336 @@
+# KDA fused chunk-recurrence — patch sketch (P11 obligations honored by verbatim transplant)
+# Applies conceptually to: include/insignia_glm53.cuh, src/glm53_ops.cu, src/glm53_generate.cu
+# NOT applied anywhere by this session (hard rule: no src/ modifications). Senior-implementer sketch.
+# Every expression marked VERBATIM is a character-exact transplant from the existing kernels
+# (modulo the named pointer/index substitutions); barrier placement is transplanted with them.
+
+--- a/include/insignia_glm53.cuh
++++ b/include/insignia_glm53.cuh
+@@ -227,6 +227,28 @@ cudaError_t kda_conv_silu3(
+     bool weights_fp32 = false,
+     cudaStream_t stream = nullptr);
+ 
++// Fused KDA chunk recurrence: conv(q/k/v)+SiLU, f-gate, T-step DeltaNet
++// recurrence with the FP32 state resident in 64 KiB dynamic shared memory,
++// and the o_norm+gated output stage, all in ONE launch per layer per chunk.
++// Bit-exact replacement for the per-token kernel sequence (P11): every
++// expression tree is transplanted verbatim; only the state cell storage
++// (global -> smem) and the inter-kernel global round-trips (removed) change.
++// gate_f is the RAW f_b output (pre-gate-transform), gate_g the RAW g_b
++// output; both GEMMs must have run before this launch. q_raw/k_raw/v_raw are
++// PRE-conv projections (the archive semantics of kda_multi are preserved:
++// the kernel never writes them). conv_history is [9, width] for this layer
++// ({q,k,v} x 3 ring slots of raw pre-conv values), state is
++// [heads, head_dim, head_dim] for this layer; both are read at kernel start
++// and written back at kernel end with exactly the values the per-token
++// kernels would have left.
++cudaError_t kda_fused_chunk(
++    float *state,
++    const float *q_raw, const float *k_raw, const float *v_raw,
++    const float *gate_f, const float *gate_g, const float *beta,
++    const void *conv_q, const void *conv_k, const void *conv_v,
++    const float *dt_bias, const float *a_log, const uint16_t *norm_weight,
++    float *conv_history, float *output,
++    int tokens, int position_base,
++    int heads = kKdaHeads, int head_dim = kKdaHeadDim, bool weights_fp32 = false,
++    cudaStream_t stream = nullptr);
++
+ // Exact dense attention for the first kMlaMaxContext positions. GLM's sparse
+--- a/src/glm53_ops.cu
++++ b/src/glm53_ops.cu
+@@ -458,6 +458,160 @@ constexpr int kMlaExactContext = 256;
+ // (after kda_conv_silu3_kernel; kept adjacent so the transplant stays reviewable)
++// ---------------------------------------------------------------------------
++// Fused chunk recurrence. One block per head (gridDim.x = heads), blockDim.x
++// = HEAD_DIM: the element-parallel geometry of kda_decode_kernel is forced by
++// the determinism law (the key loops accumulate serially in ascending key
++// order; parallelizing keys would need a reduction tree = reassociation =
++// rejected). Dynamic smem carries this head's 128x128 FP32 state (64 KiB);
++// the static arrays sq/sk/decay/delta/norms/partial keep the transplanted
++// cross-thread reduction shapes; hist is the 3x3 ring of raw conv samples.
++// P11(a): smem/global round-trips of f32 are bit-preserving transports.
++// P11(b): every FP statement below is a verbatim transplant, so nvcc's
++// contraction decisions see the same expression DAG as the standalone
++// kernels; explicit fmaf() calls pin the contraction-sensitive trees.
++// P11(c): the conv keeps the exact slot indexing (position - lag) % 3 with
++// the current-first fmaf chain of kda_conv_silu3_kernel.
++// ---------------------------------------------------------------------------
++template <int HEAD_DIM, bool WEIGHTS_FP32>
++__global__ __launch_bounds__(HEAD_DIM, 1) void kda_fused_chunk_kernel(
++    float *__restrict__ state,
++    const float *__restrict__ q_raw, const float *__restrict__ k_raw,
++    const float *__restrict__ v_raw,
++    const float *__restrict__ gate_f_raw, const float *__restrict__ gate_g_raw,
++    const float *__restrict__ beta_raw,
++    const void *__restrict__ conv_q, const void *__restrict__ conv_k,
++    const void *__restrict__ conv_v,
++    const float *__restrict__ dt_bias, const float *__restrict__ a_log,
++    const uint16_t *__restrict__ norm_weight,
++    float *__restrict__ conv_history,
++    float *__restrict__ output,
++    int tokens, int position_base, int width) {
++    static_assert(HEAD_DIM == 128, "fused KDA chunk is compiled for the GLM 64x128 geometry");
++    constexpr int WARPS = HEAD_DIM / 32;
++    const int head = blockIdx.x;
++    const int element = threadIdx.x;
++    const int offset = head * HEAD_DIM;
++    const int lane = element & 31;
++    const int warp = element >> 5;
++
++    // Cross-thread scratch (transplanted shapes, 128B-aligned per AGENTS).
++    __shared__ __align__(128) float norms[2][WARPS];
++    __shared__ __align__(128) float sq[HEAD_DIM], sk[HEAD_DIM], decay[HEAD_DIM], delta[HEAD_DIM];
++    __shared__ __align__(128) float partial[8];
++    __shared__ __align__(128) float hist[3][3][HEAD_DIM]; // [segment][ring slot][element]
++
++    // The 64 KiB FP32 recurrent state in dynamic smem, manually 128B-aligned.
++    extern __shared__ unsigned char smem_raw[];
++    float *head_state = reinterpret_cast<float *>(
++        (reinterpret_cast<uintptr_t>(smem_raw) + 127) & ~uintptr_t(127));
++
++    // Per-thread invariant loads (hoisted loads are bit-preserving, P11(a)).
++    const uint16_t *conv16[3] = {static_cast<const uint16_t *>(conv_q),
++                                 static_cast<const uint16_t *>(conv_k),
++                                 static_cast<const uint16_t *>(conv_v)};
++    const float *conv32[3] = {static_cast<const float *>(conv_q),
++                              static_cast<const float *>(conv_k),
++                              static_cast<const float *>(conv_v)};
++    float taps[3][4];
++#pragma unroll
++    for (int seg = 0; seg < 3; ++seg)
++#pragma unroll
++        for (int tap = 0; tap < 4; ++tap)
++            taps[seg][tap] = WEIGHTS_FP32 ? conv32[seg][size_t(offset + element) * 4 + tap]
++                                          : bf16_to_float(conv16[seg][size_t(offset + element) * 4 + tap]);
++    const float dt_bias_v = dt_bias[offset + element];
++    const float a_log_v = a_log[head];
++    const float norm_v = bf16_value(norm_weight[element]);   // bf16_value == bf16_to_float tree
++
++    // Seed state and conv ring from global (identical bits the per-token
++    // kernels would read; conv_history_ is zero-initialized at context start).
++#pragma unroll
++    for (int key = 0; key < HEAD_DIM; ++key)
++        head_state[key * HEAD_DIM + element] =
++            state[size_t(head) * HEAD_DIM * HEAD_DIM + key * HEAD_DIM + element];
++#pragma unroll
++    for (int seg = 0; seg < 3; ++seg)
++#pragma unroll
++        for (int slot = 0; slot < 3; ++slot)
++            hist[seg][slot][element] =
++                conv_history[size_t(seg) * 3 * width + size_t(slot) * width + offset + element];
++
++    for (int t = 0; t < tokens; ++t) {
++        const int position = position_base + t;
++        const size_t row = size_t(t) * width;
++        float current[3] = {q_raw[row + offset + element],
++                            k_raw[row + offset + element],
++                            v_raw[row + offset + element]};
++
++        // ---- conv + SiLU, VERBATIM from kda_conv_silu3_kernel per segment:
++        // projection[within] -> current[seg] register, segment_history ->
++        // hist[seg], within -> offset+element. Current-first tap order and
++        // the (position - lag) % 3 slot selection are unchanged (P11(c)).
++#pragma unroll
++        for (int seg = 0; seg < 3; ++seg) {
++            float value = current[seg] * taps[seg][3];
++#pragma unroll
++            for (int lag = 1; lag <= 3; ++lag) {
++                if (position >= lag) {
++                    const int slot = (position - lag) % 3;
++                    value = fmaf(hist[seg][slot][element], taps[seg][3 - lag], value);
++                }
++            }
++            hist[seg][position % 3][element] = current[seg];
++            current[seg] = value / (1.0f + expf(-value));
++        }
++
++        // ---- f-gate, VERBATIM from kda_gate_kernel lines 349-354:
++        // forget[index] -> local forget (the global round-trip was bit-
++        // preserving); beta[head] -> local beta_v (same input bits in).
++        const float g_raw = gate_f_raw[row + offset + element];
++        const float argument = __expf(a_log_v) * (g_raw + dt_bias_v);
++        const float forget = -5.0f / (1.0f + __expf(-argument));
++        const float beta_v = 1.0f / (1.0f + __expf(-beta_raw[size_t(t) * gridDim.x + head]));
++
++        // ---- recurrence, VERBATIM from kda_decode_kernel lines 332-381:
++        // q_input/k_input/v -> current[0]/current[1]/current[2] registers,
++        // g -> forget register, beta[head] -> beta_v, state -> head_state
++        // (smem), output -> feeds the output stage in-register.
++        float q = current[0];
++        float k = current[1];
++        float qn = q * q;
++        float kn = k * k;
++        qn = warp_sum(qn);
++        kn = warp_sum(kn);
++        if (!lane) {
++            norms[0][warp] = qn;
++            norms[1][warp] = kn;
++        }
++        __syncthreads();
++        if (!element) {
++            float qsum = 0.0f, ksum = 0.0f;
++#pragma unroll
++            for (int index = 0; index < WARPS; ++index) {
++                qsum += norms[0][index];
++                ksum += norms[1][index];
++            }
++            norms[0][0] = rsqrtf(qsum + 1.0e-6f) * rsqrtf((float)HEAD_DIM);
++            norms[0][1] = rsqrtf(ksum + 1.0e-6f);
++        }
++        __syncthreads();
++        const float q_scale = norms[0][0], k_scale = norms[0][1];
++        sq[element] = q * q_scale;
++        sk[element] = k * k_scale;
++        decay[element] = expf(forget);           // VERBATIM: expf(g[...]), NOT __expf
++        __syncthreads();
++
++        float memory = 0.0f;
++#pragma unroll
++        for (int key = 0; key < HEAD_DIM; ++key) {
++            const float cell = head_state[key * HEAD_DIM + element];
++            memory = fmaf(cell * decay[key], sk[key], memory);
++        }
++        delta[element] = (current[2] - memory) * beta_v;
++        __syncthreads();
++
++        float result = 0.0f;
++#pragma unroll
++        for (int key = 0; key < HEAD_DIM; ++key) {
++            float &cell = head_state[key * HEAD_DIM + element];
++            cell = fmaf(sk[key], delta[element], cell * decay[key]);
++            result = fmaf(cell, sq[key], result);
++        }
++
++        // ---- output stage, VERBATIM from kda_output_kernel lines 366-383:
++        // core[offset+element] -> result register, gate -> gate_g_raw row,
++        // norm_weight[element] -> norm_v register; head_dim == HEAD_DIM.
++        const float value = result;
++        float square = warp_sum(value * value);
++        if (!lane) partial[warp] = square;
++        __syncthreads();
++        if (!warp) {
++            square = lane < WARPS ? partial[lane] : 0.0f;
++            square = warp_sum(square);
++            if (!lane) partial[0] = rsqrtf(square * (1.0f / float(HEAD_DIM)) + 1.0e-5f);
++        }
++        __syncthreads();
++        const float gate_value = gate_g_raw[row + offset + element];
++        output[row + offset + element] = value * partial[0] * norm_v /
++                                         (1.0f + __expf(-gate_value));
++    }
++
++    // Write the carried state and ring back with the values the per-token
++    // kernels would have left in exactly those slots.
++#pragma unroll
++    for (int key = 0; key < HEAD_DIM; ++key)
++        state[size_t(head) * HEAD_DIM * HEAD_DIM + key * HEAD_DIM + element] =
++            head_state[key * HEAD_DIM + element];
++#pragma unroll
++    for (int seg = 0; seg < 3; ++seg)
++#pragma unroll
++        for (int slot = 0; slot < 3; ++slot)
++            conv_history[size_t(seg) * 3 * width + size_t(slot) * width + offset + element] =
++                hist[seg][slot][element];
++}
++
+ constexpr int kMlaExactContext = 256;
+ 
+@@ -705,6 +859,41 @@ cudaError_t kda_conv_silu3(
+     return cudaGetLastError();
+ }
+ 
++cudaError_t kda_fused_chunk(
++    float *state,
++    const float *q_raw, const float *k_raw, const float *v_raw,
++    const float *gate_f, const float *gate_g, const float *beta,
++    const void *conv_q, const void *conv_k, const void *conv_v,
++    const float *dt_bias, const float *a_log, const uint16_t *norm_weight,
++    float *conv_history, float *output,
++    int tokens, int position_base,
++    int heads, int head_dim, bool weights_fp32, cudaStream_t stream) {
++    if (head_dim != 128 || tokens < 1) return cudaErrorInvalidValue;
++    const size_t smem = size_t(head_dim) * head_dim * sizeof(float) + 128;  // 64 KiB + align pad
++    // One-time dynamic-smem opt-in (default cap is 48 KiB; sm_89 allows 99 KiB).
++    static const bool opted = [] {
++        bool ok = cudaFuncSetAttribute(kda_fused_chunk_kernel<128, true>,
++                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                       128 * 128 * (int)sizeof(float) + 128) == cudaSuccess;
++        ok = cudaFuncSetAttribute(kda_fused_chunk_kernel<128, false>,
++                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                  128 * 128 * (int)sizeof(float) + 128) == cudaSuccess && ok;
++        return ok;
++    }();
++    if (!opted) return cudaErrorInvalidValue;
++    const int width = heads * head_dim;
++    if (weights_fp32)
++        kda_fused_chunk_kernel<128, true><<<heads, 128, smem, stream>>>(
++            state, q_raw, k_raw, v_raw, gate_f, gate_g, beta, conv_q, conv_k, conv_v,
++            dt_bias, a_log, norm_weight, conv_history, output, tokens, position_base, width);
++    else
++        kda_fused_chunk_kernel<128, false><<<heads, 128, smem, stream>>>(
++            state, q_raw, k_raw, v_raw, gate_f, gate_g, beta, conv_q, conv_k, conv_v,
++            dt_bias, a_log, norm_weight, conv_history, output, tokens, position_base, width);
++    return cudaGetLastError();
++}
++
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -2015,6 +2015,8 @@
+         c_gate_.reset(size_t(kMaxChunk) * kda_width_);
++        // g-branch gate buffer: the fused kernel needs the raw f-gate and
++        // the raw g-gate simultaneously; gate_8192_/c_gate_ reuse would clobber.
++        c_ggate_.reset(size_t(kMaxChunk) * kda_width_);
+@@ -2257,0 +2259,3 @@
++    bool kda_fused_on_ = false;   // INSIGNIA_GLM53_KDA_FUSED A/B (parity gate)
++    static bool kda_fused_enabled() {
++        static const bool on = std::getenv("INSIGNIA_GLM53_KDA_FUSED") != nullptr;
++        return on;
++    }
+@@ -3264,6 +3268,14 @@ void Runner::kda_multi(int layer, const float *input, float *output, int tokens, int position_base) {
+     const std::string stem = layer_stem(layer) + "self_attn.";
+     const int width = kda_width_;
++    if (kda_fused_enabled() && kda_head_dim_ == 128)
++        return kda_fused_multi(layer, input, output, tokens, position_base);
+     float *history = conv_history_.get() + size_t(layer) * 9 * width;
+     ...
+ 
++// Fused KDA prefill: identical GEMM set, g_a/g_b moved before the recurrence
++// (they depend only on the layer input, so the move changes no FP value),
++// then ONE launch replaces the 6-per-token kernel storm (3 conv + gate +
++// decode + output). kda_arch_ row copies stay host-side (pure D2D reads of
++// GEMM outputs, order-irrelevant). rollback_kda is intentionally left on the
++// per-token path: it is the bit-exactness oracle for the fused path.
++void Runner::kda_fused_multi(int layer, const float *input, float *output,
++                             int tokens, int position_base) {
++    const std::string stem = layer_stem(layer) + "self_attn.";
++    const int width = kda_width_;
++    float *history = conv_history_.get() + size_t(layer) * 9 * width;
++    const bool conv_fp32 = model_.tensor(stem + "q_conv1d.weight").type == TensorType::f32;
++    const void *conv_q = stager_.load(stem + "q_conv1d.weight");
++    const void *conv_k = stager_.load(stem + "k_conv1d.weight");
++    const void *conv_v = stager_.load(stem + "v_conv1d.weight");
++    linear_multi(stem + "q_proj.weight", input, c_q_, tokens, width, hidden_);
++    if (kda_archive_) archive_kda_rows(layer, c_q_, tokens, 0);
++    linear_multi(stem + "k_proj.weight", input, c_k_, tokens, width, hidden_);
++    if (kda_archive_) archive_kda_rows(layer, c_k_, tokens, 1);
++    linear_multi(stem + "v_proj.weight", input, c_v_, tokens, width, hidden_);
++    if (kda_archive_) archive_kda_rows(layer, c_v_, tokens, 2);
++    linear_multi(stem + "f_a_proj.weight", input, c_small_, tokens, f_a_rows_, hidden_);
++    linear_multi(stem + "f_b_proj.weight", c_small_, c_gate_, tokens, width, f_a_rows_);
++    if (kda_archive_) archive_kda_rows(layer, c_gate_, tokens, 3);
++    linear_multi(stem + "b_proj.weight", input, c_beta_, tokens, kda_heads_, hidden_);
++    if (kda_archive_) archive_kda_rows(layer, c_beta_, tokens, 4);
++    // Moved before the fused launch (was after the recurrence loop):
++    linear_multi(stem + "g_a_proj.weight", input, c_small_, tokens, f_a_rows_, hidden_);
++    linear_multi(stem + "g_b_proj.weight", c_small_, c_ggate_, tokens, width, f_a_rows_);
++    const float *dt_bias = device_f32(stem + "dt_bias");
++    const float *a_log = device_f32(stem + "A_log");
++    const uint16_t *norm = reinterpret_cast<const uint16_t *>(stager_.load(stem + "o_norm.weight"));
++    float *state = kda_states_.get() + size_t(layer) * width * kda_head_dim_;
++    check(insignia::glm53::kda_fused_chunk(
++          state, c_q_.get(), c_k_.get(), c_v_.get(), c_gate_.get(), c_ggate_.get(),
++          c_beta_.get(), conv_q, conv_k, conv_v, dt_bias, a_log, norm,
++          history, c_proj_.get(), tokens, position_base,
++          kda_heads_, kda_head_dim_, conv_fp32), "KDA fused chunk recurrence");
++    linear_multi(stem + "o_proj.weight", c_proj_, output, tokens, hidden_, width);
++}

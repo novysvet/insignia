@@ -38,6 +38,7 @@ def load_cases(args, tokenizer):
     }
     maximum = 257 - args.generate
     selected = []
+    slots = args.offset + args.samples
     for dataset, rows in datasets.items():
         eligible = []
         for problem, index in rows:
@@ -45,10 +46,14 @@ def load_cases(args, tokenizer):
             if len(ids) <= maximum:
                 eligible.append((len(ids), index, problem, ids))
         eligible.sort()
-        if len(eligible) < args.samples:
+        if len(eligible) < slots:
             raise RuntimeError(f"{dataset} has only {len(eligible)} eligible prompts")
-        for ordinal in range(args.samples):
-            rank = round((ordinal + 1) * (len(eligible) - 1) / (args.samples + 1))
+        # Ranks slot into 1..len(eligible)-1 by quantile; --offset skips the
+        # first `offset` picks, so --offset 0/2 with --samples 2 partitions
+        # exactly the same slice set as one --samples 4 run, and slices stay
+        # disjoint across waves (distinct prompts per wave).
+        for ordinal in range(args.offset, slots):
+            rank = round((ordinal + 1) * (len(eligible) - 1) / (slots + 1))
             length, index, problem, ids = eligible[rank]
             selected.append({
                 "dataset": dataset,
@@ -173,6 +178,8 @@ def main():
     parser.add_argument("--output", type=pathlib.Path,
                         default=pathlib.Path("/var/lib/insignia/bench-results/math"))
     parser.add_argument("--samples", type=int, default=2)
+    parser.add_argument("--offset", type=int, default=0,
+                        help="skip the first OFFSET quantile picks (disjoint prompt slices)")
     parser.add_argument("--generate", type=int, default=32)
     parser.add_argument("--verify-k", type=int, default=7)
     parser.add_argument("--cache-mb", type=int, default=32768)

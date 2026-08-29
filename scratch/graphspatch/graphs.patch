@@ -1,0 +1,661 @@
+# CUDA-graph capture for the DFlash2 decode/verify hot path (DRAFT, NOT APPLIED)
+#
+# Base: 1359c43 (2026-08-29). Region analysis, vetoed regions, savings
+# arithmetic, integration checklist and the fallback contract are in the
+# accompanying review message; this file is only the diff. Hunk headers were
+# hand-computed against the files as of the base commit; expect `git apply
+# --recount` to normalize counts.
+#
+# Determinism argument (the law, applied to graphs): a graph captured from a
+# single stream records the exact kernel nodes (function, grid, block, shared
+# memory, parameter bytes) in the recorded stream order and replays them as
+# that same chain - nothing is fused, reordered, or re-associated. Every
+# kernel sees bit-identical inputs because the only per-round scalars
+# (anchor_position / ctx_len / RoPE pos0) move from by-value kernel arguments
+# to a pinned host scalar whose H2D copy is the first node of the graph:
+# replays re-read the pinned integer, so the kernels compute with the very
+# integers they used to receive by value. The replay stream is
+# legacy-synchronizing (cudaStreamCreate), preserving today's fully
+# serialized execution order. Acceptance test = the parity gate: greedy IDs,
+# digit-identical top-10 logits, 30/40/100/240-token sequence checks.
+#
+# Regions captured:
+#   R1 "df-forward" : 5-layer drafter block forward          144 kernels + 1 D2D memcpy
+#   R2 "df-head"    : 7x lm_head FP8 GEMV on draft hiddens    14 kernels
+#   R3 "verify-tail": avg-streams + final RMS + lm_head rows  1 + 3*count kernels
+#                     (keyed by count; padding to 8 was analyzed and rejected:
+#                      bit-safe but multiplies lm_head traffic by 8/count)
+# Regions deliberately NOT captured (host data-dependent control flow, see
+# message): sparse_moe / moe_multi / mtp_moe expert chains, router downloads,
+# ExpertStager upload loops, MLA latent path (grid varies with position),
+# KDA chains (need position indirection; phase 2).
+#
+# Env surface: INSIGNIA_GLM53_GRAPHS=0 hard-disables; any DF_DUMP / DF_LTRACE
+# / DF_ITRACE / CHECK_LINEAR session silently keeps the uncaptured path.
+
+diff --git a/include/insignia_glm53_dflash2.cuh b/include/insignia_glm53_dflash2.cuh
+--- a/include/insignia_glm53_dflash2.cuh
++++ b/include/insignia_glm53_dflash2.cuh
+@@ -10,6 +10,7 @@
+ // exact, so committed tokens always match plain greedy decode.
+
++#include <cuda_runtime.h>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -47,10 +48,25 @@ public:
+     // Copy one staged BF16 target-embedding row (4096 elems, device) into the
+     // block buffer; call for t=0 (anchor) then t=1..7 (mask rows) before
+     // forward().
+-    void set_block_row(int t, const uint16_t *device_row);
++    void set_block_row(int t, const uint16_t *device_row, cudaStream_t stream = nullptr);
+
+     // Block forward for `anchor` (token id, dumped for the NumPy oracle)
+     // whose committed K/V context covers positions 0..anchor_position.
+     // Leaves the 7 draft hiddens (mask positions) in device memory; read
+     // them with draft_hidden().
+-    void forward(int anchor, int anchor_position);
++    // stream != nullptr routes every launch onto that stream (CUDA-graph
++    // capture support); nullptr keeps the legacy default stream.
++    void forward(int anchor, int anchor_position, cudaStream_t stream = nullptr);
++
++    // CUDA-graph replay of forward(): the whole 5-layer block is one graph
++    // (shapes are compile-time constants, so no shape-class key is needed).
++    // anchor_position varies per round and is delivered through a pinned host
++    // scalar + captured H2D memcpy node (re-read at every replay), so no
++    // re-capture and no cudaGraphExecUpdate ever happens. The pinned scalar
++    // is refreshed even on the disabled/fallback paths so an uncaptured
++    // forward() still reads the correct position. Returns true when the
++    // forward has been launched (graph replay or warm-up pass); false means
++    // the caller must run forward() itself - the silent-fallback contract.
++    bool forward_graphed(int anchor, int anchor_position, cudaStream_t stream);
+
+     // Append `count` committed tokens' captured target features (the buffer
+     // behind capture_row, filled by the Runner at layers 5/14/24/33/42) to
+@@ -117,6 +133,13 @@ private:
+     float *hp_dev_ = nullptr;      // [kDrafts, kRank]
+     void *workspace_ = nullptr;    // fp8 activation quantization scratch
++
++    // Graph-replay state (see forward_graphed). Every address baked into the
++    // graph is a constructor-time cudaMalloc, so baked pointers never dangle.
++    cudaGraphExec_t forward_exec_ = nullptr;
++    int *pos_pinned_ = nullptr;    // pinned host scalar: anchor position
++    int *pos_dev_ = nullptr;       // device mirror read by rope/attn kernels
++    int forward_uses_ = 0;
++    bool graphs_broken_ = false;
+ };
+
+ }  // namespace insignia::glm53
+diff --git a/src/glm53_dflash2.cu b/src/glm53_dflash2.cu
+--- a/src/glm53_dflash2.cu
++++ b/src/glm53_dflash2.cu
+@@ -111,10 +111,15 @@ __global__ void df_conv_kernel(const float *__restrict__ x, const float *__restr
+ // Per-head RMSNorm (head_dim 128) + neox RoPE (pairs (i, i+64), freq index =
+ // i) for q rows [rows, heads*128] or k rows [rows, kvh*128]. One warp per
+ // (row, head); lane l owns dims l, l+32, l+64, l+96 so both rope pairs are
+ // lane-local.
++// pos0 is read from device memory so a captured graph stays valid as the
++// anchor advances; the dereferenced integer is identical to the old
++// by-value argument (bit-exact by construction).
+ template <int HEADS>
+ __global__ void df_norm_rope_kernel(float *__restrict__ x, const float *__restrict__ w,
+-                                    int pos0, int rows) {
++                                    const int *__restrict__ pos0_dev, int rows) {
+     const int warp_id = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+     const int lane = threadIdx.x & 31;
+     const int row = warp_id / HEADS, head = warp_id % HEADS;
+@@ -127,7 +132,7 @@ __global__ void df_norm_rope_kernel(float *__restrict__ x, const float *__restr
+     v[2] = v[2] * inv * w[lane + 64];
+     v[3] = v[3] * inv * w[lane + 96];
+-    const float pos = float(pos0 + row);
++    const float pos = float(*pos0_dev + row);
+     const float a0 = pos * c_rope_freq[lane], a1 = pos * c_rope_freq[lane + 32];
+     const float c0 = __cosf(a0), s0 = __sinf(a0), c1 = __cosf(a1), s1 = __sinf(a1);
+     // pair (d, d+64): rot(d) = d*cos - (d+64)*sin; rot(d+64) = (d+64)*cos + d*sin
+@@ -144,8 +149,10 @@ __global__ void df_attn_kernel(const float *__restrict__ q,      // [8, 32*128]
+                                const float *__restrict__ kblk,    // [8, 8*128]
+                                const float *__restrict__ vblk,
+                                float *__restrict__ out,           // [8, 32*128]
+-                               int layer, int ctx_len) {
++                               int layer, const int *__restrict__ pos_dev) {
++    // ctx_len = anchor_position + 1 committed cache rows, read from device
++    // memory so a captured graph replays with the fresh value (bit-exact:
++    // same integer, same loop trip counts, same FP sequence).
+     const int warp_id = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+     const int lane = threadIdx.x & 31;
+     const int t = warp_id >> 5, h = warp_id & 31;
+     const int kvh = h >> 2;
+-    const int keys = ctx_len + DFlash2Drafter::kBlock;
++    const int ctx_len = *pos_dev + 1;
++    const int keys = ctx_len + DFlash2Drafter::kBlock;
+     __shared__ float tile[8][DFlash2Drafter::kMaxCtx];
+     __shared__ float scale_inv;
+     if (threadIdx.x == 0) scale_inv = rsqrtf(128.f);
+@@ -424,9 +431,10 @@ float *DFlash2Drafter::capture_row(int capture_idx, int token) {
+     return capture_ + (size_t(capture_idx) * kMaxTokens + token) * kHidden;
+ }
+
+-void DFlash2Drafter::set_block_row(int t, const uint16_t *device_row) {
+-    df_embed_row_kernel<<<8, 512>>>(device_row, x_block_ + size_t(t) * kHidden);
++void DFlash2Drafter::set_block_row(int t, const uint16_t *device_row, cudaStream_t stream) {
++    df_embed_row_kernel<<<8, 512, 0, stream>>>(device_row, x_block_ + size_t(t) * kHidden);
+     check(cudaGetLastError(), "df embed row launch");
+ }
+
+-void DFlash2Drafter::forward(int anchor, int anchor_position) {
++void DFlash2Drafter::forward(int anchor, int anchor_position, cudaStream_t stream) {
+     static const bool ltrace = std::getenv("INSIGNIA_GLM53_DF_LTRACE") != nullptr;
+     static const bool itrace = std::getenv("INSIGNIA_GLM53_DF_ITRACE") != nullptr;
+@@ -474,6 +482,16 @@ void DFlash2Drafter::forward(int anchor, int anchor_position) {
+         std::fwrite(&anchor_position, sizeof(anchor_position), 1, dump);
+         std::fflush(dump);
+     }
+     const int ctx_len = anchor_position + 1;
++    // Per-round scalar parameters flow through the pinned->device copy so a
++    // captured graph replays with fresh values: the kernels read the same
++    // integers they used to receive by value, so the FP sequence is
++    // unchanged. pos_dev_ is null until the first forward_graphed() call;
++    // before that (and on fallback paths) the caller-refreshed pinned value
++    // keeps uncaptured runs correct.
++    if (pos_dev_)
++        check(cudaMemcpyAsync(pos_dev_, pos_pinned_, sizeof(int),
++                              cudaMemcpyHostToDevice, stream), "df pos upload");
+     trace_layer(-1);
+     for (int l = 0; l < kLayers; ++l) {
+         // attention sublayer
+         df_rms_rows_kernel<<<dim3(2, kBlock), 256, 256 * sizeof(float)>>>(
+             x_block_, input_ln_[l], xn_, kBlock, kHidden);
+         check(cudaGetLastError(), "df rms launch");
+         trace_stage(l, 0, xn_, kBlock, kHidden);
+         check(fp8_tc_gemv_batch(akp_[l].w, akp_[l].s, xn_, dyn_, kBlock, akp_[l].rows,
+-                                kHidden, 1024, workspace_), "df akp gemv");
++                                kHidden, 1024, workspace_, stream), "df akp gemv");
+         trace_stage(l, 1, dyn_, kBlock, 1024);
+-        df_conv_kernel<0><<<128, 256>>>(xn_, dyn_, conv_base_[2 * l], branch_, dyn1_, kBlock);
++        df_conv_kernel<0><<<128, 256, 0, stream>>>(xn_, dyn_, conv_base_[2 * l], branch_, dyn1_, kBlock);
+         check(cudaGetLastError(), "df conv prepare");
+         trace_stage(l, 2, branch_, kBlock, kHidden);
+         check(fp8_tc_gemv_batch(q_[l].w, q_[l].s, branch_, qbuf_, kBlock, q_[l].rows,
+-                                kHidden, kQHeads * kHeadDim, workspace_), "df q gemv");
++                                kHidden, kQHeads * kHeadDim, workspace_, stream), "df q gemv");
+         check(fp8_tc_gemv2_batch(k_[l].w, k_[l].s, v_[l].w, v_[l].s,
+                                  branch_, kblk_, vblk_, kBlock, k_[l].rows,
+-                                 kHidden, kKVHeads * kHeadDim, workspace_),
++                                 kHidden, kKVHeads * kHeadDim, workspace_, stream),
+               "df kv gemv batch pair");
+         trace_stage(l, 3, qbuf_, kBlock, kQHeads * kHeadDim);
+         trace_stage(l, 4, kblk_, kBlock, kKVHeads * kHeadDim);
+         trace_stage(l, 5, vblk_, kBlock, kKVHeads * kHeadDim);
+-        df_norm_rope_kernel<32><<<32, 256>>>(qbuf_, q_norm_[l], anchor_position, kBlock);
+-        df_norm_rope_kernel<8><<<8, 256>>>(kblk_, k_norm_[l], anchor_position, kBlock);
++        df_norm_rope_kernel<32><<<32, 256, 0, stream>>>(qbuf_, q_norm_[l], pos_dev_, kBlock);
++        df_norm_rope_kernel<8><<<8, 256, 0, stream>>>(kblk_, k_norm_[l], pos_dev_, kBlock);
+         check(cudaGetLastError(), "df norm rope");
+         trace_stage(l, 6, qbuf_, kBlock, kQHeads * kHeadDim);
+         trace_stage(l, 7, kblk_, kBlock, kKVHeads * kHeadDim);
+         trace_stage(l, 21, kcache_ + size_t(l) * 264 * 1024, ctx_len,
+                     kKVHeads * kHeadDim);
+         trace_stage(l, 22, vcache_ + size_t(l) * 264 * 1024, ctx_len,
+                     kKVHeads * kHeadDim);
+-        df_attn_kernel<<<32, 256>>>(qbuf_, kcache_, vcache_, kblk_, vblk_, branch_, l, ctx_len);
++        df_attn_kernel<<<32, 256, 0, stream>>>(qbuf_, kcache_, vcache_, kblk_, vblk_,
++                                               branch_, l, pos_dev_);
+         check(cudaGetLastError(), "df attn");
+         trace_stage(l, 8, branch_, kBlock, kHidden);
+         check(fp8_tc_gemv_batch(o_[l].w, o_[l].s, branch_, sub_, kBlock, o_[l].rows,
+-                                kHidden, kHidden, workspace_), "df o gemv");
++                                kHidden, kHidden, workspace_, stream), "df o gemv");
+         trace_stage(l, 9, sub_, kBlock, kHidden);
+-        df_conv_kernel<1><<<128, 256>>>(sub_, dyn1_, conv_base_[2 * l], branch_, nullptr, kBlock);
++        df_conv_kernel<1><<<128, 256, 0, stream>>>(sub_, dyn1_, conv_base_[2 * l], branch_, nullptr, kBlock);
+         check(cudaGetLastError(), "df conv finish");
+         trace_stage(l, 10, branch_, kBlock, kHidden);
+-        df_add_kernel<<<128, 256>>>(x_block_, branch_, kBlock * kHidden);
++        df_add_kernel<<<128, 256, 0, stream>>>(x_block_, branch_, kBlock * kHidden);
+         trace_stage(l, 11, x_block_, kBlock, kHidden);
+
+         // MLP sublayer
+         df_rms_rows_kernel<<<dim3(2, kBlock), 256, 256 * sizeof(float)>>>(
+             x_block_, post_ln_[l], xn_, kBlock, kHidden);
+         check(cudaGetLastError(), "df rms 2 launch");
+         trace_stage(l, 12, xn_, kBlock, kHidden);
+         check(fp8_tc_gemv_batch(mkp_[l].w, mkp_[l].s, xn_, dyn_, kBlock, mkp_[l].rows,
+-                                kHidden, 1024, workspace_), "df mkp gemv");
++                                kHidden, 1024, workspace_, stream), "df mkp gemv");
+         trace_stage(l, 13, dyn_, kBlock, 1024);
+-        df_conv_kernel<0><<<128, 256>>>(xn_, dyn_, conv_base_[2 * l + 1], branch_, dyn1_, kBlock);
++        df_conv_kernel<0><<<128, 256, 0, stream>>>(xn_, dyn_, conv_base_[2 * l + 1], branch_, dyn1_, kBlock);
+         check(cudaGetLastError(), "df conv prepare 2");
+         trace_stage(l, 14, branch_, kBlock, kHidden);
+         check(fp8_tc_gemv2_batch(gate_[l].w, gate_[l].s, up_[l].w, up_[l].s,
+                                  branch_, gbuf_, ubuf_, kBlock, gate_[l].rows,
+-                                 kHidden, kIntermediate, workspace_),
++                                 kHidden, kIntermediate, workspace_, stream),
+               "df gate/up batch pair");
+         trace_stage(l, 15, gbuf_, kBlock, kIntermediate);
+         trace_stage(l, 16, ubuf_, kBlock, kIntermediate);
+-        df_silu_mul_kernel<<<(kBlock * kIntermediate + 255) / 256, 256>>>(
++        df_silu_mul_kernel<<<(kBlock * kIntermediate + 255) / 256, 256, 0, stream>>>(
+             gbuf_, ubuf_, gbuf_, kBlock * kIntermediate);
+         trace_stage(l, 17, gbuf_, kBlock, kIntermediate);
+         check(fp8_tc_gemv_batch(down_[l].w, down_[l].s, gbuf_, sub_, kBlock, down_[l].rows,
+-                                kIntermediate, kHidden, workspace_), "df down gemv");
++                                kIntermediate, kHidden, workspace_, stream), "df down gemv");
+         trace_stage(l, 18, sub_, kBlock, kHidden);
+-        df_conv_kernel<1><<<128, 256>>>(sub_, dyn1_, conv_base_[2 * l + 1], branch_, nullptr, kBlock);
++        df_conv_kernel<1><<<128, 256, 0, stream>>>(sub_, dyn1_, conv_base_[2 * l + 1], branch_, nullptr, kBlock);
+         check(cudaGetLastError(), "df conv finish 2");
+         trace_stage(l, 19, branch_, kBlock, kHidden);
+-        df_add_kernel<<<128, 256>>>(x_block_, branch_, kBlock * kHidden);
++        df_add_kernel<<<128, 256, 0, stream>>>(x_block_, branch_, kBlock * kHidden);
+         trace_stage(l, 20, x_block_, kBlock, kHidden);
+         trace_layer(l);
+     }
+@@ -550,10 +668,12 @@ void DFlash2Drafter::forward(int anchor, int anchor_position) {
+     // copy rows 1..7 by addressing xn_ rows directly through a strided rms).
+     df_rms_rows_kernel<<<dim3(2, kBlock), 256, 256 * sizeof(float)>>>(
+         x_block_, final_norm_, xn_, kBlock, kHidden);
+     check(cudaGetLastError(), "df final norm");
+     check(cudaMemcpyAsync(hidden_, xn_ + kHidden, size_t(kDrafts) * kHidden * sizeof(float),
+-                          cudaMemcpyDeviceToDevice), "df hidden copy");
++                          cudaMemcpyDeviceToDevice, stream), "df hidden copy");
+     check(fp8_tc_gemv_batch(hp_.w, hp_.s, hidden_, hp_dev_, kDrafts, hp_.rows, kHidden,
+-                            kRank, workspace_), "df hp gemv");
++                            kRank, workspace_, stream), "df hp gemv");
+     if (FILE *dump = df_dump_file()) {
+@@ -577,6 +697,73 @@ void DFlash2Drafter::forward(int anchor, int anchor_position) {
+         std::fflush(dump);
+     }
+ }
++
++// One captured graph for the whole 5-layer block forward: 144 kernel nodes +
++// 1 D2D memcpy node (see the header). Any failure permanently disables the
++// graph for this drafter and the caller re-runs forward() uncaptured, which
++// issues the identical kernel sequence - the fallback is bit-exact.
++bool DFlash2Drafter::forward_graphed(int anchor, int anchor_position, cudaStream_t stream) {
++    static const bool enabled = [] {
++        const char *value = std::getenv("INSIGNIA_GLM53_GRAPHS");
++        return !value || std::atoi(value) != 0;
++    }();
++    if (!pos_pinned_) {
++        if (cudaHostAlloc(&pos_pinned_, sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
++            cudaMalloc(&pos_dev_, sizeof(int)) != cudaSuccess) {
++            pos_pinned_ = nullptr;   // alloc pair is all-or-nothing
++            graphs_broken_ = true;
++            return false;
++        }
++    }
++    // Refresh FIRST so every early-out below still leaves a correct pinned
++    // value for an uncaptured forward() (pos_dev_ keeps the old argument
++    // semantics via the captured memcpy node inside forward()).
++    *pos_pinned_ = anchor_position;
++    // Trace/dump modes interleave synchronous downloads inside forward(); a
++    // capture would invalidate. Those sessions keep the uncaptured path.
++    if (!enabled || graphs_broken_ || df_dump_file() ||
++        std::getenv("INSIGNIA_GLM53_DF_LTRACE") || std::getenv("INSIGNIA_GLM53_DF_ITRACE"))
++        return false;
++    if (forward_exec_) {
++        if (cudaGraphLaunch(forward_exec_, stream) != cudaSuccess) {
++            graphs_broken_ = true;
++            return false;
++        }
++        return true;
++    }
++    // One warm-up pass resolves the static env probes inside forward() before
++    // anything is recorded (all drafter allocations are constructor-time, so a
++    // single pass suffices).
++    if (forward_uses_++ == 0) {
++        forward(anchor, anchor_position, stream);
++        return true;
++    }
++    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
++        graphs_broken_ = true;
++        return false;
++    }
++    bool threw = false;
++    try {
++        forward(anchor, anchor_position, stream);
++    } catch (...) {
++        threw = true;
++    }
++    cudaGraph_t graph = nullptr;
++    const cudaError_t ended = cudaStreamEndCapture(stream, &graph);
++    if (threw || ended != cudaSuccess || !graph) {
++        if (graph) cudaGraphDestroy(graph);
++        graphs_broken_ = true;
++        return false;  // capture invalidated: nothing executed, caller re-runs
++    }
++    if (cudaGraphInstantiateWithFlags(&forward_exec_, graph, 0) != cudaSuccess) {
++        cudaGraphDestroy(graph);
++        forward_exec_ = nullptr;
++        graphs_broken_ = true;
++        return false;
++    }
++    cudaGraphDestroy(graph);
++    if (cudaGraphLaunch(forward_exec_, stream) != cudaSuccess) {
++        graphs_broken_ = true;
++        return false;
++    }
++    return true;
++}
+
+ void DFlash2Drafter::commit(int count, int pos0) {
+@@ -418,6 +605,10 @@ DFlash2Drafter::~DFlash2Drafter() {
+     cudaFree(hp_dev_); cudaFree(workspace_);
++    if (forward_exec_) cudaGraphExecDestroy(forward_exec_);
++    if (pos_dev_) cudaFree(pos_dev_);
++    if (pos_pinned_) cudaFreeHost(pos_pinned_);
+ }
+diff --git a/src/glm53_generate.cu b/src/glm53_generate.cu
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -62,6 +62,96 @@ void require(bool condition, const std::string &message) {
+     if (!condition) throw std::runtime_error(message);
+ }
+
++// ---------------------------------------------------------------------------
++// CUDA graph scaffolding (INSIGNIA_GLM53_GRAPHS=0 disables everywhere).
++//
++// Protocol per region: one uncaptured warm-up pass (resolves lazy residency:
++// Q8/BF16 stager resident maps, f32_cache_, static env probes), then one
++// capture pass (cudaStreamCaptureModeThreadLocal - the ExpertStager reader
++// pool and copy_stream_ keep issuing async copies from other threads, which
++// ThreadLocal mode tolerates), then perpetual cudaGraphLaunch. Any failure
++// marks the region broken and the caller re-runs the region uncaptured, so
++// the executed kernel sequence is exactly what today's code issues.
++//
++// Constraints honored by every region body:
++//  - only stream-ordered work on the passed stream (kernel launches,
++//    cudaMemcpyAsync with fixed pinned/device addresses, cudaMemsetAsync);
++//    a synchronous cudaMemcpy or a default-stream op would invalidate capture;
++//  - no cudaMalloc inside a region (warm-up allocates any lazy residency);
++//  - all addresses baked into the graph are process-lifetime allocations
++//    (resident FP8 cache, drafter buffers, Runner scratch) - the resident
++//    maps are append-only, so baked pointers never dangle.
++// ---------------------------------------------------------------------------
++class GraphRegion {
++public:
++    GraphRegion() = default;
++    ~GraphRegion() {
++        if (exec_) cudaGraphExecDestroy(exec_);
++    }
++    GraphRegion(const GraphRegion &) = delete;
++    GraphRegion &operator=(const GraphRegion &) = delete;
++
++    // Launch `body` as a replayed graph. Returns true when the work has been
++    // launched (graph replay, the capture-round cudaGraphLaunch, or a
++    // warm-up pass); false means graphs are unusable and the caller must run
++    // the region itself on the legacy default stream.
++    template <typename Body>
++    bool run(cudaStream_t stream, Body &&body) {
++        if (broken_ || !graphs_supported()) return false;
++        if (exec_) {
++            if (cudaGraphLaunch(exec_, stream) != cudaSuccess) {
++                broken_ = true;
++                return false;
++            }
++            return true;
++        }
++        if (uses_++ < kWarmups) {
++            body(stream);
++            return true;
++        }
++        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
++            broken_ = true;
++            return false;
++        }
++        bool threw = false;
++        try {
++            body(stream);
++        } catch (...) {
++            threw = true;
++        }
++        cudaGraph_t graph = nullptr;
++        const cudaError_t ended = cudaStreamEndCapture(stream, &graph);
++        if (threw || ended != cudaSuccess || !graph) {
++            if (graph) cudaGraphDestroy(graph);
++            broken_ = true;
++            return false;  // capture invalidated: nothing executed, re-run
++        }
++        if (cudaGraphInstantiateWithFlags(&exec_, graph, 0) != cudaSuccess) {
++            cudaGraphDestroy(graph);
++            exec_ = nullptr;
++            broken_ = true;
++            return false;
++        }
++        cudaGraphDestroy(graph);
++        if (cudaGraphLaunch(exec_, stream) != cudaSuccess) {
++            broken_ = true;
++            return false;
++        }
++        return true;
++    }
++
++private:
++    static constexpr int kWarmups = 1;
++    static bool graphs_supported() {
++        static const bool supported = [] {
++            const char *value = std::getenv("INSIGNIA_GLM53_GRAPHS");
++            if (value && !std::atoi(value)) return false;
++            // The linear-debug hook downloads synchronously per GEMV; keep
++            // those sessions fully uncaptured.
++            if (std::getenv("INSIGNIA_GLM53_CHECK_LINEAR")) return false;
++            // Minimal WSL2/driver smoke test: capture -> instantiate ->
++            // launch -> sync. WSL graph support is verified, not assumed.
++            cudaStream_t stream = nullptr;
++            int *pinned = nullptr, *device = nullptr;
++            cudaGraph_t graph = nullptr;
++            cudaGraphExec_t exec = nullptr;
++            bool ok = cudaStreamCreate(&stream) == cudaSuccess &&
++                      cudaHostAlloc(&pinned, sizeof(int), cudaHostAllocDefault) == cudaSuccess &&
++                      cudaMalloc(&device, sizeof(int)) == cudaSuccess &&
++                      cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
++            if (ok) {
++                // Async pinned->device memcpy is a legal captured node; the
++                // synchronous cudaMemcpy form would invalidate the capture.
++                cudaMemcpyAsync(device, pinned, sizeof(int),
++                                cudaMemcpyHostToDevice, stream);
++                ok = cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph &&
++                     cudaGraphInstantiateWithFlags(&exec, graph, 0) == cudaSuccess &&
++                     cudaGraphLaunch(exec, stream) == cudaSuccess &&
++                     cudaStreamSynchronize(stream) == cudaSuccess;
++            }
++            if (exec) cudaGraphExecDestroy(exec);
++            if (graph) cudaGraphDestroy(graph);
++            if (device) cudaFree(device);
++            if (pinned) cudaFreeHost(pinned);
++            if (stream) cudaStreamDestroy(stream);
++            if (!ok)
++                std::fprintf(stderr, "glm53: CUDA graphs unavailable, running uncaptured\n");
++            return ok;
++        }();
++        return supported;
++    }
++    cudaGraphExec_t exec_ = nullptr;
++    int uses_ = 0;
++    bool broken_ = false;
++};
++
+ void debug_linear_output(std::string_view name, const float *device, int count) {
+@@ -490,8 +580,9 @@ void launch_rms(const float *input, const uint16_t *weight, float *output, int r
+-void launch_rms(const float *input, const uint16_t *weight, float *output, int rows, int cols) {
+-    rms_bf16_kernel<<<rows, 256>>>(input, weight, output, rows, cols);
++void launch_rms(const float *input, const uint16_t *weight, float *output, int rows, int cols,
++                cudaStream_t stream = nullptr) {
++    rms_bf16_kernel<<<rows, 256, 0, stream>>>(input, weight, output, rows, cols);
+     check(cudaGetLastError(), "RMSNorm launch");
+ }
+
+@@ -2074,6 +2165,15 @@ class Runner {
+         load_cct();
++        // Graph replay stream. Deliberately created with cudaStreamCreate
++        // (NOT NonBlocking): it keeps legacy-synchronizing semantics with the
++        // default stream, so region launches order exactly like today's
++        // serialized launches - no bridging events needed, and the executed
++        // order (hence the FP order) is unchanged.
++        check(cudaStreamCreate(&graph_stream_), "create graph stream");
+         if (stager_.resident_bytes() || (q8_stager_ && q8_stager_->resident_bytes()))
+             std::printf("resident: %llu MiB BF16 + %llu MiB %s pinned in VRAM\n",
+                         (unsigned long long)(stager_.resident_bytes() >> 20),
+@@ -2125,14 +2225,16 @@ private:
+-    void linear(std::string_view name, const float *input, float *output, int rows, int cols);
++    void linear(std::string_view name, const float *input, float *output, int rows, int cols,
++                cudaStream_t stream = nullptr);
+     void linear_pair(std::string_view name_a, std::string_view name_b, const float *input,
+                      float *out_a, float *out_b, int rows, int cols);
+     void linear_multi(std::string_view name, const float *inputs, float *outputs,
+                       int tokens, int rows, int cols);
+     void linear_rows(std::string_view name, const TensorLocation &weight, uint64_t row, int rows,
+                      const float *input, float *output, int cols);
+-    void rms(std::string_view weight, const float *input, float *output, int rows, int cols);
++    void rms(std::string_view weight, const float *input, float *output, int rows, int cols,
++             cudaStream_t stream = nullptr);
+
+@@ -2213,6 +2315,14 @@ private:
+     std::unique_ptr<insignia::glm53::DFlash2Drafter> df_;
+     bool dflash2_on_ = false;
+     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
++    // CUDA-graph regions (see GraphRegion). verify_tail_region_ is indexed
++    // by verify row count (1..kMaxVerify) so the adaptive draft length never
++    // re-captures: each count class gets its own warm-up + capture on first
++    // use, and the set {1..8} is closed by construction.
++    cudaStream_t graph_stream_ = nullptr;
++    GraphRegion df_head_region_;                       // 7x lm_head on draft hiddens
++    GraphRegion verify_tail_region_[kMaxVerify + 1];   // per-k verify logits tail
+     std::unique_ptr<Q8Index> q8_index_;
+     std::unique_ptr<Q8Stager> q8_stager_;
+
+@@ -2294,8 +2404,9 @@ void Runner::linear(std::string_view name, const float *input, float *output, int
+-void Runner::linear(std::string_view name, const float *input, float *output, int rows, int cols) {
++void Runner::linear(std::string_view name, const float *input, float *output, int rows, int cols,
++                    cudaStream_t stream) {
+     const TensorLocation &weight = model_.tensor(name);
+     require(weight.type == TensorType::bf16 && weight.shape.size() == 2 &&
+             weight.shape[0] == uint32_t(rows) && weight.shape[1] == uint32_t(cols),
+@@ -2316,10 +2427,11 @@ void Runner::linear(std::string_view name, const float *input, float *output, int
+             q8_stager_->load(name, *q8, 0, uint32_t(rows));
+             if (q8_index_->format() == Cache8Format::fp8_e4m3)
+                 check(insignia::glm53::fp8_tc_gemv(q8_stager_->weight_bytes(), q8_stager_->scales(),
+-                      input, output, rows, cols, q8_workspace_), "FP8 linear");
++                      input, output, rows, cols, q8_workspace_, stream), "FP8 linear");
+             else
+                 check(insignia::glm53::q8_gemv(q8_stager_->weights(), q8_stager_->scales(),
+-                      input, output, rows, cols, q8_workspace_), "Q8 linear");
++                      input, output, rows, cols, q8_workspace_, stream), "Q8 linear");
+             debug_linear_output(name, output, rows);
+             return;
+         }
+
+@@ -2449,11 +2561,13 @@ void Runner::rms(std::string_view name, const float *input, float *output, int r
+-void Runner::rms(std::string_view name, const float *input, float *output, int rows, int cols) {
++void Runner::rms(std::string_view name, const float *input, float *output, int rows, int cols,
++                 cudaStream_t stream) {
+     const TensorLocation &weight = model_.tensor(name);
+     require(weight.type == TensorType::bf16 && weight.bytes == uint64_t(cols) * 2,
+             "wrong RMSNorm geometry for " + std::string(name));
+     const uint16_t *device = reinterpret_cast<const uint16_t *>(stager_.load(weight));
+-    launch_rms(input, device, output, rows, cols);
++    launch_rms(input, device, output, rows, cols, stream);
+ }
+
+@@ -3073,13 +3187,27 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
+     const TensorLocation &embedding = model_.tensor("model.language_model.embed_tokens.weight");
+     const auto stage_row = [&](int token, int t) {
+         const uint16_t *row = reinterpret_cast<const uint16_t *>(
+             stager_.load(embedding, uint64_t(token) * hidden_ * 2, hidden_ * 2));
+-        df_->set_block_row(t, row);
++        // The disk read + synchronous H2D inside stager_.load completes
++        // before it returns; the embed kernel runs on graph_stream_ so it
++        // orders with the graph that reads x_block_ (the stream is
++        // legacy-synchronizing, so ordering matches the old default-stream
++        // launches exactly).
++        df_->set_block_row(t, row, graph_stream_);
+     };
+     stage_row(anchor, 0);
+     for (int t = 1; t < insignia::glm53::DFlash2Drafter::kBlock; ++t)
+         stage_row(insignia::glm53::DFlash2Drafter::kMaskToken, t);
+-    df_->forward(anchor, position);
++    if (!df_->forward_graphed(anchor, position, graph_stream_))
++        df_->forward(anchor, position, graph_stream_);
+     // 7 separate GEMVs: each re-reads lm_head, but the BF16 stager keeps it
+     // VRAM-resident so reads cost microseconds. (linear_multi measured slower —
+     // lm_head FP8 exceeds the Q8 slot, forcing per-round NVMe re-streams.)
+-    for (int t = 0; t < insignia::glm53::DFlash2Drafter::kDrafts; ++t)
+-        linear("lm_head.weight", df_->draft_hidden() + size_t(t) * hidden_,
+-               verify_logits_.get() + size_t(t) * model_.vocab_size(),
+-               int(model_.vocab_size()), hidden_);
++    // Region "df-head": 14 launches (quantize + GEMV per row), every address
++    // fixed (resident lm_head, draft_hidden, verify_logits, q8_workspace).
++    // lm_head is guaranteed resident here: the first step() pinned it via
++    // try_pin before any df_draft() call.
++    const auto df_head = [this](cudaStream_t stream) {
++        for (int t = 0; t < insignia::glm53::DFlash2Drafter::kDrafts; ++t)
++            linear("lm_head.weight", df_->draft_hidden() + size_t(t) * hidden_,
++                   verify_logits_.get() + size_t(t) * model_.vocab_size(),
++                   int(model_.vocab_size()), hidden_, stream);
++    };
++    if (!df_head_region_.run(graph_stream_, df_head))
++        df_head(nullptr);   // silent fallback: identical kernel sequence
+
+@@ -3776,19 +3904,42 @@ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool cap
+     if (capture) {
+         kda_archive_ = false;
+         verify_populate_ = false;
++        require(count >= 1 && count <= kMaxVerify,
++                "verify tail graph index out of range");
+         // Per-position final hidden (mean of the 4 mHC streams) plus one
+         // greedy logits row per candidate: the acceptance-check targets.
+-        for (int token = 0; token < count; ++token)
+-            average_streams_kernel<<<16, 256>>>(
+-                streams + size_t(token) * kStreams * hidden_,
+-                verify_means_.get() + size_t(token) * hidden_, hidden_);
+-        check(cudaGetLastError(), "verify mean launch");
+-        for (int token = 0; token < count; ++token) {
+-            rms("model.language_model.norm.weight",
+-                verify_means_.get() + size_t(token) * hidden_,
+-                c_normalized_.get() + size_t(token) * hidden_, 1, hidden_);
+-            if (mtp_variant_ == 1)
+-                check(cudaMemcpyAsync(verify_normed_.get() + size_t(token) * hidden_,
+-                                      c_normalized_.get() + size_t(token) * hidden_,
+-                                      size_t(hidden_) * sizeof(float), cudaMemcpyDeviceToDevice),
+-                      "capture verify normed hidden");
+-            linear("lm_head.weight", c_normalized_.get() + size_t(token) * hidden_,
+-                   verify_logits_.get() + size_t(token) * model_.vocab_size(),
+-                   int(model_.vocab_size()), hidden_);
+-        }
++        // Region "verify-tail" keyed by row count: 1 + 3*count launches
++        // (avg-streams, final RMS, quantize + lm_head GEMV), all
++        // row-independent with fixed addresses. Padding to kMaxVerify was
++        // analyzed and REJECTED: bit-safe (no kernel in this tail mixes
++        // rows) but it multiplies the lm_head VRAM traffic (634 MB per row)
++        // by 8/count. Keying by count keeps a closed set {1..8} of graphs;
++        // the node COUNT changes with count (per-token loops), so
++        // cudaGraphExecUpdate - which requires identical topology - cannot
++        // substitute for a key. `streams` is always c_stream_a_ here (an
++        // even number of swaps per layer across all 45 layers), so the
++        // baked pointer is stable round to round.
++        const auto verify_tail = [&](cudaStream_t stream) {
++            for (int token = 0; token < count; ++token)
++                average_streams_kernel<<<16, 256, 0, stream>>>(
++                    streams + size_t(token) * kStreams * hidden_,
++                    verify_means_.get() + size_t(token) * hidden_, hidden_);
++            for (int token = 0; token < count; ++token) {
++                rms("model.language_model.norm.weight",
++                    verify_means_.get() + size_t(token) * hidden_,
++                    c_normalized_.get() + size_t(token) * hidden_, 1, hidden_, stream);
++                if (mtp_variant_ == 1)
++                    check(cudaMemcpyAsync(verify_normed_.get() + size_t(token) * hidden_,
++                                          c_normalized_.get() + size_t(token) * hidden_,
++                                          size_t(hidden_) * sizeof(float),
++                                          cudaMemcpyDeviceToDevice, stream),
++                          "capture verify normed hidden");
++                linear("lm_head.weight", c_normalized_.get() + size_t(token) * hidden_,
++                       verify_logits_.get() + size_t(token) * model_.vocab_size(),
++                       int(model_.vocab_size()), hidden_, stream);
++            }
++        };
++        if (!verify_tail_region_[count].run(graph_stream_, verify_tail)) {
++            verify_tail(nullptr);   // silent fallback
++            check(cudaGetLastError(), "verify mean launch");
++        }
+     }

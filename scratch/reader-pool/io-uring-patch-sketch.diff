@@ -1,0 +1,302 @@
+# io_uring reader-pool backend — PATCH SKETCH (does not apply as-is)
+#
+# Target: src/glm53_generate.cu @ current HEAD of glm53-dflash2-4070ti-super
+# Env gate: INSIGNIA_GLM53_IO_URING=1 enables, INSIGNIA_GLM53_IO_URING_DEPTH
+# (default 64). Default behavior (env unset) is byte-identical to today.
+#
+# Design: keep the entire window/LRU/priority machinery untouched. In uring
+# mode drive 0's reader THREADS are replaced by ONE submitter/reaper thread
+# that owns a raw-syscall io_uring ring (no liburing dependency, no SQPOLL,
+# fixed files, depth 64). The ring READs land either directly in the 4 KiB
+# aligned pinned window (compact-store path, same geometry as
+# ShardedIndex::read_span_direct_window) or in a per-SLOT scratch (packed
+# sidecar path, one scratch per depth slot instead of per thread). Existing
+# pool threads survive as EXPAND workers: they drain a new expand_queue_ of
+# windows whose bytes have landed and run the CPU half of stage_packed
+# (memcpy bodies + AVX2 scale expand). demand > prefetch priority and
+# promote_read() keep working because submission still goes through the
+# same deques.
+#
+# Open items marked TODO (tail-of-shard buffered fallback, PAGECACHE_L2
+# interplay, ALT-drive mixed mode) — see bench plan before finishing these.
+#
+# Expected (to be confirmed by scratch/reader-pool/bench_reader_pool.sh on
+# glm-box): +0.0..0.35 GB/s device side (5.5 -> 5.8-5.9 fio ceiling chase),
+# i.e. -1..4% ms/token on I/O-saturated phases; possibly nothing. The
+# microbench must show io_uring >= pread at bs~13m before this lands.
+
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -17,2 +17,4 @@
+ #include <condition_variable>
++#include <linux/io_uring.h>
++#include <sys/mman.h>
+@@ -31,2 +33,3 @@
+ #include <thread>
++#include <sys/syscall.h>
+@@ -589,2 +592,6 @@ explicit ExpertStager(ShardedIndex &model, uint64_t host_cache_bytes) : model_(model) {
+         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS"))
+             open_packed_experts(path);
++        if (const char *mode = std::getenv("INSIGNIA_GLM53_IO_URING"))
++            uring_depth_ = std::atoi(mode) ? default_uring_depth() : 0;
++        if (const char *depth = std::getenv("INSIGNIA_GLM53_IO_URING_DEPTH"))
++            uring_depth_ = std::max(0, std::atoi(depth));
+         for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
+@@ -929,2 +936,3 @@ struct WindowState {
+         bool releasing = false, pinned = false;
++        bool await_expand = false;  // uring: bytes landed, CPU expand pending
+         uint64_t stamp = 0;
+@@ -1319,4 +1327,6 @@ void start_pool() {
+         int readers = 4, readers_e = 2;
+-        if (const char *workers = std::getenv("INSIGNIA_GLM53_READERS"))
++        if (uring_depth_ && (const char *workers = std::getenv("INSIGNIA_GLM53_READERS")))
++            ;  // uring mode: READERS counts expand workers, not disk threads
++        else if (const char *workers = std::getenv("INSIGNIA_GLM53_READERS"))
+             readers = std::max(1, std::atoi(workers));
+@@ -1325,5 +1335,14 @@ void start_pool() {
+         stop_ = false;
+         for (int drive = 0; drive < 2; ++drive) {
+             const int workers = std::min<int>(drive ? readers_e : readers, window_count_);
++            if (drive == 0 && uring_depth_ && try_setup_uring()) {
++                // One submitter/reaper replaces drive-0 disk threads; the
++                // `workers` threads below become expand workers instead.
++                pool_.emplace_back([this] { uring_reaper_loop(); });
++                expand_workers_ = workers;
++                for (int index = 0; index < workers; ++index)
++                    pool_.emplace_back([this] { expand_worker_loop(); });
++                continue;
++            }
+             for (int index = 0; index < workers; ++index)
+                 pool_.emplace_back([this, drive] {
+@@ -1333,5 +1352,28 @@ void start_pool() {
+                             int window = -1;
+                             {
+                                 std::unique_lock<std::mutex> lock(pool_mutex_);
+-                                pool_cv_.wait(lock, [this, drive] {
++                                // uring mode: packed windows finished by the ring
++                                // wait here for the CPU expand instead of a disk read.
++                                pool_cv_.wait(lock, [this, drive] {
+                                     return stop_ || !demand_queue_[drive].empty() ||
+                                            !prefetch_queue_[drive].empty();
+                                 });
+@@ -1366,2 +1408,180 @@ void stop_pool() {
+     }
++
++    // ---- raw io_uring (kernel 5.1+ ABI; WSL2 6.x ships CONFIG_IO_URING=y) ----
++    static int default_uring_depth() { return 64; }
++    bool try_setup_uring() {
++        struct io_uring_params params{};
++        params.flags = 0;  // SQPOLL deliberately OFF: one submitter, no poll thread
++        uring_fd_ = int(::syscall(SYS_io_uring_setup, unsigned(uring_depth_), &params));
++        if (uring_fd_ < 0) {
++            std::printf("io_uring: setup failed (%s), staying on pread pool\n",
++                        std::strerror(errno));
++            uring_depth_ = 0;
++            return false;
++        }
++        const size_t sq_bytes = params.sq_off.array + params.sq_entries * sizeof(unsigned);
++        const size_t cq_bytes = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
++        void *sq_ring = ::mmap(nullptr, sq_bytes, PROT_READ | PROT_WRITE,
++                               MAP_SHARED | MAP_POPULATE, uring_fd_, IORING_OFF_SQ_RING);
++        void *cq_ring = ::mmap(nullptr, cq_bytes, PROT_READ | PROT_WRITE,
++                               MAP_SHARED | MAP_POPULATE, uring_fd_, IORING_OFF_CQ_RING);
++        sqes_ = static_cast<struct io_uring_sqe *>(
++            ::mmap(nullptr, params.sq_entries * sizeof(struct io_uring_sqe),
++                   PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, uring_fd_, IORING_OFF_SQES));
++        if (sq_ring == MAP_FAILED || cq_ring == MAP_FAILED || sqes_ == MAP_FAILED) {
++            uring_depth_ = 0;  // TODO: munmap partial maps, close fd
++            return false;
++        }
++        sq_mask_ = static_cast<unsigned *>(sq_ring) + params.sq_off.ring_mask;
++        sq_head_ = static_cast<unsigned *>(sq_ring) + params.sq_off.head;
++        sq_tail_ = static_cast<unsigned *>(sq_ring) + params.sq_off.tail;
++        sq_array_ = static_cast<unsigned *>(sq_ring) + params.sq_off.array;
++        cq_mask_ = static_cast<unsigned *>(cq_ring) + params.cq_off.ring_mask;
++        cq_head_ = static_cast<unsigned *>(cq_ring) + params.cq_off.head;
++        cq_tail_ = static_cast<unsigned *>(cq_ring) + params.cq_off.tail;
++        cqes_ = static_cast<struct io_uring_cqe *>(cq_ring) + params.cq_off.cqes / 8;
++        // Fixed files: one per I/O source. Drive 0 only — ALT_SHARD_DIR keeps
++        // its thread pool (glm-box has a single NVMe anyway).
++        int files[2] = {packed_direct_fd_ >= 0 ? packed_direct_fd_
++                                               : first_direct_shard_fd(),  // TODO helper
++                        -1};
++        if (::syscall(SYS_io_uring_register, uring_fd_, IORING_REGISTER_FILES, files, 1)) {
++            uring_fixed_ = false;  // fall back to plain sqe->fd
++        } else {
++            uring_fixed_ = true;
++        }
++        // Per-depth-slot packed scratch (replaces the per-thread scratch).
++        uring_scratch_.resize(size_t(uring_depth_), nullptr);
++        for (void *&scratch : uring_scratch_)
++            if (packed_fd_ >= 0 && ::posix_memalign(&scratch, kAlignment, packed_scratch_bytes_))
++                scratch = nullptr;
++        return true;
++    }
++    void uring_sqe_read(unsigned slot, int fd_index, uint64_t offset, void *buffer,
++                        uint32_t bytes, uint64_t user_data) {
++        struct io_uring_sqe &sqe = sqes_[slot & *sq_mask_];
++        sqe = {};
++        sqe.opcode = IORING_OP_READ;
++        sqe.fd = uring_fixed_ ? fd_index : (packed_direct_fd_ >= 0 ? packed_direct_fd_ : fd_index);
++        if (uring_fixed_) sqe.flags |= IOSQE_FIXED_FILE;
++        sqe.addr = reinterpret_cast<uint64_t>(buffer);
++        sqe.len = bytes;
++        sqe.off = offset;
++        sqe.user_data = user_data;  // window id
++    }
++    // Submitter+reaper: drains the SAME deques with the SAME demand-first
++    // rule, so prefetch can still never delay demand, and promote_read()
++    // keeps its meaning.
++    void uring_reaper_loop() {
++        std::vector<int> in_flight;
++        for (;;) {
++            int submitted = 0;
++            {
++                std::unique_lock<std::mutex> lock(pool_mutex_);
++                pool_cv_.wait(lock, [this] {
++                    return stop_ || !demand_queue_[0].empty() || !prefetch_queue_[0].empty() ||
++                           !expand_queue_.empty() == false;  // TODO: wake on completions
++                });
++                if (stop_ && demand_queue_[0].empty() && prefetch_queue_[0].empty()) return;
++                while (int(in_flight.size()) < uring_depth_ &&
++                       !(demand_queue_[0].empty() && prefetch_queue_[0].empty())) {
++                    int window;
++                    if (!demand_queue_[0].empty()) {
++                        window = demand_queue_[0].front(); demand_queue_[0].pop_front();
++                    } else {
++                        window = prefetch_queue_[0].front(); prefetch_queue_[0].pop_front();
++                    }
++                    WindowState &state = windows_[size_t(window)];
++                    const unsigned slot = unsigned(in_flight.size());
++                    if (packed_fd_ >= 0) {
++                        const PackedExpertIndexEntry &entry = packed_entry(state.layer, state.expert);
++                        state.uring_io = true; state.await_expand = true;
++                        uring_sqe_read(slot, 0, entry.offset,
++                                       uring_scratch_[slot] /* TODO null check: fall back pread */,
++                                       entry.padded_bytes, uint64_t(window));
++                    } else {
++                        // Compact store: identical geometry to
++                        // ShardedIndex::read_span_direct_window — align down
++                        // to 4 KiB, read `request` bytes straight into the
++                        // pinned window, payload lands at +delta.
++                        const ExpertLocations tensors = locate_expert(model_, state.layer, state.expert);
++                        // TODO: hoist the span math (first/last, delta,
++                        // request) into a helper shared with stage() so the
++                        // two cannot drift; tail-of-shard fallback stays a
++                        // blocking pread HERE (once per shard end, rare).
++                        uint64_t aligned_offset = 0, request = 0, delta = 0;
++                        span_for_uring(tensors, aligned_offset, request, delta);
++                        state.uring_io = true; state.uring_delta = delta;
++                        uring_sqe_read(slot, shard_direct_fd(tensors), aligned_offset,
++                                       host_ + size_t(window) * kWindowBytes, uint32_t(request),
++                                       uint64_t(window));
++                    }
++                    in_flight.push_back(window);
++                    ++submitted;
++                }
++            }
++            if (submitted)
++                ::syscall(SYS_io_uring_enter, uring_fd_, unsigned(submitted), 0, 0, nullptr);
++            // Reap everything visible; block only when the ring is empty.
++            ::syscall(SYS_io_uring_enter, uring_fd_, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
++            for (;;) {
++                const unsigned head = __atomic_load_n(cq_head_, __ATOMIC_RELAXED);
++                const unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
++                if (head == tail) break;
++                struct io_uring_cqe &cqe = cqes_[head & *cq_mask_];
++                const int window = int(cqe.user_data);
++                WindowState &state = windows_[size_t(window)];
++                if (cqe.res < 0) {
++                    state.error = std::make_exception_ptr(
++                        std::system_error(-cqe.res, std::generic_category(), "io_uring expert read"));
++                } else if (unsigned(cqe.res) != cqe_expected_bytes_[window]) {
++                    // TODO: short reads must chain a follow-up sqe, not fail.
++                    state.error = std::make_exception_ptr(std::runtime_error("short io_uring read"));
++                }
++                in_flight.erase(std::find(in_flight.begin(), in_flight.end(), window));
++                if (state.await_expand) {
++                    // Packed: bytes are in uring_scratch_[slot]; an expand
++                    // worker finishes the record. Slot scratch ownership is
++                    // carried in state.uring_slot (TODO field) because slots
++                    // recycle at submit time.
++                    std::lock_guard<std::mutex> lock(pool_mutex_);
++                    expand_queue_.push_back(window);
++                    pool_cv_.notify_all();
++                } else {
++                    std::lock_guard<std::mutex> lock(pool_mutex_);
++                    state.done = true;
++                    state.end = std::chrono::steady_clock::now();
++                }
++                pool_done_.notify_all();
++                __atomic_store_n(cq_head_, head + 1, __ATOMIC_RELEASE);
++            }
++        }
++    }
++    void expand_worker_loop() {
++        void *scratch = nullptr;  // reused for the fallback pread path
++        if (packed_fd_ >= 0 && ::posix_memalign(&scratch, kAlignment, packed_scratch_bytes_))
++            scratch = nullptr;
++        for (;;) {
++            int window = -1;
++            {
++                std::unique_lock<std::mutex> lock(pool_mutex_);
++                pool_cv_.wait(lock, [this] { return stop_ || !expand_queue_.empty(); });
++                if (stop_ && expand_queue_.empty()) { std::free(scratch); return; }
++                window = expand_queue_.front(); expand_queue_.pop_front();
++            }
++            WindowState &state = windows_[size_t(window)];
++            try {
++                // CPU half of stage_packed() (see split below): 3x 4 MiB
++                // memcpy + AVX2 nibble expand, reading from the uring slot
++                // scratch instead of a thread-local one.
++                expand_packed(state.layout, state.globals, state.payload,
++                              host_ + size_t(window) * kWindowBytes,
++                              state.layer, state.expert,
++                              uring_scratch_[state.uring_slot],
++                              packed_entry(state.layer, state.expert).stored_bytes);
++            } catch (...) { state.error = std::current_exception(); }
++            {
++                std::lock_guard<std::mutex> lock(pool_mutex_);
++                state.done = true;
++                state.end = std::chrono::steady_clock::now();
++            }
++            pool_done_.notify_all();
++        }
++    }
+@@ -1052,4 +1272,6 @@ void stage_packed(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                       uint8_t *window, int layer, int expert, void *scratch) {
+         const PackedExpertIndexEntry &entry = packed_entry(layer, expert);
+         require(scratch && entry.padded_bytes <= packed_scratch_bytes_,
+                 "packed expert reader scratch is unavailable");
+         pread_exact(packed_direct_fd_ >= 0 ? packed_direct_fd_ : packed_fd_,
+                     entry.offset, scratch, entry.padded_bytes,
+                     "read packed expert record");
++        // v uring mode calls only the second half; bytes already landed v
++        expand_packed(layout, globals, payload, window, layer, expert, scratch,
++                      entry.stored_bytes);
++    }
++    void expand_packed(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
++                       uint8_t *window, int layer, int expert, void *scratch,
++                       size_t stored_bytes) {
+         const auto expand_begin = std::chrono::steady_clock::now();
+         const auto *header = static_cast<const PackedExpertRecordHeader *>(scratch);
+@@ -1066,3 +1288,3 @@
+-        const uint8_t *const input_end = static_cast<const uint8_t *>(scratch) + entry.stored_bytes;
++        const uint8_t *const input_end = static_cast<const uint8_t *>(scratch) + stored_bytes;
+@@ -1470,2 +1692,14 @@ class ExpertStager {
+     ShardedIndex &model_;
+     int packed_fd_ = -1, packed_direct_fd_ = -1;
++    // io_uring state (drive 0 only; zero depth = disabled)
++    int uring_fd_ = -1, uring_depth_ = 0;
++    bool uring_fixed_ = false;
++    struct io_uring_sqe *sqes_ = nullptr;
++    unsigned *sq_head_ = nullptr, *sq_tail_ = nullptr, *sq_array_ = nullptr, *sq_mask_ = nullptr;
++    unsigned *cq_head_ = nullptr, *cq_tail_ = nullptr, *cq_mask_ = nullptr;
++    struct io_uring_cqe *cqes_ = nullptr;
++    std::vector<void *> uring_scratch_;
++    std::deque<int> expand_queue_;
++    int expand_workers_ = 0;
++    std::vector<uint32_t> cqe_expected_bytes_;  // per window, for short-read checks
+@@ -1486,1 +1720,1 @@
+     std::deque<int> demand_queue_[2], prefetch_queue_[2];
++    // NOTE: WindowState grows: bool uring_io; bool await_expand; uint32_t uring_slot; uint64_t uring_delta;

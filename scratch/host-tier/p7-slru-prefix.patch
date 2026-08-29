@@ -1,0 +1,131 @@
+# P7 patch sketch — burst-scoped SLRU + verify-prefix retention
+#
+# NOT APPLIED. Sketch against src/glm53_generate.cu @ current working tree
+# (branch glm53-dflash2-4070ti-super). Apply with: patch -p1 <
+# scratch/host-tier/p7-slru-prefix.patch (from repo root) after review.
+#
+# Policy (see p7-host-tier-analysis.md):
+#   1. Soft segment-LRU ("burst door"): every fresh insert waits in a
+#      probation segment; only a completed-resident HIT promotes a record
+#      into the protected segment. take_window() evicts probation-LRU first
+#      and touches protected only when probation runs dry. One-shot
+#      verify-union records (draft-tail, never re-referenced) die in
+#      probation; the per-layer hot set accumulates in protected with a
+#      retention horizon set by promotion rate, not burst rate.
+#   2. Verify-prefix retention cap: in batch verify, admit only the first
+#      VERIFY_RETAIN_POS positions' picks per layer (position 0 is
+#      guaranteed accepted: main()'s truth0 pre-check already gated the
+#      round; positions beyond the acceptance EMA are likely-rejected
+#      draft tail).
+#
+# Determinism: admission/retention only decides WHICH windows stay
+# resident. Every union record is still read, uploaded, and GEMV'd exactly
+# once per round in the same `distinct` first-seen order with the same
+# users/out_ids/combine lists, so the routed-sum FP order and the kernel
+# sequence are bit-identical by construction. Payloads are byte-identical
+# (byte-verified store, deterministic AVX2 expansion), so a hit vs miss
+# re-read cannot change logits. Still gated by the parity A/B below.
+#
+# Escape hatches: INSIGNIA_GLM53_TIER_SEGMENTS=0 restores plain LRU;
+# INSIGNIA_GLM53_VERIFY_RETAIN_POS=0 (default) keeps the current
+# retain-everything behavior.
+
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -582,6 +582,10 @@ class ExpertStager {
+         l2_mode_ = std::getenv("INSIGNIA_GLM53_PAGECACHE_L2") != nullptr;
+         if (const char *filter = std::getenv("INSIGNIA_GLM53_ADMIT_N"))
+             admit_threshold_ = std::max(1, std::atoi(filter));
++        if (const char *segments = std::getenv("INSIGNIA_GLM53_TIER_SEGMENTS"))
++            slru_on_ = std::atoi(segments) != 0;
++        // Soft segment-LRU: fresh inserts wait in probation, a completed
++        // resident hit promotes, eviction drains probation first. 0 = old
++        // plain LRU.
+         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
+             vram_budget_mb_ = std::max(0, std::atoi(budget));
+
+@@ -729,6 +733,10 @@ class ExpertStager {
+                 if (window_done(resident->second)) {
+                     // Host-tier hit: the record is already pinned in RAM and
+                     // only owes the 13.5 MiB H2D copy.
++                    // A completed-resident hit is re-reference evidence:
++                    // promote out of probation. First-sight records (the
++                    // verify-union draft tail) never take this branch and
++                    // stay eviction-first. Content untouched, FP order
++                    // untouched (see analysis doc).
++                    state.probation = false;
+                     batch_cached_[slot] = true;
+                     ++state.hits;
+                     ++hits;
+
+@@ -927,7 +935,11 @@ class ExpertStager {
+         bool demand = false, done = true, claimed = false, copy_issued = false;
+         bool releasing = false, pinned = false;
++        // SLRU segment label: true = probation (first sight, burst
++        // suspect), false = protected (re-referenced at least once while
++        // resident). Eviction order: probation-LRU, then protected-LRU.
++        bool probation = true;
+         uint64_t stamp = 0;
+
+@@ -1176,6 +1188,7 @@ class ExpertStager {
+         state.claimed = false;
+         state.copy_issued = false;
+         state.pinned = false;
++        state.probation = true;  // fresh insert: unproven until a hit
+         state.stamp = 0;
+
+@@ -1259,12 +1272,24 @@ class ExpertStager {
+         // (Measured: frequency-based eviction churns newcomers and halves
+         // the hit rate on this near-uniform routing; plain LRU wins.)
+         int victim = -1;
++        int newcomer = -1;
+         for (int window = 0; window < window_count_; ++window) {
+             const WindowState &state = windows_[size_t(window)];
+             if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
+                 state.pinned)
+                 continue;
+-            if (victim < 0 || state.stamp < windows_[size_t(victim)].stamp) victim = window;
++            // Burst door: rank each segment by its own LRU stamp, then
++            // prefer a probation victim. A verify-union burst (42 layers x
++            // U(k) ~ 1100-1700 records/round, all first-sight) eats its own
++            // probation residue instead of aging the promoted hot set; in
++            // the scalar-only steady state probation drains and the policy
++            // degenerates to exactly the old plain LRU.
++            const bool guarded = slru_on_ && state.probation;
++            int &rank = guarded ? newcomer : victim;
++            if (rank < 0 || state.stamp < windows_[size_t(rank)].stamp) rank = window;
+         }
++        if (victim < 0) victim = newcomer;  // protected is touched only when probation is dry
+
+@@ -1502,6 +1527,7 @@ class ExpertStager {
+     int batch_layer_ = -1, batch_count_ = 0, batch_demand_count_ = 0;
+     uint64_t stamp_ = 0;
+     bool overlap_reads_ = true, batch_io_recorded_ = true;
++    bool slru_on_ = true;  // INSIGNIA_GLM53_TIER_SEGMENTS=0 disables
+
+@@ -3564,9 +3590,19 @@ void Runner::moe_multi(int layer, const float *input, float *output,
+                 static const int cache_token = [] {
+                     const char *value = std::getenv("INSIGNIA_GLM53_VERIFY_CACHE_TOKEN");
+                     return value ? std::max(0, std::atoi(value)) : 0;
+                 }();
+                 const int chosen_token = std::min(cache_token, tokens - 1);
++                // Acceptance-prefix cap: main() only runs a verify round
++                // after d1 matched truth0 (guaranteed accepted), and the
++                // acceptance EMA bounds how far the real-text prefix runs.
++                // Positions past the cap are likely-rejected draft tail:
++                // read once (the GEMVs still need them this round), but do
++                // not let them occupy retention. 0 = keep old behavior.
++                static const int retain_pos = [] {
++                    const char *value = std::getenv("INSIGNIA_GLM53_VERIFY_RETAIN_POS");
++                    return value ? std::max(0, std::atoi(value)) : 0;
++                }();
++                const int position_cap = retain_pos > 0 ? std::min(tokens, retain_pos) : tokens;
+                 const int sparse_layers = int(std::count(is_sparse_.begin(), is_sparse_.end(), true));
+                 const int quota = std::max(1, (expert_stager_->cache_slots() - 16) /
+                                                    std::max(1, sparse_layers));
+                 std::vector<int> retained;
+                 retained.reserve(size_t(quota));
+-                for (int offset = 0; offset < tokens && int(retained.size()) < quota; ++offset) {
++                for (int offset = 0; offset < position_cap &&
++                                   int(retained.size()) < quota; ++offset) {
+                     const int token = (chosen_token + offset) % tokens;

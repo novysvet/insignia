@@ -1,0 +1,254 @@
+From: CUDA-Graph capture sketch for the GLM-5.3 DFlash2 decode/verify path
+Subject: [GRAPH-SKETCH] stream-capture the static spans of a verify round
+
+Sketch status (NOT compilable as-is; mechanical TODOs are marked GRAPH-TODO):
+  - Precedent in tree: src/decode.cu (Qwen insig4 path) already does
+    cudaStreamBeginCapture(ThreadLocal) + cudaGraphLaunch with a pinned
+    next-token staging memcpy, and src/cuda13_probe.cu probed pinned-memcpy
+    capture + cudaGraphExecKernelNodeSetParams on this exact WSL2/CUDA-13.3
+    driver stack. This sketch reuses those patterns.
+  - Phase 1: drafter forward + df lm_head + df_commit graphs (zero parity
+    surface beyond int-scalar externalization).
+  - Phase 2: per-(k, phase) verify/scalar fragment graphs for the static
+    spans between router resolutions; expert staging stays eager.
+  - Phase 3 (optional, largest): per-8-batch expert mini-graphs over 8
+    dedicated fixed VRAM slots. Only outlined here.
+
+Determinism note: graph replay preserves kernel order and arguments
+bit-for-bit. The ONLY semantics-touching edits are (a) kernels that took
+position/ctx_len/combine-weight scalars by value now read them from a
+pinned parameter page (identical integer/float values -> identical FP
+behavior), and (b) scale_add reads its weight from pinned memory instead
+of a kernel argument. Both must pass the full parity gate (greedy IDs +
+digit-identical top-10 logits + 30/40/100/240-token sequence checks)
+against INSIGNIA_GLM53_GRAPHS=0 before landing.
+
+diff --git a/include/insignia_glm53_graph.cuh b/include/insignia_glm53_graph.cuh
+new file mode 100644
+--- /dev/null
++++ b/include/insignia_glm53_graph.cuh
+@@ -0,0 +1,64 @@
++#pragma once
++// GRAPH-SKETCH: parameter page + fragment-graph bank for decode/verify.
++// One pinned page is written by the host before each graph launch and read
++// by kernels through UVA (zero API calls per parameter update; WSL2 + UVA
++// verified by src/cuda13_probe.cu patterns; fallback = one cudaMemcpyAsync
++// into a device mirror before cudaGraphLaunch, as decode.cu does).
++namespace insignia::glm53 {
++
++struct GraphParamPage {
++    int   position_base;              // verify/prefill anchor position
++    int   ctx_len;                    // drafter attention length
++    int   df_anchor_position;         // drafter RoPE position
++    int   commit_pos0;                // df kv_append base
++    int   k;                          // active verify rows (grids stay kMaxVerify)
++    float combine[8 /*kMaxVerify*/ * 8 /*topk*/];  // scale_add weights, per (token, pick)
++    int   row_ids[8];                 // phase-3 expert batch user rows
++    float expert_globals[8][3];       // phase-3 per-slot record global scales
++};
++
++// Owns one instantiated exec per capture key. Lazy: a shape that has not run
++// eagerly at least once is never captured (weights must already be resident:
++// Q8 pin_all, BF16 stager resident map, f32_cache_), because TensorStager::
++// stage_new issues a synchronous cudaMemcpy that is illegal during capture.
++class FragmentGraphBank {
++public:
++    void launch(uint64_t key, cudaStream_t stream) {
++        const auto found = execs_.find(key);
++        if (found != execs_.end()) {
++            check(cudaGraphLaunch(found->second, stream), "fragment graph launch");
++            return;
++        }
++        require(pending_ != cudaGraph_t{}, "fragment capture not armed");
++        check(cudaStreamEndCapture(stream, &pending_), "fragment end capture");
++        cudaGraphExec_t exec = nullptr;
++        check(cudaGraphInstantiate(&exec, pending_, nullptr, nullptr, 0),
++              "fragment instantiate");
++        check(cudaGraphDestroy(pending_), "fragment destroy template");
++        pending_ = cudaGraph_t{};
++        execs_.emplace(key, exec);
++    }
++    void arm(cudaStream_t stream) {  // begin capture for the next key
++        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreaded),
++              "fragment begin capture");
++    }
++    bool armed() const { return pending_ != cudaGraph_t{}; }
++    ~FragmentGraphBank() {
++        for (auto &[key, exec] : execs_) if (exec) cudaGraphExecDestroy(exec);
++    }
++private:
++    std::unordered_map<uint64_t, cudaGraphExec_t> execs_;
++    cudaGraph_t pending_ = cudaGraph_t{};
++};
++
++}  // namespace insignia::glm53
+diff --git a/src/glm53_ops.cu b/src/glm53_ops.cu
+--- a/src/glm53_ops.cu
++++ b/src/glm53_ops.cu
+@@ class-less sketch hunks
+@@ kda_conv_silu3: externalized position (representative hunk; the same edit
+@@ applies to mla_store_latent / mla_prefill_latent / df_norm_rope / df_attn /
+@@ df_kv_append wrappers -- GRAPH-TODO list, all int plumbing, FP-neutral)
+-cudaError_t kda_conv_silu3(
+-    float *q, float *k, float *v,
+-    const void *conv_q, const void *conv_k, const void *conv_v,
+-    float *history,
+-    int position,
+-    int count, bool weights_fp32, cudaStream_t stream) {
+-    if (position < 0) return cudaErrorErrorInvalidValue;
+-    kda_conv_silu3_kernel<<<96, 256, 0, stream>>>(
+-        q, k, v, conv_q, conv_k, conv_v, history, position, count,
+-        weights_fp32 ? 1 : 0);
+-    return cudaGetLastError();
++// GRAPH: position arrives via a pinned int (UVA read inside the kernel) so a
++// captured node replays with the current round's position without
++// cudaGraphExecKernelNodeSetParams. The kernel body is unchanged except
++// `const int position = *position_pin;` on entry (GRAPH-TODO: kernel edit).
++cudaError_t kda_conv_silu3_pin(
++    float *q, float *k, float *v,
++    const void *conv_q, const void *conv_k, const void *conv_v,
++    float *history,
++    const int *position_pin,
++    int count, bool weights_fp32, cudaStream_t stream) {
++    if (!position_pin) return cudaErrorErrorInvalidValue;
++    kda_conv_silu3_kernel_pin<<<96, 256, 0, stream>>>(
++        q, k, v, conv_q, conv_k, conv_v, history, position_pin, count,
++        weights_fp32 ? 1 : 0);
++    return cudaGetLastError();
+ }
+diff --git a/src/glm53_generate.cu b/src/glm53_generate.cu
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -490,10 +490,14 @@ void launch_rms(...)
+-void launch_rms(const float *input, const uint16_t *weight, float *output,
+-                int rows, int cols) {
+-    rms_bf16_kernel<<<rows, 256>>>(input, weight, output, rows, cols);
++// GRAPH-TODO (~40 sites in this file): every raw <<<>>> launch gains the
++// Runner's exec_ stream. The glm53_* op wrappers already take
++// `cudaStream_t stream = nullptr` (include/insignia_glm53.cuh) so only the
++// in-file kernels (embed_repeat, rms_bf16, kda_gate, kda_output,
++// clamped_swiglu, scale_add, add, average_streams, rows_argmax, bf16_rms,
++// finite) and the Runner helpers need plumbing.
++void launch_rms(const float *input, const uint16_t *weight, float *output,
++                int rows, int cols, cudaStream_t stream = nullptr) {
++    rms_bf16_kernel<<<rows, 256, 0, stream>>>(input, weight, output, rows, cols);
+     check(cudaGetLastError(), "RMSNorm launch");
+ }
+@@ Runner members (class Runner, near df_logits_host_)
+     std::unique_ptr<insignia::glm53::DFlash2Drafter> df_;
+     bool dflash2_on_ = false;
+     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
++    // GRAPH: decode/verify execution stream (NULL-stream capture is illegal),
++    // pinned parameter page, and the graph banks.
++    cudaStream_t exec_ = nullptr;
++    insignia::glm53::GraphParamPage *page_ = nullptr;        // pinned, UVA
++    insignia::glm53::FragmentGraphBank df_bank_;             // drafter+head
++    insignia::glm53::FragmentGraphBank verify_bank_;         // key = k*2+phase
++    insignia::glm53::FragmentGraphBank scalar_bank_;         // key = fragment id
++    bool graphs_on_ = true;                                  // INSIGNIA_GLM53_GRAPHS=0 A/B
++    int  warmups_ = 0;                                       // eager passes before first arm
+@@ Runner constructor tail (after load_cct(); ...)
++    if (const char *g = std::getenv("INSIGNIA_GLM53_GRAPHS")) graphs_on_ = std::atoi(g) != 0;
++    check(cudaStreamCreateWithFlags(&exec_, cudaStreamNonBlocking), "exec stream");
++    check(cudaHostAlloc(&page_, sizeof(*page_), cudaHostAllocDefault), "graph param page");
+@@ Runner destructor
++    if (exec_) { cudaStreamSynchronize(exec_); cudaStreamDestroy(exec_); }
++    if (page_) cudaFreeHost(page_);
+@@ scale_add weight externalization (used by the ordered-accumulation tail)
+ __global__ __launch_bounds__(256) void scale_add_kernel(
+     const float *__restrict__ destination,
+     const float *__restrict__ source,
+-    float scale,
++    const float *__restrict__ scale_pin,   // GRAPH: pinned page slot
+     int count) {
++    const float scale = scale_pin[0];
+     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+          index += blockDim.x * gridDim.x)
+         destination[index] = fmaf(source[index], scale, destination[index]);
+ }
+@@ df_draft: phase-1 capture (drafter forward + 7 lm_head GEMVs, 146 kernels)
+-    stage_row(anchor, 0);
+-    for (int t = 1; t < insignia::glm53::DFlash2Drafter::kBlock; ++t)
+-        stage_row(insignia::glm53::DFlash2Drafter::kMaskToken, t);
+-    df_->forward(anchor, position);
+-    for (int t = 0; t < insignia::glm53::DFlash2Drafter::kDrafts; ++t)
+-        linear("lm_head.weight", df_->draft_hidden() + size_t(t) * hidden_,
+-               verify_logits_.get() + size_t(t) * model_.vocab_size(),
+-               int(model_.vocab_size()), hidden_);
++    // GRAPH: embed rows are pre-staged EAGER into the drafter's fixed
++    // x_block_ source (stager scratch would alias inside a graph; the
++    // df_embed_row kernels themselves stay in-graph reading a dedicated
++    // df_embed_stage_[8][hidden] buffer -- GRAPH-TODO: add buffer + adapt
++    // set_block_row to take it).
++    page_->df_anchor_position = position;
++    page_->ctx_len = position + 1;
++    const uint64_t key = 0;                       // one drafter shape only
++    if (!graphs_on_ || warmups_ > 0 && df_bank_.captured(key)) {
++        df_bank_.launch(key, exec_);
++    } else {
++        if (graphs_on_ && warmups_ > 0) df_bank_.arm(exec_);
++        stage_rows_and_forward();                  // GRAPH-TODO: existing body
++        for (int t = 0; t < kDrafts; ++t)
++            linear("lm_head.weight", ...);        // on exec_ (GRAPH-TODO)
++        if (df_bank_.armed()) df_bank_.seal(key, exec_);
++    }
++    // D2H logits + hp stay eager (synchronous downloads end the region).
+@@ prefill(capture=true): phase-2 fragment boundaries in the layer loop
+     for (int layer = 0; layer < layers; ++layer) {
++        // GRAPH: fragment H_L = [ordered scale_add tail of layer L-1
++        // + mHC/attn/MLP static span of layer L + router GEMV of layer L].
++        // Boundaries are exactly the 42 router D2H syncs (moe_multi) -- the
++        // only data-dependent host decisions inside the dense chain.
++        // Key: (k, position_phase, layer) with position_phase in
++        // {prefix<=256, latent}. Shared-expert MLP + memset + activation
++        // quantize stay EAGER (they hide under expert disk waits today and
++        // must not be reordered behind the expert loop).
++        if (!graphs_on_ || warmups_ == 0 || !verify_bank_.captured(hkey(layer)))
++            run_layer_span_eager(layer);          // GRAPH-TODO: existing body
++        else
++            verify_bank_.launch(hkey(layer), exec_);
+         const std::string base = layer_stem(layer);
+         ...existing mhc_multi / rms / mla_multi|kda_multi / mhc_mix...
+@@ moe_multi: the eager islands between fragments (unchanged control flow)
+     // router linear_multi + cudaMemcpy D2H + host partial_sort: EAGER, ends
+     // the previous fragment. stage_layer/load_batch/upload per record: EAGER
+     // (NVMe waits, window/slot/LRU decisions -- inherently dynamic).
+     // Per-expert 4-kernel chains (quantize_rows/pair_rows/swiglu_rows/
+     // down_rows): EAGER in phase 2; phase 3 wraps each 8-batch in a
+     // mini-graph over 8 dedicated fixed VRAM slots with row_ids/globals
+     // fed from page_ (loses ~3% device-tier hits; +~108 MiB slots).
+@@ verify_round: replay + tail fragment
+ std::pair<int, std::vector<int>> Runner::verify_round(const std::vector<int> &candidates,
+                                                       int position_base) {
++    page_->position_base = position_base;
++    page_->k = int(candidates.size());
+     prefill(candidates, position_base, true);
++    // F_tail fragment [avg k + rms k + lm_head 2k + argmax + finite] replays
++    // as one node; the finite-check D2H stays outside (synchronous).
+     ...
+diff --git a/src/glm53_dflash2.cu b/src/glm53_dflash2.cu
+--- a/src/glm53_dflash2.cu
++++ b/src/glm53_dflash2.cu
+@@ forward(): the three position-dependent launches read the pinned page
+-        df_norm_rope_kernel<32><<<32, 256>>>(qbuf_, q_norm_[l], anchor_position, kBlock);
+-        df_norm_rope_kernel<8><<<8, 256>>>(kblk_, k_norm_[l], anchor_position, kBlock);
++        // GRAPH: anchor_position/ctx_len come from the pinned page (kernels
++        // take `const int *pin` -- GRAPH-TODO, same shape as kda_conv_silu3).
++        df_norm_rope_kernel<32><<<32, 256, 0, stream>>>(qbuf_, q_norm_[l], pos_pin, kBlock);
++        df_norm_rope_kernel<8><<<8, 256, 0, stream>>>(kblk_, k_norm_[l], pos_pin, kBlock);
+@@ -507 +512 @@
+-        df_attn_kernel<<<32, 256>>>(qbuf_, kcache_, vcache_, kblk_, vblk_, branch_, l, ctx_len);
++        df_attn_kernel<<<32, 256, 0, stream>>>(qbuf_, kcache_, vcache_, kblk_, vblk_, branch_, l, len_pin);
+@@ commit(): per-count variants (count in 1..8 -> bank key)
++        // GRAPH: df_gather/fc/fc/add/rms grids depend on `count`; the bank
++        // keys on count so no cudaGraphExecUpdate is needed. kv_append's
++        // pos0 reads page_->commit_pos0.
+--
+Integration risks (see final report): NULL-stream capture illegality (exec_
+plumbing), synchronous cudaMemcpy/cudaMemset and cudaEventQuery/Synchronize
+must never run inside an armed span (fragments start after staging, expert
+region + finite-check stay eager), pageable H2D absent (all staging buffers
+are cudaHostAlloc'd), first-use cudaMallocs (arena/try_pin/f32_cache)
+require one eager warmup round per shape before arming, and
+cudaStreamCaptureModeThreaded confines restrictions to the decode thread
+(reader-pool threads make no CUDA calls).

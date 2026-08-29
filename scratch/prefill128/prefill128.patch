@@ -1,0 +1,220 @@
+prefill128: runtime-configurable prefill chunk (INSIGNIA_GLM53_PREFILL_CHUNK, default 64, max 128)
+DRAFT ONLY - not applied. Generated 2026-08-29. Determinism note: the chunk size does
+not touch FP accumulation order (buffers only grow; kernel wave order is unchanged),
+so greedy parity is preserved by construction; still gate on the standard prompts.
+
+diff --git a/src/glm53_generate.cu b/src/glm53_generate.cu
+index e58c6eb..aa1474f 100644
+--- a/src/glm53_generate.cu
++++ b/src/glm53_generate.cu
+@@ -1869,6 +1869,12 @@ public:
+                                     insignia::glm53::DFlash2Drafter::kRank * sizeof(float),
+                                 cudaHostAllocDefault),
+                   "pin DFlash2 hp buffer");
++            // The drafter captures one row per prompt-chunk token at layers
++            // 5/14/24/33/42 and commits them in one batch; its kMaxTokens
++            // stride is baked into df_gather_kernel, so the chunk must not
++            // exceed it.
++            require(kMaxChunk() <= insignia::glm53::DFlash2Drafter::kMaxTokens,
++                    "INSIGNIA_GLM53_PREFILL_CHUNK exceeds the DFlash2 capture batch");
+         }
+         // Dense layer -> KDA archive row (recurrent-state replay indexing).
+         kda_row_.assign(size_t(layer_count) + 1, -1);
+@@ -1998,32 +2004,32 @@ public:
+             w_uv_.reset(absorb_per_layer_ * mla_layers_);
+             extract_mla_absorb();
+         }
+-        c_stream_a_.reset(size_t(kMaxChunk) * kStreams * hidden_);
++        c_stream_a_.reset(size_t(kMaxChunk()) * kStreams * hidden_);
+         c_stream_b_.reset(c_stream_a_.size());
+-        c_collapsed_.reset(size_t(kMaxChunk) * hidden_);
+-        c_normalized_.reset(size_t(kMaxChunk) * hidden_);
+-        c_attn_.reset(size_t(kMaxChunk) * hidden_);
+-        c_ffn_.reset(size_t(kMaxChunk) * hidden_);
+-        c_routed_.reset(size_t(kMaxChunk) * hidden_);
++        c_collapsed_.reset(size_t(kMaxChunk()) * hidden_);
++        c_normalized_.reset(size_t(kMaxChunk()) * hidden_);
++        c_attn_.reset(size_t(kMaxChunk()) * hidden_);
++        c_ffn_.reset(size_t(kMaxChunk()) * hidden_);
++        c_routed_.reset(size_t(kMaxChunk()) * hidden_);
+         c_expert_out_.reset(size_t(kMaxVerify) * moe_topk_ * hidden_);
+-        c_q_.reset(size_t(kMaxChunk) * kda_width_);
+-        c_k_.reset(size_t(kMaxChunk) * kda_width_);
+-        c_v_.reset(size_t(kMaxChunk) * kda_width_);
+-        c_gate_.reset(size_t(kMaxChunk) * kda_width_);
+-        c_core_.reset(size_t(kMaxChunk) * kda_width_);
+-        c_proj_.reset(size_t(kMaxChunk) * kda_width_);
+-        c_small_.reset(size_t(kMaxChunk) * std::max({f_a_rows_, q_a_rows_, kv_a_rows_}));
+-        c_kv_.reset(size_t(kMaxChunk) * kv_b_rows_);
+-        c_mlaq_.reset(size_t(kMaxChunk) * q_b_rows_);
+-        c_mlao_.reset(size_t(kMaxChunk) * q_b_rows_);
+-        c_gateu_.reset(size_t(kMaxChunk) * std::max({dense_intermediate_, moe_intermediate_,
++        c_q_.reset(size_t(kMaxChunk()) * kda_width_);
++        c_k_.reset(size_t(kMaxChunk()) * kda_width_);
++        c_v_.reset(size_t(kMaxChunk()) * kda_width_);
++        c_gate_.reset(size_t(kMaxChunk()) * kda_width_);
++        c_core_.reset(size_t(kMaxChunk()) * kda_width_);
++        c_proj_.reset(size_t(kMaxChunk()) * kda_width_);
++        c_small_.reset(size_t(kMaxChunk()) * std::max({f_a_rows_, q_a_rows_, kv_a_rows_}));
++        c_kv_.reset(size_t(kMaxChunk()) * kv_b_rows_);
++        c_mlaq_.reset(size_t(kMaxChunk()) * q_b_rows_);
++        c_mlao_.reset(size_t(kMaxChunk()) * q_b_rows_);
++        c_gateu_.reset(size_t(kMaxChunk()) * std::max({dense_intermediate_, moe_intermediate_,
+                                                     shared_intermediate_}));
+         c_up_.reset(c_gateu_.size());
+         c_act_.reset(c_gateu_.size());
+-        c_router_.reset(size_t(kMaxChunk) * moe_experts_);
+-        c_post_.reset(size_t(kMaxChunk) * 4);
+-        c_comb_.reset(size_t(kMaxChunk) * 16);
+-        c_beta_.reset(size_t(kMaxChunk) * kda_heads_);
++        c_router_.reset(size_t(kMaxChunk()) * moe_experts_);
++        c_post_.reset(size_t(kMaxChunk()) * 4);
++        c_comb_.reset(size_t(kMaxChunk()) * 16);
++        c_beta_.reset(size_t(kMaxChunk()) * kda_heads_);
+         if (nvfp4_experts_) {
+             nv_workspace_4096_.reset(insignia::glm53::nvfp4_workspace_rows_bytes(hidden_, kMaxVerify));
+             nv_workspace_2048_.reset(
+@@ -2031,7 +2037,7 @@ public:
+         }
+         if (q8_index_)
+             q8_workspace_.reset(q8_index_->format() == Cache8Format::fp8_e4m3 ?
+-                insignia::glm53::fp8_batch_workspace_bytes(16384, kMaxChunk) :
++                insignia::glm53::fp8_batch_workspace_bytes(16384, kMaxChunk()) :
+                 insignia::glm53::q8_workspace_bytes(16384));
+         last_avg_.reset(hidden_);
+         last_normed_.reset(hidden_);
+@@ -2081,7 +2087,21 @@ public:
+     }
+ 
+     int layer_count() const { return int(model_.layers()); }
+-    static constexpr int kMaxChunk = 64;
++    // Prefill chunk ceiling. The compile-time cap sizes the fixed-length host
++    // arrays in moe_multi and the kernel-side validation limits
++    // (fp8_tc_gemv_batch/_gemv2_batch, mla_flash2_prefill,
++    // mla_prefill_latent, DFlash2Drafter::kMaxTokens); the runtime knob
++    // below selects the actual chunk inside it. Default 64 is the
++    // parity-proven chunk; 128 is the validated ceiling (~+66 MiB VRAM,
++    // chunk buffers + DFlash2 capture batch, over the 64-token sizing).
++    static constexpr int kMaxChunkCap = 128;
++    static int kMaxChunk() {
++        static const int chunk = [] {
++            const char *value = std::getenv("INSIGNIA_GLM53_PREFILL_CHUNK");
++            return std::clamp(value ? std::atoi(value) : 64, 8, kMaxChunkCap);
++        }();
++        return chunk;
++    }
+     // Verify passes are hard-capped by the drafter (DFlash2 kDrafts=7, MTP
+     // clamp 8); sizing their scratch by kMaxChunk would burn ~240 MiB per
+     // chunk-size doubling for nothing.
+@@ -2364,7 +2384,7 @@ void Runner::linear_pair(std::string_view name_a, std::string_view name_b,
+ // prompt chunk costs one streaming pass per matrix instead of one per token.
+ void Runner::linear_multi(std::string_view name, const float *inputs, float *outputs,
+                           int tokens, int rows, int cols) {
+-    require(tokens >= 1 && tokens <= kMaxChunk, "prefill chunk out of range");
++    require(tokens >= 1 && tokens <= kMaxChunk(), "prefill chunk out of range");
+     const TensorLocation &weight = model_.tensor(name);
+     require(weight.type == TensorType::bf16 && weight.shape.size() == 2 &&
+             weight.shape[0] == uint32_t(rows) && weight.shape[1] == uint32_t(cols),
+@@ -3587,9 +3607,15 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
+                 // Prompt prefill: retain a bounded per-layer slice of the
+                 // chunk union so the next chunk's overlapping picks hit the
+                 // pinned tier instead of re-reading disk. Zero disables.
++                // Default stays 24: cross-chunk reuse is the per-layer hot
++                // set (top-28 experts cover 91.5% of accesses), while the
++                // chunk union keeps growing with T (U(64) ~ 105,
++                // U(128) ~ 137 per the P2 ratio trend); a quota past ~96
++                // only admits 8.5%-mass cold tail the next chunk will not
++                // re-select, evicting warm records to no effect.
+                 static const int retain_quota = [] {
+                     const char *value = std::getenv("INSIGNIA_GLM53_PREFILL_RETAIN");
+-                    return value ? std::max(0, std::atoi(value)) : 24;
++                    return value ? std::clamp(std::atoi(value), 0, 288) : 24;
+                 }();
+                 for (int slot = 0; slot < batch_count; ++slot)
+                     if (int(base_slot) + slot < retain_quota)
+@@ -3605,8 +3631,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
+                 // group of up to 8 rows in one weight pass. The batched
+                 // kernels preserve every per-row accumulation chain, so the
+                 // routed-sum rounding is untouched.
+-                std::array<int, kMaxChunk> users{}, out_ids{};
+-                std::array<float, kMaxChunk> combine{};
++                std::array<int, kMaxChunkCap> users{}, out_ids{};
++                std::array<float, kMaxChunkCap> combine{};
+                 int total = 0;
+                 for (int token = 0; token < tokens; ++token)
+                     for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
+@@ -3668,7 +3694,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
+ 
+ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool capture) {
+     const int count = int(tokens.size());
+-    require(count >= 1 && count <= kMaxChunk, "prefill chunk out of range");
++    require(count >= 1 && count <= kMaxChunk(), "prefill chunk out of range");
+     if (early_multi_route_on_) ++early_multi_batch_;
+     if (capture) {
+         require(mtp_draft_total_, "verify capture requested with MTP disabled");
+@@ -4084,7 +4110,7 @@ int main(int argc, char **argv) {
+         if (tokens.size() > 1) {
+             const size_t prefill_count = tokens.size() - 1;
+             for (size_t consumed = 0; consumed < prefill_count; ) {
+-                const size_t take = std::min<size_t>(Runner::kMaxChunk, prefill_count - consumed);
++                const size_t take = std::min<size_t>(Runner::kMaxChunk(), prefill_count - consumed);
+                 std::vector<int> chunk(tokens.begin() + int(consumed), tokens.begin() + int(consumed + take));
+                 runner.prefill(chunk, int(consumed));
+                 consumed += take;
+diff --git a/include/insignia_glm53_dflash2.cuh b/include/insignia_glm53_dflash2.cuh
+index 4ed5662..d20cc71 100644
+--- a/include/insignia_glm53_dflash2.cuh
++++ b/include/insignia_glm53_dflash2.cuh
+@@ -29,7 +29,7 @@ public:
+     static constexpr int kKVHeads = 8;
+     static constexpr int kHeadDim = 128;
+     static constexpr int kIntermediate = 12288;
+-    static constexpr int kMaxTokens = 64;      // capture rows per commit batch
++    static constexpr int kMaxTokens = 128;     // capture rows per commit batch (>= chunk cap)
+     static constexpr int kMaxCtx = 264;        // 256 target positions + block
+     static constexpr int kMaskToken = 154856;
+     static constexpr int kTopK = 16;
+diff --git a/src/glm53_fp8.cu b/src/glm53_fp8.cu
+index 18dc2f8..0dd3807 100644
+--- a/src/glm53_fp8.cu
++++ b/src/glm53_fp8.cu
+@@ -516,7 +516,7 @@ cudaError_t fp8_tc_gemv_batch(
+     int output_stride,
+     void *workspace,
+     cudaStream_t stream) {
+-    if (!weights || !scales || !x || !y || !workspace || tokens <= 0 || tokens > 64 ||
++    if (!weights || !scales || !x || !y || !workspace || tokens <= 0 || tokens > 128 ||
+         rows <= 0 || cols <= 0 || output_stride < rows ||
+         (cols & (kFp8GroupSize - 1)) || cols / kFp8GroupSize > 256)
+         return cudaErrorInvalidValue;
+@@ -566,7 +566,7 @@ cudaError_t fp8_tc_gemv2_batch(
+     void *workspace,
+     cudaStream_t stream) {
+     if (!weights_a || !scales_a || !weights_b || !scales_b || !x || !y_a || !y_b ||
+-        !workspace || tokens <= 0 || tokens > 64 || rows <= 0 || cols <= 0 ||
++        !workspace || tokens <= 0 || tokens > 128 || rows <= 0 || cols <= 0 ||
+         output_stride < rows || (cols & (kFp8GroupSize - 1)) ||
+         cols / kFp8GroupSize > 256)
+         return cudaErrorInvalidValue;
+diff --git a/src/glm53_ops.cu b/src/glm53_ops.cu
+index bbaff7b..c7ea68e 100644
+--- a/src/glm53_ops.cu
++++ b/src/glm53_ops.cu
+@@ -749,7 +749,7 @@ cudaError_t mla_flash2_prefill(
+     int head_dim,
+     cudaStream_t stream) {
+     if (!query || !kv || !key_cache || !value_cache || !output ||
+-        tokens <= 0 || tokens > 64 || position_base < 0 ||
++        tokens <= 0 || tokens > 128 || position_base < 0 ||
+         position_base + tokens > kMlaExactContext || heads <= 0 ||
+         head_dim < 32 || head_dim > 256 || head_dim % 32)
+         return cudaErrorInvalidValue;
+@@ -1325,7 +1325,7 @@ cudaError_t mla_prefill_latent(
+     int head_dim,
+     int latent_dim,
+     cudaStream_t stream) {
+-    if (tokens <= 0 || tokens > 64 || position_base < 0 ||
++    if (tokens <= 0 || tokens > 128 || position_base < 0 ||
+         position_base + tokens > kMlaMaxContext || heads != kKdaHeads ||
+         head_dim != kMlaHeadDim || latent_dim != kMlaLatentDim ||
+         !query || !latents || !w_uk || !w_uv || !output ||

@@ -1,0 +1,130 @@
+====================================================================================================
+P2 / P8 analysis -- data: audits/s6-open-problems.md section 0
+measured U(K): K=1..5 -> 8, 14.45, 20.61, 26.40, 31.40;  E[I_adj]=1.544
+increments (new experts/token, k=2..5): [6.45 6.16 5.79 5.  ]
+repeats r(k)=8-inc: [1.55 1.84 2.21 3.  ]  -> empirical rho_l: [0.1938 0.045  0.0601 0.1364]
+----------------------------------------------------------------------------------------------------
+naive birthday 288(1-(1-1/288)^8K):      [15.59  23.066 30.336 37.407]   rmsRel=0.1408
+uniform distinct 288(1-(1-8/288)^K):     [15.778 23.34  30.691 37.839]   rmsRel=0.1537
+(a1) N_eff=76.7:                     [14.526 20.722 26.3   31.322]   rmsRel=0.0044
+(a2) N=81.4, m/token=7.899:      [14.439 20.667 26.315 31.438]   rmsRel=0.0022
+(b) DM alpha(pairwise, matches U(2))=90.432: [14.456 20.647 26.291 31.468]  rmsRel=0.0025  U(1)=7.62
+(b) DM alpha(LS)=90.4:                    [14.456 20.647 26.29  31.467]  rmsRel=0.0025  U(1)=7.62
+(b*) DM renorm alpha=56.0:               [14.877 20.89  26.22  30.997]  rmsRel=0.0178  U(1)=8
+(c1) chain (0 free params, lam=0.1707):    [14.45  20.751 26.908 32.922]  rmsRel=0.0263
+(c2) chain lam=0.2766:               [14.45  20.425 26.158 31.711]  rmsRel=0.0081
+(e1) hybrid flat N=95.5, kappa=0.0977:     [14.537 20.619 26.242 31.439]  rmsRel=0.0043
+(e2) hybrid anchor kappa=-0.5000:              [16.078 20.872 24.361 27.157]  rmsRel=0.0963
+(pl) power law U=8.051*K^0.8509: [14.521 20.503 26.189 31.664]  rmsRel=0.0068
+----------------------------------------------------------------------------------------------------
+MODEL (d) exchangeable skewed marginal (MC, 400k tokens, exact w/o replacement):
+  Zipf H=4.54              H=5.77b E[I]=2.922 sum q^2=2.922 U(2..5)=[13.08 17.27 20.97 24.32] rmsRel=0.1791
+  Zipf H=5.22              H=6.11b E[I]=2.436 sum q^2=2.437 U(2..5)=[13.56 18.27 22.46 26.29] rmsRel=0.1279
+  anchor(hot-set)          H=5.35b E[I]=2.617 sum q^2=2.615 U(2..5)=[13.38 17.31 20.36 22.85] rmsRel=0.1986
+  flat H=4.54 (N=23.46)    H=4.54b E[I]=2.751 sum q^2=2.751 U(2..5)=[13.25 16.69 18.95 20.43] rmsRel=0.2473
+  flat H=5.22 (N=37.20)    H=5.22b E[I]=1.717 sum q^2=1.717 U(2..5)=[14.28 19.22 23.09 26.14] rmsRel=0.1101
+  Zipf exponents: s(H=4.54)=1.369  s(H=5.22)=1.229
+  moment bound: max U(5) over ALL marginals with sum q=8, sum q^2=1.544: 32.25  (measured U(5)=31.40 -> shortfall >= -0.85)
+----------------------------------------------------------------------------------------------------
+out-of-sample (fit K=2..4, predict K=5; measured 31.40):
+  (a1) N_eff: 76.005
+  (a1) U(5): 31.258
+  (b) DM: 91.338
+  (b) U(5): 31.515
+  (c2) lam: 0.163
+  (c2) U(5): 32.178
+  (e1) N,kap: (95.49999999922608, 0.09767967426088775)
+  (e1) U(5): 31.439
+  (pl) U(5): 32.087
+  (c1) U(5): 32.922
+----------------------------------------------------------------------------------------------------
+extrapolations U(6), U(7), U(8):
+  a1   : U(6)= 35.84  U(7)= 39.91  U(8)= 43.58
+  a2   : U(6)= 36.08  U(7)= 40.30  U(8)= 44.12
+  b_pw : U(6)= 36.24  U(7)= 40.66  U(8)= 44.78
+  b_ls : U(6)= 36.24  U(7)= 40.66  U(8)= 44.78
+  b_lsx: U(6)= 35.32  U(7)= 39.26  U(8)= 42.87
+  c1   : U(6)= 38.80  U(7)= 44.54  U(8)= 50.15
+  c2   : U(6)= 37.11  U(7)= 42.35  U(8)= 47.44
+  e1   : U(6)= 36.24  U(7)= 40.68  U(8)= 44.79
+  e2   : U(6)= 29.53  U(7)= 31.63  U(8)= 33.52
+  pl   : U(6)= 36.98  U(7)= 42.16  U(8)= 47.23
+bootstrap 90% bands on U(8) (sigma=[0.06,0.15,0.20,0.25] on U(2..5)):
+  a1   : U(8) 5%=22.6 med=44.7 95%=63.6
+  b_ls : U(8) 5%=27.2 med=45.6 95%=57.4
+  b_lsx: U(8) 5%=23.5 med=43.2 95%=58.1
+  c2   : U(8) 5%=33.9 med=46.3 95%=49.6
+  e1   : U(8) 5%=20.6 med=46.3 95%=62.6
+  pl   : U(8) 5%=23.0 med=48.4 95%=74.4
+----------------------------------------------------------------------------------------------------
+P2(2) PREFILL CHUNK IO TABLE (per sparse layer: records = U(K)):
+    K |       U range (models) | recs/chunk 42U | GiB @13.56 | ms/tok @5.8GB/s | dedup saving
+    6 |     35.3 ..     38.8 |          1630 |       21.6 |           665.8 |        19.2%
+    7 |     39.3 ..     44.5 |          1871 |       24.8 |           655.1 |        20.5%
+    8 |     42.9 ..     50.1 |          2106 |       27.9 |           645.4 |        21.6%
+   16 |     62.4 ..     90.6 |          3805 |       50.4 |           583.1 |        29.2%
+   32 |     74.0 ..    153.6 |          6453 |       85.5 |           494.4 |        40.0%
+   64 |     76.6 ..    277.1 |         11639 |      154.1 |           445.8 |        45.9%
+  128 |     76.7 ..    288.0 |         12096 |      160.2 |           231.7 |        71.9%
+  256 |     76.7 ..    288.0 |         12096 |      160.2 |           115.8 |        85.9%
+====================================================================================================
+====================================================================================================
+P8: prefill chunk-size optimum
+measured ms/token: T=16:700 (cold) 32:356 64:180 -> per-chunk wall ms: [11200. 11392. 11520.]
+  (2048-token prompt at T=64: 32 chunks x 11.52s = 368.6s vs 369.4s measured)
+KDA per-token launch constant: 0.204..0.544 ms/token (34 KDA layers x2 launches x 3-8us)
+attention within-chunk coefficient alpha ~= 0.00725 ms/token per chunk-position
+----------------------------------------------------------------------------------------------------
+prescribed exact 3-param fit m(T)=a+b/T+w*U(T)/T under each U model:
+  a1  : U(16,32,64)=[62.4 74.  76.6]  a=    3.01 b=  10379.5 w= 12.38 -> BW_eff=   48.2 GB/s
+  b_ls: U(16,32,64)=[ 69.9  99.4 129.5]  a=   -4.36 b=  10648.2 w=  8.89 -> BW_eff=   67.2 GB/s
+  c1  : U(16,32,64)=[ 90.6 152.  223.5]  a=   -7.12 b=  10862.8 w=  4.98 -> BW_eff=  119.9 GB/s
+  pl  : U(16,32,64)=[ 85.2 153.6 277.1]  a=  -69.46 b=  10689.4 w= 19.04 -> BW_eff=   31.4 GB/s
+----------------------------------------------------------------------------------------------------
+anchored warm-2-point fit (T=32,64): w=(128-32a)/(U64-U32), b from eq1
+  b_ls a=0.000: U32=  99.4 U64= 129.5 -> w=   4.251 BW_eff=   140.5 GB/s b=  10969.4
+  b_ls a=0.204: U32=  99.4 U64= 129.5 -> w=   4.034 BW_eff=   148.0 GB/s b=  10984.4
+  b_ls a=0.374: U32=  99.4 U64= 129.5 -> w=   3.854 BW_eff=   155.0 GB/s b=  10997.0
+  b_ls a=0.544: U32=  99.4 U64= 129.5 -> w=   3.673 BW_eff=   162.6 GB/s b=  11009.5
+  c1   a=0.000: U32= 152.0 U64= 223.5 -> w=   1.791 BW_eff=   333.4 GB/s b=  11119.7
+  c1   a=0.204: U32= 152.0 U64= 223.5 -> w=   1.700 BW_eff=   351.3 GB/s b=  11127.0
+  c1   a=0.374: U32= 152.0 U64= 223.5 -> w=   1.624 BW_eff=   367.8 GB/s b=  11133.2
+  c1   a=0.544: U32= 152.0 U64= 223.5 -> w=   1.548 BW_eff=   385.9 GB/s b=  11139.3
+  pl   a=0.000: U32= 153.6 U64= 277.1 -> w=   1.037 BW_eff=   576.0 GB/s b=  11232.7
+  pl   a=0.204: U32= 153.6 U64= 277.1 -> w=   0.984 BW_eff=   607.0 GB/s b=  11234.3
+  pl   a=0.374: U32= 153.6 U64= 277.1 -> w=   0.940 BW_eff=   635.4 GB/s b=  11235.6
+  pl   a=0.544: U32= 153.6 U64= 277.1 -> w=   0.896 BW_eff=   666.7 GB/s b=  11237.0
+----------------------------------------------------------------------------------------------------
+constant-chunk-wall interpretation: chunk ~11.37 s at BW => records/layer read:
+  BW=5.80 GB/s -> R= 110.4 recs/layer (  4638 recs,   61.4 GiB/chunk)
+  BW=5.45 GB/s -> R= 103.8 recs/layer (  4358 recs,   57.7 GiB/chunk)
+  BW=4.75 GB/s -> R=  90.4 recs/layer (  3798 recs,   50.3 GiB/chunk)
+  BW=3.70 GB/s -> R=  70.4 recs/layer (  2959 recs,   39.2 GiB/chunk)
+----------------------------------------------------------------------------------------------------
+predictions T=128/256/512 (ms/token):
+  A const-reads (R=110,BW=5.8)
+    T=128: base=  88.9  +KDA-fusion=  88.5  +packed=  83.6  both=  83.2
+    T=256: base=  44.6  +KDA-fusion=  44.2  +packed=  42.0  both=  41.6
+    T=512: base=  22.5  +KDA-fusion=  22.1  +packed=  21.2  both=  20.8
+  B mid-U (b* DM), hits h=50
+    T=128: base=  69.2  +KDA-fusion=  68.9  +packed=  65.1  both=  64.8
+    T=256: base=  43.3  +KDA-fusion=  42.9  +packed=  40.7  both=  40.4
+    T=512: base=  25.6  +KDA-fusion=  25.3  +packed=  24.1  both=  23.8
+  C high-U (c1), hits h=81
+    T=128: base= 155.2  +KDA-fusion= 154.8  +packed= 146.0  both= 145.6
+    T=256: base=  83.3  +KDA-fusion=  83.0  +packed=  78.4  both=  78.0
+    T=512: base=  42.0  +KDA-fusion=  41.6  +packed=  39.5  both=  39.1
+----------------------------------------------------------------------------------------------------
+T* derivation and VRAM table:
+  T= 32 U(b_lsx)=  88.2 -> per-layer staging  1.17 GiB, 42-layer union   49.0 GiB, retention24 x42 = 13.35 GiB
+  T= 32 U(c1)= 152.0 -> per-layer staging  2.01 GiB, 42-layer union   84.6 GiB, retention24 x42 = 13.35 GiB
+  T= 64 U(b_lsx)= 112.5 -> per-layer staging  1.49 GiB, 42-layer union   62.6 GiB, retention24 x42 = 13.35 GiB
+  T= 64 U(c1)= 223.5 -> per-layer staging  2.96 GiB, 42-layer union  124.3 GiB, retention24 x42 = 13.35 GiB
+  T=128 U(b_lsx)= 135.6 -> per-layer staging  1.80 GiB, 42-layer union   75.4 GiB, retention24 x42 = 13.35 GiB
+  T=128 U(c1)= 273.5 -> per-layer staging  3.62 GiB, 42-layer union  152.1 GiB, retention24 x42 = 13.35 GiB
+  T=256 U(b_lsx)= 156.7 -> per-layer staging  2.08 GiB, 42-layer union   87.2 GiB, retention24 x42 = 13.35 GiB
+  T=256 U(c1)= 287.3 -> per-layer staging  3.80 GiB, 42-layer union  159.8 GiB, retention24 x42 = 13.35 GiB
+  T=512 U(b_lsx)= 175.6 -> per-layer staging  2.33 GiB, 42-layer union   97.7 GiB, retention24 x42 = 13.35 GiB
+  T=512 U(c1)= 288.0 -> per-layer staging  3.81 GiB, 42-layer union  160.2 GiB, retention24 x42 = 13.35 GiB
+====================================================================================================
+done.

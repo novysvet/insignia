@@ -1,0 +1,226 @@
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+
+==============================================================================
+== A. TRACE INVENTORY (from caches)
+==============================================================================
+trace      tokens train test acts/layer distinct/layer           H bits/layer
+realtext        5     2    3         40     31.4 [ 27, 38]     4.82 [4.51,5.22]
+campaign       60    30   30        480     70.7 [ 31,109]     5.14 [4.20,6.09]
+math           12     6    6         96     51.9 [ 32, 76]     5.35 [4.46,6.10]
+audit anchors: entropy 4.54-5.22 bits; adjacent-token I/8 mean 0.193
+  adjacent-token same-layer overlap realtext  : mean I/8 = 0.193  (pairs=4)
+  adjacent-token same-layer overlap campaign  : mean I/8 = 0.303  (pairs=59)
+  adjacent-token same-layer overlap math      : mean I/8 = 0.259  (pairs=11)
+  early-route-math built-in pair column (|e SET u|/8): mean = 0.599
+
+==============================================================================
+== B. IN-SAMPLE TOP-B COVERAGE (share of activations), avg over 42 layers
+==============================================================================
+  B | realtext | campaign |     math | POOL avg POOL min POOL max
+  1 |   9.46 |   9.19 |   8.33 |   7.47   3.73  11.36
+  2 |  16.25 |  17.36 |  14.66 |  14.04   7.47  20.29
+  3 |  21.43 |  24.19 |  20.06 |  19.44  11.20  29.22
+  4 |  26.13 |  30.19 |  24.70 |  24.20  14.94  35.55
+  5 |  30.54 |  35.46 |  28.70 |  28.44  17.86  40.58
+  6 |  34.46 |  40.32 |  32.29 |  32.32  20.62  45.29
+  7 |  37.98 |  44.80 |  35.54 |  35.94  23.38  50.00
+  8 |  41.07 |  48.90 |  38.57 |  39.31  25.97  54.71
+ 10 |  46.43 |  56.15 |  44.00 |  45.28  30.68  62.82
+ 12 |  51.49 |  62.06 |  48.74 |  50.30  34.58  67.53
+ 14 |  56.49 |  66.98 |  53.10 |  54.56  38.31  71.10
+ 16 |  61.49 |  70.97 |  57.24 |  58.11  41.23  74.51
+ 20 |  71.49 |  76.84 |  64.76 |  63.65  46.10  78.41
+ 24 |  81.49 |  81.03 |  70.59 |  67.88  50.32  81.17
+ 28 |  91.25 |  84.28 |  75.07 |  71.29  54.22  83.44
+ 32 |  97.38 |  86.91 |  79.24 |  74.23  57.63  85.23
+ 36 |  99.70 |  89.07 |  83.31 |  76.79  60.88  86.69
+ 40 | 100.00 |  90.89 |  87.28 |  79.04  64.12  87.99
+ 44 | 100.00 |  92.41 |  91.00 |  81.03  66.72  89.77
+ 48 | 100.00 |  93.70 |  94.07 |  82.84  69.32  91.07
+ 52 | 100.00 |  94.79 |  96.21 |  84.52  71.92  92.37
+ 56 | 100.00 |  95.71 |  97.52 |  86.07  74.19  93.51
+ 57 | 100.00 |  95.92 |  97.74 |  86.43  74.68  93.67
+ 60 | 100.00 |  96.47 |  98.36 |  87.44  76.14  94.16
+ 64 | 100.00 |  97.08 |  99.06 |  88.60  78.08  94.81
+ 68 | 100.00 |  97.65 |  99.55 |  89.68  80.03  95.45
+ 72 | 100.00 |  98.17 |  99.90 |  90.73  81.98  96.10
+ 76 | 100.00 |  98.61 | 100.00 |  91.68  83.60  96.75
+ 80 | 100.00 |  98.98 | 100.00 |  92.56  84.90  97.40
+ 84 | 100.00 |  99.30 | 100.00 |  93.41  86.20  98.05
+ 88 | 100.00 |  99.53 | 100.00 |  94.18  87.50  98.70
+ 92 | 100.00 |  99.72 | 100.00 |  94.88  88.80  99.35
+ 96 | 100.00 |  99.86 | 100.00 |  95.58  90.10 100.00
+audit anchors: top-1 9.46%  top-8 41.07%  top-28 91.49%  (of accesses, per layer)
+full curve CSV -> /var/lib/insignia/analysis/hotset/insample_curve.csv
+
+==============================================================================
+== C. SPLIT-SAMPLE OOS HIT RATE (top-B built on first half, hit on second half)
+==============================================================================
+trace      n_test_acts/layer | B= 8 | B=16 | B=28 | B=48 | B=57 | B=96
+realtext                  24 | 13.19 | 20.04 | 24.01 | 30.16 | 33.63 | 44.94
+campaign                 240 | 39.93 | 57.95 | 69.98 | 77.78 | 81.03 | 84.59
+math                      48 | 21.43 | 29.27 | 40.62 | 45.68 | 48.02 | 57.19
+pooled                   312 | 31.21 | 47.60 | 57.75 | 66.36 | 68.89 | 77.77
+
+Wilson 95% CI on the pooled-activation OOS rate (iid-activation assumption; optimistic):
+trace      B= 8 | B=16 | B=28 | B=48 | B=57 | B=96
+realtext   11.2- 15.4 | 17.7- 22.6 | 21.5- 26.7 | 27.4- 33.1 | 30.8- 36.6 | 41.9- 48.0
+campaign   39.0- 40.9 | 57.0- 58.9 | 69.1- 70.9 | 77.0- 78.6 | 80.3- 81.8 | 83.9- 85.3
+math       19.7- 23.3 | 27.3- 31.3 | 38.5- 42.8 | 43.5- 47.9 | 45.8- 50.2 | 55.0- 59.3
+pooled     30.4- 32.0 | 46.7- 48.5 | 56.9- 58.6 | 65.5- 67.2 | 68.1- 69.7 | 77.1- 78.5
+per-layer OOS CSV -> /var/lib/insignia/analysis/hotset/oos_perlayer.csv
+
+==============================================================================
+== C2. CROSS-TEXT TRANSFER (train first halves on one text set, test second half of another)
+==============================================================================
+                   train set   test set | B= 8 | B=16 | B=28 | B=48 | B=57 | B=96
+campaign+math+realtext -> each   realtext | 4.37 | 8.93 | 14.78 | 25.20 | 31.75 | 47.72
+campaign+math+realtext -> each   campaign | 38.22 | 56.80 | 67.16 | 74.82 | 76.67 | 83.66
+campaign+math+realtext -> each       math | 9.57 | 20.93 | 32.14 | 44.64 | 48.61 | 63.34
+   campaign only -> realtext   realtext | 2.68 | 6.75 | 11.41 | 19.05 | 22.62 | 35.42
+       campaign only -> math       math | 7.19 | 14.88 | 23.66 | 33.88 | 37.50 | 47.27
+   realtext+math -> campaign   campaign | 4.36 | 7.53 | 11.66 | 19.37 | 22.05 | 35.45
+
+==============================================================================
+== D. HOST-TIER ALLOCATION, budget split across 42 layers (OOS on second half)
+==============================================================================
+
+--- total slots = 2425 (57.7/layer equal) ---
+trace      equal OOS waterfill OOS wf-eq (pp)   equal in-sample wf in-sample
+realtext    34.03  34.03     +0.00            100.00       100.00
+campaign    81.11  82.06     +0.95             98.12       100.00
+math        48.16  50.25     +2.08            100.00       100.00
+pooled      69.12  68.01     -1.11             90.85        90.89
+  pooled water-fill B_l spread: min=32 p25=45 med=54 p75=66 max=97; layers pinned to 0: 0, layers at >=288: 0
+
+--- total slots = 3620 (86.2/layer equal) ---
+trace      equal OOS waterfill OOS wf-eq (pp)   equal in-sample wf in-sample
+realtext    41.96  42.56     +0.60            100.00       100.00
+campaign    83.78  83.11     -0.67            100.00       100.00
+math        54.61  58.28     +3.67            100.00       100.00
+pooled      76.27  76.91     +0.64             98.48       100.00
+  pooled water-fill B_l spread: min=59 p25=76 med=86 p75=94 max=125; layers pinned to 0: 0, layers at >=288: 0
+
+==============================================================================
+== E. VRAM MIRROR (~330 slots), OOS on second half
+==============================================================================
+per-layer uniform top-k:
+trace      k=1(slots 42) | k=2(slots 84) | k=4(slots 168) | k=7(slots 294) | k=8(slots 336)
+realtext           3.37 |         7.34 |         9.23 |        12.20 |        13.19
+campaign           7.17 |        14.06 |        25.17 |        36.21 |        39.93
+math               5.75 |         8.88 |        14.98 |        19.84 |        21.43
+pooled             5.65 |        11.61 |        19.64 |        28.27 |        31.21
+
+equal-split vs global-hottest at matched totals:
+trace      total   equal  global global-eq (pp)
+realtext     294  12.20  10.32         -1.88
+realtext     321  12.80  11.90         -0.89
+realtext     330  13.00  11.90         -1.09
+realtext     336  13.19  12.10         -1.09
+campaign     294  36.21  38.45         +2.24
+campaign     321  38.60  40.60         +1.99
+campaign     330  38.97  41.38         +2.41
+campaign     336  39.93  41.54         +1.61
+math         294  19.84  20.09         +0.25
+math         321  20.88  20.59         -0.30
+math         330  21.28  21.03         -0.25
+math         336  21.43  21.23         -0.20
+pooled       294  28.27  30.27         +1.99
+pooled       321  30.14  31.81         +1.66
+pooled       330  30.73  32.28         +1.55
+pooled       336  31.21  32.66         +1.45
+
+==============================================================================
+== F. MARGINAL OOS HIT PER +100 SLOTS (2425 -> 3620)
+==============================================================================
+cost per marginal missed record: 3.8 ms (3.7 GB/s) .. 2.4 ms (5.84 GB/s); audit avg b = 0.60 ms
+total | pool eq pool wf d_wf pp ms/tok(3.7) |  cmp eq  cmp wf
+ 2425 |  69.12  68.01    nan        nan |  81.11  82.06
+ 2525 |  69.70  69.01   1.00       12.9 |  81.52  82.13
+ 2625 |  70.15  69.89   0.88       11.3 |  81.75  82.21
+ 2725 |  70.95  70.73   0.84       10.8 |  82.00  82.36
+ 2825 |  71.61  71.60   0.88       11.3 |  82.36  82.36
+ 2925 |  72.57  72.43   0.82       10.6 |  82.73  82.40
+ 3025 |  73.19  73.31   0.88       11.3 |  82.98  82.83
+ 3125 |  73.73  74.08   0.77       10.0 |  83.18  82.85
+ 3225 |  74.25  74.84   0.76        9.9 |  83.26  82.90
+ 3325 |  74.82  75.43   0.60        7.7 |  83.38  82.90
+ 3425 |  75.29  76.08   0.65        8.4 |  83.55  82.90
+ 3525 |  75.74  76.47   0.38        4.9 |  83.61  83.08
+ 3620 |  76.27  76.91   0.44        5.7 |  83.78  83.11
++600 slots from 2425 (pooled   equal    ): dOOS = +4.08 pp =  13.7 rec/token ->  52.6/33.3 ms at NVMe,  8.2 ms at b=0.6ms (+10.2% of 516.7 ms/token)
++600 slots from 2425 (pooled   waterfill): dOOS = +5.30 pp =  17.8 rec/token ->  68.4/43.3 ms at NVMe, 10.7 ms at b=0.6ms (+13.2% of 516.7 ms/token)
++600 slots from 2425 (campaign equal    ): dOOS = +1.87 pp =   6.3 rec/token ->  24.1/15.3 ms at NVMe,  3.8 ms at b=0.6ms (+4.7% of 516.7 ms/token)
++600 slots from 2425 (campaign waterfill): dOOS = +0.76 pp =   2.6 rec/token ->   9.9/ 6.2 ms at NVMe,  1.5 ms at b=0.6ms (+1.9% of 516.7 ms/token)
++1195 slots from 2425 (pooled   equal    ): dOOS = +7.15 pp =  24.0 rec/token ->  92.3/58.5 ms at NVMe, 14.4 ms at b=0.6ms (+17.9% of 516.7 ms/token)
++1195 slots from 2425 (pooled   waterfill): dOOS = +8.90 pp =  29.9 rec/token -> 114.9/72.8 ms at NVMe, 17.9 ms at b=0.6ms (+22.2% of 516.7 ms/token)
++1195 slots from 2425 (campaign equal    ): dOOS = +2.67 pp =   9.0 rec/token ->  34.5/21.8 ms at NVMe,  5.4 ms at b=0.6ms (+6.7% of 516.7 ms/token)
++1195 slots from 2425 (campaign waterfill): dOOS = +1.04 pp =   3.5 rec/token ->  13.5/ 8.5 ms at NVMe,  2.1 ms at b=0.6ms (+2.6% of 516.7 ms/token)
+
+campaign train counts at per-layer rank 1/4/8/12/16/28/57 (median over layers):
+  rank  1: median count  24.0  (of 240 train acts)
+  rank  4: median count  14.0  (of 240 train acts)
+  rank  8: median count   9.0  (of 240 train acts)
+  rank 12: median count   6.0  (of 240 train acts)
+  rank 16: median count   4.0  (of 240 train acts)
+  rank 28: median count   2.0  (of 240 train acts)
+  rank 57: median count   0.0  (of 240 train acts)
+
+==============================================================================
+== G. BLOCK-BOOTSTRAP 95% CIs (token blocks, 2000 reps)
+==============================================================================
+
+pooled:
+  OOS top- 8: 28.6..34.1%
+  OOS top-28: 54.3..61.6%
+  OOS top-57: 65.2..72.7%
+  wf@2425: 64.2..72.0%   eq@2425: 65.4..72.9%
+  wf@3620: 73.7..80.3%   eq@3620: 73.0..79.7%
+  wf-eq @2425: -1.43..-0.77 pp
+  wf-eq @3620: +0.44..+0.82 pp
+  wf +600 slots (2425->3025): +4.71..+5.84 pp
+  eq +600 slots (2425->3025): +3.73..+4.43 pp
+  per-layer top-8 (336 slots) minus global-336: -1.71..-1.20 pp
+
+campaign:
+  OOS top- 8: 36.5..43.5%
+  OOS top-28: 65.5..74.6%
+  OOS top-57: 76.7..85.2%
+  wf@2425: 77.6..86.1%   eq@2425: 76.8..85.2%
+  wf@3620: 79.0..86.9%   eq@3620: 79.6..87.7%
+  wf-eq @2425: +0.74..+1.15 pp
+  wf-eq @3620: -0.87..-0.44 pp
+  wf +600 slots (2425->3025): +0.55..+1.00 pp
+  eq +600 slots (2425->3025): +1.58..+2.10 pp
+  per-layer top-8 (336 slots) minus global-336: -1.94..-1.29 pp
+
+==============================================================================
+== H. POWER / SAMPLE-SIZE STATEMENT
+==============================================================================
+two-proportion test (alpha=0.05 two-sided, 80% power), per LAYER, counts in activations;
+tokens/arm per layer = n/8 (8 activations per token per layer); one trace feeds all 42 layers at once.
+   p1    p2 n/arm (acts) tokens/arm  tokens, both arms
+ 0.45   0.5         1565        196                392
+ 0.41  0.45         2404        301                602
+ 0.28  0.33         1330        167                334
+  0.8  0.85          906        114                228
+
+Wilson half-width at p=0.5 vs per-layer test-half size (activations = 8*tokens):
+tokens in test half acts/layer half-width
+                  3         24     20.00pp
+                  6         48     14.15pp
+                 30        240      6.33pp
+                 39        312      5.55pp
+                125       1000      3.10pp
+                250       2000      2.19pp
+               1000       8000      1.10pp
+               2000      16000      0.77pp
+
+n for +/-1pp (95%, p~0.5): 9604 acts/layer ~ 1200 tokens; +/-0.5pp: 38416 acts ~ 4800 tokens.
+Caveats: (i) Wilson assumes iid activations; adjacent-token routing overlap (0.19-0.30 here)
+clusters hits -> inflate 2-4x; (ii) prompt-to-prompt variance dominates (campaign vs realtext
+in-sample rates differ strongly) -> collect across >=8 independent prompts.
+
+analysis complete; caches+CSVs in /var/lib/insignia/analysis/hotset/

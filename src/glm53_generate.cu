@@ -593,6 +593,11 @@ public:
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
             vram_budget_mb_ = std::max(0, std::atoi(budget));
+        // F3 residency ordering: consult the VRAM expert tier before starting
+        // an NVMe read. The legacy order only noticed device residency at
+        // upload time, after the bytes had already been re-read from disk.
+        if (const char *f3 = std::getenv("INSIGNIA_GLM53_F3"))
+            f3_device_consult_ = std::atoi(f3) != 0;
         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS")) {
             const char *gpu = std::getenv("INSIGNIA_GLM53_PACKED_GPU");
             packed_gpu_scales_ = !gpu || std::atoi(gpu) != 0;
@@ -718,6 +723,7 @@ public:
         batch_admit_.fill(true);
         batch_populate_.fill(false);
         batch_window_.fill(-1);
+        batch_device_.fill(false);
         batch_count_ = count;
         batch_read_begin_ = std::chrono::steady_clock::now();
         batch_read_ends_.clear();
@@ -729,7 +735,7 @@ public:
             const auto found = flight_index_.find(route_key(layer, experts[slot]));
             if (found != flight_index_.end()) windows_[size_t(found->second)].claimed = true;
         }
-        int hits = 0, adopted = 0;
+        int hits = 0, adopted = 0, f3_rescued = 0;
         uint64_t started_bytes = 0;
         for (int slot = 0; slot < count; ++slot) {
             const int expert = experts[slot];
@@ -769,6 +775,22 @@ public:
                 }
                 continue;
             }
+            // F3 residency ordering: the record may sit in the VRAM tier from
+            // an earlier token even though its host window was evicted. The
+            // legacy flow re-read 13.5 MiB from NVMe and only noticed the
+            // device hit inside upload(); adopting the slot here skips both
+            // the disk read and the window churn. If the slot is recycled in
+            // the narrow window before upload (this batch's own misses are
+            // the only possible evictor), upload falls back to a demand read.
+            if (f3_device_consult_ && device_arena_) {
+                const auto device_resident = device_index_.find(key);
+                if (device_resident != device_index_.end()) {
+                    batch_device_[size_t(slot)] = true;
+                    batch_cached_[size_t(slot)] = true;
+                    ++f3_rescued;
+                    continue;
+                }
+            }
             const int window = take_window();
             start_read(window, key, layer, expert, true);
             batch_window_[slot] = window;
@@ -795,7 +817,8 @@ public:
         }
         cache_hits_ += hits;
         cache_lookups_ += count;
-        batch_demand_count_ = count - hits;
+        f3_rescued_ += uint64_t(f3_rescued);
+        batch_demand_count_ = count - hits - f3_rescued;
         batch_read_ends_.clear();
         batch_read_ends_.reserve(8);
         if (!overlap_reads_)
@@ -819,6 +842,10 @@ public:
                 if (!window_done(resident->second)) promote_read(resident->second);
                 continue;
             }
+            // F3: a device-resident record needs no host read-ahead; the
+            // batch consult adopts the VRAM slot directly at upload time.
+            if (f3_device_consult_ && device_arena_ && device_index_.count(key))
+                continue;
             const int window = take_window();
             start_read(window, key, layer, experts[index], true);
             windows_[size_t(window)].claimed = true;
@@ -826,6 +853,38 @@ public:
         }
     }
     void upload(int slot) {
+        if (batch_device_[size_t(slot)]) {
+            // F3 device-resident adoption (consulted in load_batch). Serve
+            // straight from the VRAM arena: no host window was ever read.
+            const uint32_t key = route_key(batch_layer_, batch_experts_[size_t(slot)]);
+            const auto found = device_index_.find(key);
+            if (found != device_index_.end()) {
+                // Fence the previous active slot exactly like the regular
+                // path, then adopt this one.
+                if (active_device_slot_ >= 0)
+                    check(cudaEventRecord(device_slot_reads_[size_t(active_device_slot_)], nullptr),
+                          "fence active expert slot");
+                ++device_lookups_;
+                ++device_hits_;
+                const int device_slot = found->second;
+                device_slot_stamps_[size_t(device_slot)] = ++device_stamp_;
+                active_device_ = device_arena_ + size_t(device_slot) * device_stride_;
+                active_device_slot_ = device_slot;
+                active_ = device_slot_layouts_[size_t(device_slot)];
+                active_globals_ = device_slot_globals_[size_t(device_slot)];
+                batch_device_[size_t(slot)] = false;
+                return;
+            }
+            // The slot was recycled between the batch consult and this
+            // upload (only this batch's own miss uploads can evict). Stage
+            // the demand read now and fall through to the regular path.
+            const int window = take_window();
+            start_read(window, key, batch_layer_, batch_experts_[size_t(slot)], true);
+            io_bytes_ += windows_[size_t(window)].source_bytes;
+            batch_window_[size_t(slot)] = window;
+            batch_device_[size_t(slot)] = false;
+            batch_cached_[size_t(slot)] = false;
+        }
         const int window = batch_window_[slot];
         require(window >= 0, "expert slot has no record in flight");
         WindowState &state = windows_[size_t(window)];
@@ -874,6 +933,11 @@ public:
                 device_slot_keys_[size_t(device_slot)] = key;
                 device_slot_pinned_[size_t(device_slot)] =
                     pinned_device_keys_.count(key) ? 1 : 0;
+                // F3: remember how this slot's image is laid out (and its
+                // host-side globals) so a host-evicted record can be served
+                // by upload() without an NVMe re-read.
+                device_slot_layouts_[size_t(device_slot)] = state.layout;
+                device_slot_globals_[size_t(device_slot)] = state.globals;
             }
             device_slot_stamps_[size_t(device_slot)] = ++device_stamp_;
             active_device_ = device_arena_ + size_t(device_slot) * device_stride_;
@@ -934,6 +998,7 @@ public:
     int cache_slots() const { return window_count_; }
     double read_wait_seconds() const { return read_wait_seconds_; }
     uint64_t device_hits() const { return device_hits_; }
+    uint64_t f3_rescued() const { return f3_rescued_; }
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
     bool packed_experts() const { return packed_fd_ >= 0; }
@@ -1368,6 +1433,8 @@ private:
         device_slot_keys_.assign(attempt, kNoKey);
         device_slot_stamps_.assign(attempt, 0);
         device_slot_pinned_.assign(attempt, 0);
+        device_slot_layouts_.assign(attempt, Layout{});
+        device_slot_globals_.assign(attempt, std::array<float, 3>{});
         device_slot_reads_.resize(attempt, nullptr);
         for (cudaEvent_t &event : device_slot_reads_)
             check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
@@ -1762,10 +1829,16 @@ private:
     std::vector<uint32_t> device_slot_keys_;
     std::vector<uint64_t> device_slot_stamps_;
     std::vector<uint8_t> device_slot_pinned_;
+    std::vector<Layout> device_slot_layouts_;
+    std::vector<std::array<float, 3>> device_slot_globals_;
     std::unordered_set<uint32_t> pinned_device_keys_;
     std::vector<cudaEvent_t> device_slot_reads_;
     std::unordered_map<uint32_t, int> device_index_;
     uint64_t device_hits_ = 0, device_lookups_ = 0;
+    // F3 device-consult state (INSIGNIA_GLM53_F3).
+    bool f3_device_consult_ = false;
+    std::array<bool, 8> batch_device_{};
+    uint64_t f3_rescued_ = 0;
 };
 
 class Q8Stager {
@@ -4298,6 +4371,12 @@ std::vector<std::pair<int, float>> Runner::step(
                     100.0 * expert_stager_->device_hits() / expert_stager_->device_lookups(),
                     expert_stager_->device_hits() * ExpertStager::kPayloadCapacity / double(1ull << 30),
                     expert_stager_->device_slots());
+    if (expert_stager_ && expert_stager_->f3_rescued())
+        std::printf("  F3 device-consult rescued %llu reads (%.3f GiB NVMe avoided)\n",
+                    (unsigned long long)expert_stager_->f3_rescued(),
+                    expert_stager_->f3_rescued() *
+                        (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes) /
+                        double(1ull << 30));
     if (expert_stager_ && expert_stager_->cache_lookups())
         std::printf("  expert read-wait %.3f s of %.3f s expert wall (demand blocks on NVMe/pool)\n",
                     expert_stager_->read_wait_seconds(), expert_io_seconds());

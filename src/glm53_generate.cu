@@ -2020,7 +2020,13 @@ public:
         c_attn_.reset(size_t(kMaxChunk()) * hidden_);
         c_ffn_.reset(size_t(kMaxChunk()) * hidden_);
         c_routed_.reset(size_t(kMaxChunk()) * hidden_);
-        c_expert_out_.reset(size_t(kMaxVerify) * moe_topk_ * hidden_);
+        // Verification stores one down-projection per pick so it can replay
+        // scalar router order.  Chunks above the parity-proven 64 rows need
+        // the same scratch for every row: expert weights are still read once
+        // for the 128-row union, then routed accumulation is replayed in the
+        // two legacy 64-row union orders.
+        const int expert_out_rows = kMaxChunk() > 64 ? kMaxChunk() : kMaxVerify;
+        c_expert_out_.reset(size_t(expert_out_rows) * moe_topk_ * hidden_);
         c_q_.reset(size_t(kMaxChunk()) * kda_width_);
         c_k_.reset(size_t(kMaxChunk()) * kda_width_);
         c_v_.reset(size_t(kMaxChunk()) * kda_width_);
@@ -3578,7 +3584,13 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         // later token's router top-k order. Verification must retain each
         // down result and reproduce the scalar fmaf order exactly; otherwise
         // close target-logit ties can flip and break greedy equivalence.
+        // Likewise, a >64-row prompt union changes the effective accumulation
+        // order of its second 64 rows. Retain those results and replay the
+        // legacy per-64-row union order while keeping expert compute and I/O
+        // deduplicated across the full chunk.
         const bool ordered_accumulation = kda_archive_;
+        const bool legacy_chunk_accumulation = !kda_archive_ && tokens > 64;
+        const bool retain_down_results = ordered_accumulation || legacy_chunk_accumulation;
         for (size_t base_slot = 0; base_slot < distinct.size(); base_slot += 8) {
             std::array<int, 8> batch{};
             for (size_t slot = 0; slot < 8; ++slot)
@@ -3671,7 +3683,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     check(insignia::glm53::quantize_swiglu_activation_rows(
                               c_gateu_.get(), c_up_.get(), moe_intermediate_, &users[size_t(base)],
                               count, nv_workspace_2048_), "quantize routed SwiGLU (batched prefill)");
-                    if (ordered_accumulation) {
+                    if (retain_down_results) {
                         check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
                                   expert_stager_->down_weight(), expert_stager_->down_scale(),
                                   expert_stager_->down_global(int(slot)), nv_workspace_2048_,
@@ -3695,6 +3707,26 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                         c_expert_out_.get() +
                             (size_t(token) * topk + size_t(pick_slot)) * hidden_,
                         selection[token][size_t(pick_slot)].second, hidden_);
+        else if (legacy_chunk_accumulation)
+            for (int chunk_base = 0; chunk_base < tokens; chunk_base += 64) {
+                const int chunk_end = std::min(chunk_base + 64, tokens);
+                std::vector<int> chunk_distinct;
+                chunk_distinct.reserve(distinct.size());
+                for (int token = chunk_base; token < chunk_end; ++token)
+                    for (const auto &[expert, weight] : selection[size_t(token)])
+                        if (std::find(chunk_distinct.begin(), chunk_distinct.end(), expert) ==
+                            chunk_distinct.end())
+                            chunk_distinct.push_back(expert);
+                for (int expert : chunk_distinct)
+                    for (int token = chunk_base; token < chunk_end; ++token)
+                        for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
+                            if (selection[size_t(token)][size_t(pick_slot)].first == expert)
+                                scale_add_kernel<<<16, 256>>>(
+                                    c_routed_.get() + size_t(token) * hidden_,
+                                    c_expert_out_.get() +
+                                        (size_t(token) * topk + size_t(pick_slot)) * hidden_,
+                                    selection[size_t(token)][size_t(pick_slot)].second, hidden_);
+            }
     }
     if (!nvfp4_experts_)
         mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);

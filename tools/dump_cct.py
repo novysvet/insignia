@@ -44,8 +44,11 @@ for a in range(FIRST_SPARSE, LAYERS - 1):
         if a in routing and a + 1 in routing:
             for e in routing[a]:
                 co[e, routing[a + 1]] += 1
-    # Top-8 per expert by count, ties broken by smaller id.
-    order = np.argsort(-co, axis=1, kind="stable")[:, :topk].astype(np.uint16)
+    # Top-8 per expert by count, ties broken by smaller id. The counts MUST
+    # be widened before negation: -co on uint32 wraps (0 -> 2^32, k -> 2^32-k)
+    # and the ascending argsort would rank never-co-activated experts first,
+    # turning the whole table into an anti-signal ranking of small ids.
+    order = np.argsort(-co.astype(np.int64), axis=1, kind="stable")[:, :topk].astype(np.uint16)
     tables.append(order)
 
 with open(out, "wb") as f:

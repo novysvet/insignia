@@ -56,6 +56,10 @@ These are the author's stated rules. They are the project's constitution:
   slow float conversions/divisions).
 - Use inline assembly when the compiler misbehaves (force exact machine
   instructions when compiler heuristics generate suboptimal assembly).
+- Write host hot paths in assembly when intrinsics or the compiler fail to
+  emit the ISA's AI instructions (force `VPDPBUSD`/`VPDPWSSD` via inline
+  asm or Xbyak). The host target is this exact raptorlake box and nothing
+  else: no CPUID dispatch, no -march=native guessing, no portable fallbacks.
 
 ## Ignore these completely, in the sake of performance
 
@@ -100,9 +104,17 @@ under WSL2 for the GLM path:
   memory (12.251 GHz effective, ~800 GB/s observed)**. Verified stable
   through sustained testing under load — no throttle/PCI/token faults, no
   clock dips, no token divergence.
-- CPU: Intel i7-14700KF (Raptor Lake). AVX2 + FMA + 256-bit AVX-VNNI + F16C +
-  GFNI. **No** AVX-512, AMX, AVX-VNNI-INT8, native BF16/FP16 arithmetic. See
-  `audits/14700kf-isa.md`.
+- CPU: Intel i7-14700KF (Raptor Lake Refresh; 8P+12E, 28 threads, Thread
+  Director). Verified by live CPUID on the box: SSE4.1/4.2, AVX2, FMA, F16C
+  (conversion only), **256-bit AVX-VNNI** (`VPDPBUSD`/`VPDPWSSD` — the client
+  "DL Boost" form), GFNI, VAES, PCLMULQDQ, BMI1/2, POPCNT, ERMS/FSRM,
+  WAITPKG. **No** AVX-512 of any form, AMX, AVX-VNNI-INT8/INT16,
+  AVX512-BF16, AVX512-FP16, NPU. GNA 3.0 exists in silicon but is a
+  Windows-driver speech/noise block unreachable from WSL2 — dead for this
+  engine. The host ISA contract is raptorlake exactly: portability is not
+  an issue, hand-written assembly (inline asm / Xbyak) is sanctioned
+  wherever the compiler misses the AI instructions, and portable fallback
+  paths are waste. See `audits/14700kf-isa.md`.
 - RAM: 60 GiB usable in WSL (62 GiB limit). Pinned expert cache sweet spot
   measured at 32 GiB (`INSIGNIA_GLM53_EXPERT_CACHE_MB=32768`, the engine
   default; requests above ~32–40 GiB fail `cudaHostAlloc` and halve).

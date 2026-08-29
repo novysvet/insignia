@@ -20,7 +20,10 @@ only allowed when a benchmark and disassembly prove they help.
   sweet spot.
 - glm-box: RTX 4070 Ti SUPER 16 GiB, overclocked +150 MHz core /
   +2000 MHz memory (~800 GB/s observed, verified stable), i7-14700KF
-  (AVX2/FMA/AVX-VNNI-256; no AVX-512/AMX), 60 GiB WSL RAM, single NVMe,
+  (8P+12E; AVX2/FMA/F16C + 256-bit AVX-VNNI [VPDPBUSD — the client DL
+  Boost] + GFNI/VAES; NO AVX-512/AMX/AVX-VNNI-INT8/NPU; GNA 3.0 silicon
+  present but WSL-unreachable; raptorlake-only host target, hand-written
+  asm sanctioned), 60 GiB WSL RAM, single NVMe,
   32 GiB pinned expert cache sweet spot.
 - Both: CUDA 13.3, Arch WSL2, sm_89. Ada has no block-scaled FP4 MMA:
   NVFP4 decodes through an Ada path (FP32-accum-from-nibbles beat DP4A);

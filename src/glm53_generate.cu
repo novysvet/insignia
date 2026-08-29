@@ -2723,10 +2723,10 @@ public:
                 std::getenv("INSIGNIA_GLM53_MLA_CROSS_HEAD_FP8") &&
                 std::atoi(std::getenv("INSIGNIA_GLM53_MLA_CROSS_HEAD_FP8")) != 0;
             if (mla_cross_head_fp8_) {
-                mla_qeff_u8_.reset(size_t(mla_heads_) * kv_a_rows_);
-                mla_qeff_scale_.reset(size_t(mla_heads_) *
+                mla_qeff_u8_.reset(size_t(kMaxChunk()) * mla_heads_ * kv_a_rows_);
+                mla_qeff_scale_.reset(size_t(kMaxChunk()) * mla_heads_ *
                                        insignia::glm53::kMlaLatentGroups);
-                std::printf("MLA long decode: approximate H8 cross-head FP8 MMA\n");
+                std::printf("MLA long path: approximate H8 decode / H4xQ8 fused prefill FP8 MMA\n");
             }
             const char *reconstruct = std::getenv("INSIGNIA_GLM53_MLA_RECON_PREFIX");
             mla_prefix_reconstruct_ = reconstruct && std::atoi(reconstruct) != 0 &&
@@ -4330,7 +4330,17 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
                       "scalar MLA attention (prefill)");
         }
     } else if (!exact_prefix) {
-        if (mla_fp8_absorb_)
+        const bool cross_prefill = mla_cross_head_fp8_ &&
+            (tokens >= 16 || position_base >= 4096);
+        if (mla_fp8_absorb_ && cross_prefill)
+            check(insignia::glm53::mla_prefill_latent_cross_head_fp8_absorb(
+                  c_mlaq_.get(), c_small_.get(), cache_u8, cache_scale,
+                  absorb_view->weights, absorb_view->scales,
+                  mla_qeff_u8_.get(), mla_qeff_scale_.get(),
+                  c_mlao_.get(), tokens,
+                  position_base, mla_heads_, mla_head_dim_, kv_a_rows_),
+                  "cross-head FP8 MLA latent prefill");
+        else if (mla_fp8_absorb_)
             check(insignia::glm53::mla_prefill_latent_fp8_absorb(
                   c_mlaq_.get(), c_small_.get(), cache_u8, cache_scale, cache_f32,
                   absorb_view->weights, absorb_view->scales, c_mlao_, tokens,

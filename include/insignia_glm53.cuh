@@ -478,4 +478,24 @@ cudaError_t mla_prefill_latent_fp8_absorb(
     int latent_dim = kMlaLatentDim,
     cudaStream_t stream = nullptr);
 
+// Approximate H4 x Q8 long-context prefill counterpart of the cross-head
+// decode path. qeff scratch is token-major. One persistent CTA scans the full
+// causal prefix for each (eight queries, four heads) tile and projects W_uv.
+cudaError_t mla_prefill_latent_cross_head_fp8_absorb(
+    const float *query,
+    const float *latents,
+    uint8_t *cache,
+    float *scales,
+    const uint8_t *kv_b_fp8,
+    const uint16_t *kv_b_scales,
+    uint8_t *qeff_fp8,
+    float *qeff_scales,
+    float *output,
+    int tokens,
+    int position_base,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    int latent_dim = kMlaLatentDim,
+    cudaStream_t stream = nullptr);
+
 }  // namespace insignia::glm53

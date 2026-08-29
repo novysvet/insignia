@@ -2707,7 +2707,10 @@ public:
                                (size_t(kv_a_rows_) + 2));
             absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
             const char *compact_absorb = std::getenv("INSIGNIA_GLM53_MLA_FP8_ABSORB");
-            mla_fp8_absorb_ = compact_absorb && std::atoi(compact_absorb) != 0 &&
+            // Exact on-consumption reconstruction is the normal full-FP8
+            // path: it trades idle Ada ALU for 704 MiB of expert residency.
+            // Explicit zero retains the materialized FP32 A/B/oracle path.
+            mla_fp8_absorb_ = (!compact_absorb || std::atoi(compact_absorb) != 0) &&
                               bind_mla_absorb_fp8();
             if (!mla_fp8_absorb_) {
                 w_uk_.reset(absorb_per_layer_ * mla_layers_);

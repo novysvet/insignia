@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Counterbalanced production-stack A/B for exact MLA weight compaction and the
-# two trace-derived VRAM-tier policies.  Every arm retains the s9 winner:
+# Focused production-stack A/B for exact MLA weight compaction. Every arm
+# retains the s9 winner:
 # packed-v2 transport + F3 device consult + O(1) host LRU + host SLRU.
 set -u
 exec >> /var/lib/insignia/s9-reclaim-vram-ab-run.log 2>&1
@@ -56,31 +56,14 @@ run_named() {
       run_arm "$ROOT/b-absorb/w$wave" "$offset" \
         INSIGNIA_GLM53_MLA_FP8_ABSORB=1
       ;;
-    compact)
-      run_arm "$ROOT/c-absorb-compact/w$wave" "$offset" \
-        INSIGNIA_GLM53_MLA_FP8_ABSORB=1 \
-        INSIGNIA_GLM53_VRAM_COMPACT_SEGMENTS=1
-      ;;
-    batch)
-      run_arm "$ROOT/d-absorb-batch/w$wave" "$offset" \
-        INSIGNIA_GLM53_MLA_FP8_ABSORB=1 \
-        INSIGNIA_GLM53_VRAM_BATCH_VICTIM=1
-      ;;
-    both)
-      run_arm "$ROOT/e-absorb-both/w$wave" "$offset" \
-        INSIGNIA_GLM53_MLA_FP8_ABSORB=1 \
-        INSIGNIA_GLM53_VRAM_COMPACT_SEGMENTS=1 \
-        INSIGNIA_GLM53_VRAM_BATCH_VICTIM=1
-      ;;
   esac
 }
 
 echo "reclaim/VRAM A/B start: $(date)"
-for arm in base absorb compact batch both; do run_named "$arm" 1 0; done
-for arm in both batch compact absorb base; do run_named "$arm" 2 2; done
+for arm in base absorb; do run_named "$arm" 1 0; done
 
 if find "$ROOT" -mindepth 3 -maxdepth 3 -type f -name DONE |
-    awk 'END { exit(NR == 10 ? 0 : 1) }'; then
+    awk 'END { exit(NR == 2 ? 0 : 1) }'; then
   touch "$ROOT/DONE"
   echo "reclaim/VRAM A/B done: $(date)"
 else

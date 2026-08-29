@@ -611,6 +611,12 @@ public:
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
             vram_budget_mb_ = std::max(0, std::atoi(budget));
+        // The model has exactly 42 sparse layers (3..44).  The legacy
+        // layer-id mapping carved 46 segments and stranded four complete
+        // slices.  Keep the corrected dense mapping A/B-gated until the
+        // real-prompt campaign confirms the trace-replay gain.
+        compact_device_segments_ =
+            std::getenv("INSIGNIA_GLM53_VRAM_COMPACT_SEGMENTS") != nullptr;
         // F3 residency ordering: consult the VRAM expert tier before starting
         // an NVMe read. The legacy order only noticed device residency at
         // upload time, after the bytes had already been re-read from disk.
@@ -1649,11 +1655,15 @@ private:
     // for layer L retains its own most recent records, so the measured ~27%
     // adjacent-token routing overlap converts directly into PCIe-free hits.
     int take_device_slot(int layer) {
-        const int segments = std::max(1, std::min(46, device_slot_count_));
-        const int begin = size_t(layer) % size_t(segments) * device_slot_count_ / segments;
-        const int end = size_t(layer) % size_t(segments) + 1 == segments
+        const int segments = std::max(
+            1, std::min(compact_device_segments_ ? 42 : 46, device_slot_count_));
+        const size_t segment = compact_device_segments_
+                                   ? size_t(layer - 3) % size_t(segments)
+                                   : size_t(layer) % size_t(segments);
+        const int begin = segment * device_slot_count_ / segments;
+        const int end = segment + 1 == size_t(segments)
                             ? device_slot_count_
-                            : (size_t(layer) % size_t(segments) + 1) * device_slot_count_ / segments;
+                            : (segment + 1) * device_slot_count_ / segments;
         int victim = -1;
         for (int index = begin; index < end; ++index) {
             if (index == active_device_slot_) continue;  // fence not recorded yet
@@ -2136,6 +2146,7 @@ private:
     size_t device_stride_ = 0;
     int device_slot_count_ = 0;
     int active_device_slot_ = -1;
+    bool compact_device_segments_ = false;
     bool device_arena_ready_ = false;
     int vram_budget_mb_ = -1;  // -1 = size from free VRAM at first use
     uint64_t device_stamp_ = 0;

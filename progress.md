@@ -1,5 +1,22 @@
 # progress
 
+### 2026-08-30 (session 10) - cross-head FP8 MLA; 314.5 MiB exact reclaim
+
+Full findings: `audits/s10-cross-head-mla.md`. The exact first-256 MLA bridge
+can now retain 512-wide FP32 latents and incrementally reconstruct K/V into one
+shared layer-major buffer: 352 MiB became 37.5 MiB (314.5 MiB reclaimed,
+292->315 observed expert slots), with decode and two-chunk FA2 prefix tests bit
+exact. An opt-in compute-for-bandwidth mode now uses H8 cross-head E4M3 MMA for
+long decode (1.48x at 2K, 1.93x at 4K, 2.66x at 8K) and a persistent fused H4
+x Q8 E4M3 prefill kernel (1.31-1.69x for 128-row chunks, 1.53x at the 8K
+boundary). Worst focused numerical quality was rel-L2 0.0061 / cosine
+0.9999817; a real 300-token smoke stayed coherent and kept the first four IDs,
+then diverged at token five. The user accepts this speed/quality trade, but the
+knob remains explicit: `INSIGNIA_GLM53_MLA_CROSS_HEAD_FP8=1`. A two-pair cold
+whole-engine prefill check was I/O-confounded (10.4-12.9 s expert read waits,
+3.73-4.69 GB/s) and supports no wall claim. No broad campaign was run. The
+4070 Ti SUPER overclock remained stable with no Xid/CUDA fault.
+
 ### 2026-08-29 (session 9) — compute-for-bandwidth MLA; +81 DFlash expert slots
 
 Full findings: `audits/s9-reclaim-session.md`. Exact on-consumption MLA absorb

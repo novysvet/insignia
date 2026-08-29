@@ -2696,13 +2696,10 @@ public:
             mla_values_.reset(size_t(mla_layers_) * expanded_stride);
         } else {
             const size_t latent_stride = size_t(kMaxContext()) * kv_a_rows_;
-            const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
             mla_latent_u8_.reset(kv_fp8_ ? size_t(mla_layers_) * latent_stride : 0);
             mla_latent_f32_.reset(kv_fp8_ ? 0 : size_t(mla_layers_) * latent_stride);
             mla_latent_scale_.reset(size_t(mla_layers_) * kMaxContext() *
                                     insignia::glm53::kMlaLatentGroups);
-            mla_keys_.reset(size_t(mla_layers_) * expanded_stride);
-            mla_values_.reset(size_t(mla_layers_) * expanded_stride);
             mla_partial_.reset(size_t(mla_heads_) * ((kMaxContext() + 511) / 512) *
                                (size_t(kv_a_rows_) + 2));
             absorb_per_layer_ = size_t(mla_heads_) * mla_head_dim_ * kv_a_rows_;
@@ -2721,6 +2718,29 @@ public:
                     2.0 * absorb_per_layer_ * mla_layers_ * sizeof(float) / double(1 << 20);
                 std::printf("MLA absorb: exact on-consumption resident FP8 "
                             "(%.0f MiB FP32 duplicate removed)\n", removed_mib);
+            }
+            const char *reconstruct = std::getenv("INSIGNIA_GLM53_MLA_RECON_PREFIX");
+            mla_prefix_reconstruct_ = reconstruct && std::atoi(reconstruct) != 0 &&
+                                      mla_fp8_absorb_;
+            if (mla_prefix_reconstruct_) {
+                const size_t prefix_latent_stride =
+                    size_t(kLegacyMlaContext) * kv_a_rows_;
+                mla_prefix_latent_.reset(size_t(mla_layers_) * prefix_latent_stride);
+                mla_prefix_kv_.reset(size_t(kLegacyMlaContext) * kv_b_rows_);
+                const double old_mib = 2.0 * mla_layers_ * kLegacyMlaContext *
+                                       q_b_rows_ * sizeof(float) / double(1 << 20);
+                const double new_mib = (mla_prefix_latent_.size() + mla_prefix_kv_.size()) *
+                                       sizeof(float) / double(1 << 20);
+                std::printf("MLA exact prefix: FP32 latent reconstruction "
+                            "(%.1f MiB -> %.1f MiB, %.1f MiB reclaimed)\n",
+                            old_mib, new_mib, old_mib - new_mib);
+            } else {
+                const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+                mla_keys_.reset(size_t(mla_layers_) * expanded_stride);
+                mla_values_.reset(size_t(mla_layers_) * expanded_stride);
+                if (reconstruct && std::atoi(reconstruct) != 0)
+                    std::printf("MLA exact prefix reconstruction unavailable: "
+                                "resident compact FP8 absorb is required\n");
             }
         }
         c_stream_a_.reset(size_t(kMaxChunk()) * kStreams * hidden_);
@@ -2935,6 +2955,7 @@ private:
     void mla(int layer, const float *input, float *output, int position);
     bool bind_mla_absorb_fp8();
     void extract_mla_absorb();
+    void reconstruct_mla_prefix(int slot, int positions);
     void compute_mlp(std::string_view stem, const float *input, float *output, int intermediate);
     void dense_mlp(std::string_view stem, const float *input, float *output, int intermediate);
     void sparse_moe(int layer, const float *input, float *output);
@@ -3051,9 +3072,10 @@ private:
     // merge scratch [heads, tiles, latent+2].
     DeviceBuffer<uint8_t> mla_latent_u8_;
     DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_, w_uk_, w_uv_;
-    DeviceBuffer<float> mla_keys_, mla_values_;
+    DeviceBuffer<float> mla_keys_, mla_values_, mla_prefix_latent_, mla_prefix_kv_;
     std::vector<Q8Stager::ResidentView> mla_absorb_fp8_views_;
     bool kv_fp8_ = true, mla_legacy_ = false, mla_fp8_absorb_ = false;
+    bool mla_prefix_reconstruct_ = false;
     size_t absorb_per_layer_ = 0;
     const uint32_t *chunk_bf16_weights_ = nullptr;
     DeviceBuffer<float> c_stream_a_, c_stream_b_, c_collapsed_, c_normalized_, c_attn_, c_ffn_;
@@ -3410,6 +3432,23 @@ void Runner::extract_mla_absorb() {
     }
 }
 
+void Runner::reconstruct_mla_prefix(int slot, int positions) {
+    require(mla_prefix_reconstruct_ && slot >= 0 && slot < mla_layers_ &&
+            positions >= 1 && positions <= kLegacyMlaContext,
+            "invalid MLA exact-prefix reconstruction request");
+    const Q8Stager::ResidentView &view = mla_absorb_fp8_views_[size_t(slot)];
+    const size_t latent_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+    const float *latents = mla_prefix_latent_.get() + size_t(slot) * latent_stride;
+    for (int base = 0; base < positions; base += kMaxChunk()) {
+        const int count = std::min(kMaxChunk(), positions - base);
+        check(insignia::glm53::fp8_tc_gemv_batch(
+              view.weights, view.scales, latents + size_t(base) * kv_a_rows_,
+              mla_prefix_kv_.get() + size_t(base) * kv_b_rows_, count,
+              kv_b_rows_, kv_a_rows_, kv_b_rows_, q8_workspace_),
+              "reconstruct exact MLA prefix K/V");
+    }
+}
+
 void Runner::mla(int layer, const float *input, float *output, int position) {
     const std::string stem = layer_stem(layer) + "self_attn.";
     linear(stem + "q_a_proj.weight", input, small_a_, q_a_rows_, hidden_);
@@ -3458,17 +3497,30 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
         ? nullptr
         : mla_latent_f32_.get() + size_t(slot) * layer_stride;
     if (position < kLegacyMlaContext) {
-        linear(stem + "kv_b_proj.weight", small_b_, kv_, kv_b_rows_, kv_a_rows_);
         check(insignia::glm53::mla_store_latent(
               small_b_.get(), cache_u8, cache_scale, cache_f32, 1, position,
               kv_a_rows_), "MLA latent shadow store");
-        const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
-        check(insignia::glm53::mla_decode(
-              mla_query_.get(), kv_.get(),
-              mla_keys_.get() + size_t(slot) * expanded_stride,
-              mla_values_.get() + size_t(slot) * expanded_stride,
-              mla_output_, position, mla_heads_, mla_head_dim_),
-              "exact MLA prefix attention");
+        if (mla_prefix_reconstruct_) {
+            const size_t prefix_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+            check(cudaMemcpyAsync(
+                  mla_prefix_latent_.get() + size_t(slot) * prefix_stride +
+                      size_t(position) * kv_a_rows_,
+                  small_b_.get(), size_t(kv_a_rows_) * sizeof(float),
+                  cudaMemcpyDeviceToDevice), "save exact MLA prefix latent");
+            reconstruct_mla_prefix(slot, position + 1);
+            check(insignia::glm53::mla_decode_reconstructed(
+                  mla_query_.get(), mla_prefix_kv_.get(), mla_output_, position,
+                  mla_heads_, mla_head_dim_), "reconstructed exact MLA prefix attention");
+        } else {
+            linear(stem + "kv_b_proj.weight", small_b_, kv_, kv_b_rows_, kv_a_rows_);
+            const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+            check(insignia::glm53::mla_decode(
+                  mla_query_.get(), kv_.get(),
+                  mla_keys_.get() + size_t(slot) * expanded_stride,
+                  mla_values_.get() + size_t(slot) * expanded_stride,
+                  mla_output_, position, mla_heads_, mla_head_dim_),
+                  "exact MLA prefix attention");
+        }
     } else {
         if (mla_fp8_absorb_) {
             const Q8Stager::ResidentView &view = mla_absorb_fp8_views_[size_t(slot)];
@@ -4198,18 +4250,32 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
                          insignia::glm53::kMlaLatentGroups;
     const bool exact_prefix = position_base + tokens <= kLegacyMlaContext;
     if (exact_prefix) {
-        linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_, tokens,
-                     kv_b_rows_, kv_a_rows_);
         check(insignia::glm53::mla_store_latent(
               c_small_.get(), cache_u8, cache_scale, cache_f32,
               tokens, position_base, kv_a_rows_), "MLA latent shadow prefill store");
-        const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
-        check(insignia::glm53::mla_flash2_prefill(
-              c_mlaq_.get(), c_kv_.get(),
-              mla_keys_.get() + size_t(slot) * expanded_stride,
-              mla_values_.get() + size_t(slot) * expanded_stride,
-              c_mlao_.get(), tokens, position_base, mla_heads_, mla_head_dim_),
-              "exact FlashAttention-2 MLA prefix");
+        if (mla_prefix_reconstruct_) {
+            const size_t prefix_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+            check(cudaMemcpyAsync(
+                  mla_prefix_latent_.get() + size_t(slot) * prefix_stride +
+                      size_t(position_base) * kv_a_rows_,
+                  c_small_.get(), size_t(tokens) * kv_a_rows_ * sizeof(float),
+                  cudaMemcpyDeviceToDevice), "save exact MLA prefix latents (prefill)");
+            reconstruct_mla_prefix(slot, position_base + tokens);
+            check(insignia::glm53::mla_flash2_prefill_reconstructed(
+                  c_mlaq_.get(), mla_prefix_kv_.get(), c_mlao_.get(), tokens,
+                  position_base, mla_heads_, mla_head_dim_),
+                  "reconstructed exact FlashAttention-2 MLA prefix");
+        } else {
+            linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_, tokens,
+                         kv_b_rows_, kv_a_rows_);
+            const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
+            check(insignia::glm53::mla_flash2_prefill(
+                  c_mlaq_.get(), c_kv_.get(),
+                  mla_keys_.get() + size_t(slot) * expanded_stride,
+                  mla_values_.get() + size_t(slot) * expanded_stride,
+                  c_mlao_.get(), tokens, position_base, mla_heads_, mla_head_dim_),
+                  "exact FlashAttention-2 MLA prefix");
+        }
     }
     static const bool scalar_attention =
         std::getenv("INSIGNIA_GLM53_SCALAR_MLA_PREFILL") != nullptr;

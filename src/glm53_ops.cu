@@ -538,6 +538,64 @@ __global__ __launch_bounds__(256) void mla_decode_kernel(
     output[vector_offset] = result;
 }
 
+// Same arithmetic and reduction order as mla_decode_kernel, but the complete
+// token-major kv_b output has just been reconstructed into one transient
+// [context, heads, 2*head_dim] buffer.  There is deliberately no persistent
+// expanded cache write here.
+__global__ __launch_bounds__(256) void mla_decode_reconstructed_kernel(
+    const float *__restrict__ query,
+    const float *__restrict__ expanded_kv,
+    float *__restrict__ output,
+    int position,
+    int heads) {
+    const int head = blockIdx.x;
+    const int element = threadIdx.x;
+    const int head_dim = blockDim.x;
+    const int warps = head_dim >> 5;
+    const int width = heads * head_dim;
+    const int vector_offset = head * head_dim + element;
+
+    __shared__ float logits[kMlaExactContext];
+    __shared__ float partial[8];
+    const int lane = element & 31;
+    const int warp = element >> 5;
+    const float q = query[vector_offset];
+    const float scale = rsqrtf((float)head_dim);
+    for (int token = 0; token <= position; ++token) {
+        const size_t kv_index = size_t(token) * 2 * width +
+                                head * (2 * head_dim) + element;
+        float dot = warp_sum(q * expanded_kv[kv_index]);
+        if (!lane) partial[warp] = dot;
+        __syncthreads();
+        if (!element) {
+            float total = 0.0f;
+#pragma unroll 4
+            for (int index = 0; index < warps; ++index) total += partial[index];
+            logits[token] = total * scale;
+        }
+        __syncthreads();
+    }
+    if (!element) {
+        float maximum = -3.402823466e38F;
+        for (int token = 0; token <= position; ++token) maximum = fmaxf(maximum, logits[token]);
+        float denominator = 0.0f;
+        for (int token = 0; token <= position; ++token) {
+            logits[token] = expf(logits[token] - maximum);
+            denominator += logits[token];
+        }
+        const float inverse = 1.0f / denominator;
+        for (int token = 0; token <= position; ++token) logits[token] *= inverse;
+    }
+    __syncthreads();
+    float result = 0.0f;
+    for (int token = 0; token <= position; ++token) {
+        const size_t kv_index = size_t(token) * 2 * width +
+                                head * (2 * head_dim) + head_dim + element;
+        result = fmaf(logits[token], expanded_kv[kv_index], result);
+    }
+    output[vector_offset] = result;
+}
+
 __global__ __launch_bounds__(256) void mla_store_kv_batch_kernel(
     const float *__restrict__ kv,
     float *__restrict__ key_cache,
@@ -635,6 +693,96 @@ __global__ __launch_bounds__(256, 2) void mla_flash2_prefill_kernel(
 
     for (int key = 0; key <= last_key; ++key) {
         const float value = value_cache[size_t(key) * width + head_offset];
+#pragma unroll
+        for (int slot = 0; slot < kQueries; ++slot)
+            if (slot < query_count && key <= position_base + query_base + slot)
+                accumulator[slot] = fmaf(logits[slot][key], value, accumulator[slot]);
+    }
+#pragma unroll
+    for (int slot = 0; slot < kQueries; ++slot)
+        if (slot < query_count)
+            output[size_t(query_base + slot) * width + head_offset] = accumulator[slot];
+}
+
+// Reconstructed-cache twin of the exact FA2 prefix kernel.  Only K/V address
+// formation differs; score, softmax, and value accumulation order are kept
+// byte-for-byte structurally identical to protect discrete MoE routing.
+template <int kQueries>
+__global__ __launch_bounds__(256, 2) void mla_flash2_prefill_reconstructed_kernel(
+    const float *__restrict__ query,
+    const float *__restrict__ expanded_kv,
+    float *__restrict__ output,
+    int tokens,
+    int position_base,
+    int heads,
+    int head_dim) {
+    const int head = blockIdx.x;
+    const int query_base = blockIdx.y * kQueries;
+    const int query_count = min(kQueries, tokens - query_base);
+    const int element = threadIdx.x;
+    const int lane = element & 31;
+    const int warp = element >> 5;
+    const int warps = head_dim >> 5;
+    const int width = heads * head_dim;
+    const int head_offset = head * head_dim + element;
+    const float scale = rsqrtf(float(head_dim));
+
+    float q[kQueries], accumulator[kQueries];
+#pragma unroll
+    for (int slot = 0; slot < kQueries; ++slot) {
+        q[slot] = slot < query_count
+            ? query[size_t(query_base + slot) * width + head_offset]
+            : 0.0f;
+        accumulator[slot] = 0.0f;
+    }
+
+    __shared__ float partial[kQueries][8];
+    __shared__ float logits[kQueries][kMlaExactContext];
+    const int last_key = position_base + query_base + query_count - 1;
+
+    for (int key = 0; key <= last_key; ++key) {
+        const size_t kv_index = size_t(key) * 2 * width +
+                                head * (2 * head_dim) + element;
+        const float key_value = expanded_kv[kv_index];
+#pragma unroll
+        for (int slot = 0; slot < kQueries; ++slot) {
+            const float dot = warp_sum(q[slot] * key_value);
+            if (!lane) partial[slot][warp] = dot;
+        }
+        __syncthreads();
+
+        if (element < kQueries) {
+            const int slot = element;
+            if (slot < query_count) {
+                float dot = 0.0f;
+#pragma unroll 4
+                for (int part = 0; part < warps; ++part) dot += partial[slot][part];
+                logits[slot][key] = dot * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (element < query_count) {
+        const int slot = element;
+        const int query_last_key = position_base + query_base + slot;
+        float maximum = -3.402823466e38F;
+        for (int key = 0; key <= query_last_key; ++key)
+            maximum = fmaxf(maximum, logits[slot][key]);
+        float denominator = 0.0f;
+        for (int key = 0; key <= query_last_key; ++key) {
+            logits[slot][key] = expf(logits[slot][key] - maximum);
+            denominator += logits[slot][key];
+        }
+        const float inverse = 1.0f / denominator;
+        for (int key = 0; key <= query_last_key; ++key) logits[slot][key] *= inverse;
+    }
+    __syncthreads();
+
+    for (int key = 0; key <= last_key; ++key) {
+        const size_t kv_index = size_t(key) * 2 * width +
+                                head * (2 * head_dim) + head_dim + element;
+        const float value = expanded_kv[kv_index];
 #pragma unroll
         for (int slot = 0; slot < kQueries; ++slot)
             if (slot < query_count && key <= position_base + query_base + slot)
@@ -791,6 +939,43 @@ cudaError_t mla_flash2_prefill(
     mla_flash2_prefill_kernel<queries>
         <<<dim3(heads, (tokens + queries - 1) / queries), head_dim, 0, stream>>>(
             query, key_cache, value_cache, output, tokens, position_base, heads, head_dim);
+    return cudaGetLastError();
+}
+
+cudaError_t mla_decode_reconstructed(
+    const float *query,
+    const float *expanded_kv,
+    float *output,
+    int position,
+    int heads,
+    int head_dim,
+    cudaStream_t stream) {
+    if (!query || !expanded_kv || !output || position < 0 ||
+        position >= kMlaExactContext || heads <= 0 || head_dim < 32 ||
+        head_dim > 256 || head_dim % 32)
+        return cudaErrorInvalidValue;
+    mla_decode_reconstructed_kernel<<<heads, head_dim, 0, stream>>>(
+        query, expanded_kv, output, position, heads);
+    return cudaGetLastError();
+}
+
+cudaError_t mla_flash2_prefill_reconstructed(
+    const float *query,
+    const float *expanded_kv,
+    float *output,
+    int tokens,
+    int position_base,
+    int heads,
+    int head_dim,
+    cudaStream_t stream) {
+    if (!query || !expanded_kv || !output || tokens <= 0 || tokens > 128 ||
+        position_base < 0 || position_base + tokens > kMlaExactContext ||
+        heads <= 0 || head_dim < 32 || head_dim > 256 || head_dim % 32)
+        return cudaErrorInvalidValue;
+    constexpr int queries = 8;
+    mla_flash2_prefill_reconstructed_kernel<queries>
+        <<<dim3(heads, (tokens + queries - 1) / queries), head_dim, 0, stream>>>(
+            query, expanded_kv, output, tokens, position_base, heads, head_dim);
     return cudaGetLastError();
 }
 

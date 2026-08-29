@@ -323,6 +323,30 @@ cudaError_t mla_flash2_prefill(
     int head_dim = kMlaHeadDim,
     cudaStream_t stream = nullptr);
 
+// Exact-prefix attention over a transient, fully reconstructed kv_b output.
+// expanded_kv is token-major [context,heads,2*head_dim].  Unlike the legacy
+// entry points these calls do not append to a persistent expanded K/V cache;
+// the caller recreates rows 0..position from exact FP32 latents immediately
+// before attention.  This trades tensor-core work for ~315 MiB of VRAM.
+cudaError_t mla_decode_reconstructed(
+    const float *query,
+    const float *expanded_kv,
+    float *output,
+    int position,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    cudaStream_t stream = nullptr);
+
+cudaError_t mla_flash2_prefill_reconstructed(
+    const float *query,
+    const float *expanded_kv,
+    float *output,
+    int tokens,
+    int position_base,
+    int heads = kKdaHeads,
+    int head_dim = kMlaHeadDim,
+    cudaStream_t stream = nullptr);
+
 // Latent-cache MLA: the cache holds the compressed post-kv_a-layernorm
 // latent [kMlaLatentDim] per (layer, position) instead of the expanded
 // per-head K/V, so a full 8192-token cache costs ~50 MiB in FP8 instead of

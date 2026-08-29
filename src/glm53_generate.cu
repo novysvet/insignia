@@ -555,6 +555,18 @@ public:
     static constexpr size_t kPackedDeviceCapacity = kScaleBytes + (64ull << 10);
     static constexpr size_t kPayloadCapacity = kBodyBytes + kScaleBytes + 64;
     static constexpr size_t kAlignment = 4096;
+    // v2 sidecar: per-projection scale "region" = packed nibbles + escapes +
+    // codebook + align pad + prefix table, padded to 4 KiB. The reader scratch
+    // only needs the header page plus one such region (CPU-expand path).
+    static constexpr size_t kV2RegionOverhead =
+        kPackedScaleBytes + 16 + alignof(uint32_t) +
+        kScalePrefixEntries * sizeof(uint32_t) + kAlignment;
+    static constexpr size_t kV2MaxEscapes =
+        (kPayloadCapacity - kBodyBytes - 3 * kV2RegionOverhead) / 3;
+    static constexpr size_t kV2ReaderScratchBytes =
+        kAlignment + ((kPackedScaleBytes + kV2MaxEscapes + 16 + alignof(uint32_t) +
+                       kScalePrefixEntries * sizeof(uint32_t) + kAlignment - 1) &
+                      ~(kAlignment - 1));
     static constexpr size_t kWindowBytes =
         (kPayloadCapacity + 2 * kAlignment - 2) & ~(kAlignment - 1);
     static constexpr uint32_t kNoKey = 0xffffffffu;
@@ -1061,8 +1073,10 @@ private:
                                     "open packed expert sidecar " + path.string());
         PackedExpertFileHeader header{};
         pread_exact(packed_fd_, 0, &header, sizeof(header), "read packed expert header");
-        require(std::memcmp(header.magic, "IG53XPK1", 8) == 0 && header.version == 1,
+        require(std::memcmp(header.magic, "IG53XPK1", 8) == 0 &&
+                (header.version == 1 || header.version == 2),
                 "bad packed expert sidecar header");
+        packed_version_ = header.version;
         require(header.layers == model_.layers() && header.experts == model_.experts(),
                 "packed expert sidecar geometry does not match model");
         std::error_code error;
@@ -1086,21 +1100,28 @@ private:
                     entry.offset <= header.file_bytes &&
                     entry.padded_bytes <= header.file_bytes - entry.offset,
                     "malformed packed expert index entry");
-            packed_scratch_bytes_ = std::max(packed_scratch_bytes_, size_t(entry.padded_bytes));
+            if (packed_version_ == 1)
+                packed_scratch_bytes_ = std::max(packed_scratch_bytes_, size_t(entry.padded_bytes));
             ++populated;
         }
-        require(populated == header.records && packed_scratch_bytes_,
-                "packed expert index record count mismatch");
+        require(populated == header.records, "packed expert index record count mismatch");
+        if (packed_version_ >= 2)
+            // v2 stages straight into the window; the reader scratch only
+            // ever holds the 4 KiB header page (GPU path) or one scale
+            // region (CPU-expand path). No 12.8 MiB scratch records.
+            packed_scratch_bytes_ = kV2ReaderScratchBytes;
+        require(packed_scratch_bytes_, "packed expert index record count mismatch");
 #ifdef O_DIRECT
         packed_direct_fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
 #endif
         const double fraction = header.source_bytes
             ? double(header.stored_bytes) / double(header.source_bytes) : 1.0;
-        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + %s expand\n",
+        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + %s expand (format v%d)\n",
                     populated, header.stored_bytes / double(1ull << 30),
                     100.0 * (1.0 - fraction),
                     packed_direct_fd_ >= 0 ? "O_DIRECT" : "buffered I/O",
-                    packed_gpu_scales_ ? "GPU/packed-H2D" : "AVX2/expanded-H2D");
+                    packed_gpu_scales_ ? "GPU/packed-H2D" : "AVX2/expanded-H2D",
+                    packed_version_);
     }
     const PackedExpertIndexEntry &packed_entry(int layer, int expert) const {
         const size_t index = size_t(layer) * model_.experts() + size_t(expert);
@@ -1294,8 +1315,134 @@ private:
         packed_expand_nanoseconds_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - expand_begin).count()), std::memory_order_relaxed);
     }
+    // v2 direct-read staging: header page into scratch, then ONE payload
+    // pread straight into the window (bodies contiguous, then the three
+    // pre-assembled scale regions at 4 KiB strides). Zero reader-thread CPU
+    // work beyond bounds checks: no memcpy, no prefix build, no expand.
+    void stage_packed_v2_gpu(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                             uint8_t *window, int layer, int expert, void *scratch) {
+        const PackedExpertIndexEntry &entry = packed_entry(layer, expert);
+        require(scratch && entry.stored_bytes >= kAlignment &&
+                entry.stored_bytes - kAlignment <= kPayloadCapacity,
+                "packed expert v2 record exceeds staging capacity");
+        const int fd = packed_direct_fd_ >= 0 ? packed_direct_fd_ : packed_fd_;
+        pread_exact(fd, entry.offset, scratch, kAlignment, "read packed v2 header");
+        const auto *header = static_cast<const PackedExpertRecordHeader *>(scratch);
+        require(std::memcmp(header->magic, "XPR1", 4) == 0 &&
+                header->layer == layer && header->expert == expert,
+                "packed expert record key mismatch");
+        for (int projection = 0; projection < 3; ++projection)
+            require(header->escapes[projection] <= kV2MaxEscapes,
+                    "packed expert v2 escape tail exceeds staging capacity");
+        layout = {};
+        size_t cursor = kBodyBytes;
+        size_t device_cursor = 0;
+        size_t seg = kAlignment + kBodyBytes;  // record-relative region cursor
+        for (int projection = 0; projection < 3; ++projection) {
+            layout.packed_body[projection] = size_t(projection) * kProjectionBodyBytes;
+            layout.body[projection] = size_t(projection) *
+                                      (kProjectionBodyBytes + kProjectionScaleBytes);
+            layout.scales[projection] = layout.body[projection] + kProjectionBodyBytes;
+            globals[projection] = header->globals[projection];
+            layout.packed_blob[projection] = cursor;
+            layout.packed_device[projection] = device_cursor;
+            layout.packed_escapes[projection] = kPackedScaleBytes;
+            layout.packed_codebook[projection] =
+                kPackedScaleBytes + header->escapes[projection];
+            layout.packed_prefix[projection] =
+                (layout.packed_codebook[projection] + 16 + alignof(uint32_t) - 1) &
+                ~(alignof(uint32_t) - 1);
+            layout.packed_blob_bytes[projection] =
+                layout.packed_prefix[projection] + kScalePrefixEntries * sizeof(uint32_t);
+            const size_t region_disk =
+                (layout.packed_blob_bytes[projection] + kAlignment - 1) & ~(kAlignment - 1);
+            seg += region_disk;
+            cursor += region_disk;
+            device_cursor += region_disk;
+        }
+        require(seg == entry.stored_bytes,
+                "packed v2 record span does not match its index entry");
+        require(cursor <= kPayloadCapacity && device_cursor <= kPackedDeviceCapacity,
+                "packed v2 GPU scale transport exceeds staging capacity");
+        layout.bytes = cursor;
+        layout.packed_blob_span = device_cursor;
+        layout.packed_scales = true;
+        payload = window;
+        pread_exact(fd, entry.offset + kAlignment, window, entry.stored_bytes - kAlignment,
+                    "read packed v2 record");
+        // Corruption tripwire: the on-disk prefix table's last entry counts
+        // every escape nibble, so it must equal the header's escape count.
+        for (int projection = 0; projection < 3; ++projection) {
+            const uint32_t *prefix = reinterpret_cast<const uint32_t *>(
+                window + layout.packed_blob[projection] + layout.packed_prefix[projection]);
+            require(prefix[kScalePrefixEntries - 1] == header->escapes[projection],
+                    "packed v2 prefix table mismatch");
+        }
+    }
+    void stage_packed_v2_cpu(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                             uint8_t *window, int layer, int expert, void *scratch) {
+        const PackedExpertIndexEntry &entry = packed_entry(layer, expert);
+        require(scratch && entry.stored_bytes >= kAlignment &&
+                entry.stored_bytes - kAlignment <= kPayloadCapacity,
+                "packed expert v2 record exceeds staging capacity");
+        const int fd = packed_direct_fd_ >= 0 ? packed_direct_fd_ : packed_fd_;
+        pread_exact(fd, entry.offset, scratch, kAlignment, "read packed v2 header");
+        const auto *header = static_cast<const PackedExpertRecordHeader *>(scratch);
+        require(std::memcmp(header->magic, "XPR1", 4) == 0 &&
+                header->layer == layer && header->expert == expert,
+                "packed expert record key mismatch");
+        for (int projection = 0; projection < 3; ++projection)
+            require(header->escapes[projection] <= kV2MaxEscapes,
+                    "packed expert v2 escape tail exceeds staging capacity");
+        const auto expand_begin = std::chrono::steady_clock::now();
+        layout = {};
+        size_t cursor = 0;
+        size_t seg = kAlignment;
+        // The header page lives at scratch[0, 4 KiB) for the whole function;
+        // region reads go after it (kV2ReaderScratchBytes budgeted for both).
+        uint8_t *region = static_cast<uint8_t *>(scratch) + kAlignment;
+        for (int projection = 0; projection < 3; ++projection) {
+            layout.body[projection] = cursor;
+            pread_exact(fd, entry.offset + seg, window + cursor, kProjectionBodyBytes,
+                        "read packed v2 body");
+            seg += kProjectionBodyBytes;
+            cursor += kProjectionBodyBytes;
+            layout.scales[projection] = cursor;
+            const size_t prefix_at =
+                (kPackedScaleBytes + header->escapes[projection] + 16 +
+                 alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
+            const size_t region_disk =
+                (prefix_at + kScalePrefixEntries * sizeof(uint32_t) + kAlignment - 1) &
+                ~(kAlignment - 1);
+            require(region_disk + kAlignment <= packed_scratch_bytes_,
+                    "packed expert v2 region exceeds reader scratch");
+            pread_exact(fd, entry.offset + seg, region, region_disk,
+                        "read packed v2 scale region");
+            seg += region_disk;
+            expand_scale_nibbles(region, region + kPackedScaleBytes,
+                                 header->escapes[projection], region + kPackedScaleBytes +
+                                     header->escapes[projection],
+                                 window + cursor, kScaleBytes / 3);
+            cursor += kProjectionScaleBytes;
+            globals[projection] = header->globals[projection];
+        }
+        require(seg == entry.stored_bytes && cursor == kBodyBytes + kScaleBytes,
+                "packed v2 record span does not match its index entry");
+        layout.bytes = cursor;
+        payload = window;
+        packed_expanded_bytes_.fetch_add(kBodyBytes + kScaleBytes, std::memory_order_relaxed);
+        packed_expand_nanoseconds_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - expand_begin).count()), std::memory_order_relaxed);
+    }
     void stage_packed(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
                       uint8_t *window, int layer, int expert, void *scratch) {
+        if (packed_version_ >= 2) {
+            if (packed_gpu_scales_)
+                stage_packed_v2_gpu(layout, globals, payload, window, layer, expert, scratch);
+            else
+                stage_packed_v2_cpu(layout, globals, payload, window, layer, expert, scratch);
+            return;
+        }
         if (packed_gpu_scales_)
             stage_packed_gpu(layout, globals, payload, window, layer, expert, scratch);
         else
@@ -1774,6 +1921,7 @@ private:
 
     ShardedIndex &model_;
     int packed_fd_ = -1, packed_direct_fd_ = -1;
+    int packed_version_ = 0;
     std::vector<PackedExpertIndexEntry> packed_entries_;
     size_t packed_scratch_bytes_ = 0;
     std::atomic<uint64_t> packed_expanded_bytes_{0}, packed_expand_nanoseconds_{0};

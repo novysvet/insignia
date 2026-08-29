@@ -2106,7 +2106,7 @@ public:
     static int kMaxChunk() {
         static const int chunk = [] {
             const char *value = std::getenv("INSIGNIA_GLM53_PREFILL_CHUNK");
-            return std::clamp(value ? std::atoi(value) : 64, 8, kMaxChunkCap);
+            return std::clamp(value ? std::atoi(value) : kMaxChunkCap, 8, kMaxChunkCap);
         }();
         return chunk;
     }

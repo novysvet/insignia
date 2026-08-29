@@ -5,8 +5,10 @@
 #       (C) packed v2 + F3 on + merged transport + uint32 kernel
 set -u
 exec >> /var/lib/insignia/s9-ab-run.log 2>&1
+exec 9>/var/lib/insignia/s9-ab-campaign.lock
+flock -n 9 || { echo "AB campaign already running"; exit 1; }
 echo "AB campaign start: $(date)"
-ROOT=/var/lib/insignia/bench-results/s9-ab
+ROOT=/var/lib/insignia/bench-results/s9-ab-wave
 PY=/var/lib/insignia/bench-venv/bin/python
 DRIVER=/mnt/c/coding/Insignia-glm53-dflash2/tools/benchmark_math.py
 BIN=/var/tmp/insignia-build/glm53-generate
@@ -15,8 +17,11 @@ V2=/var/lib/insignia/glm53-experts-nvfp4x-v2.igx
 run_arm() { # outdir offset env...
   local out=$1 offset=$2; shift 2
   while true; do pgrep -x glm53-generate >/dev/null && sleep 20 || break; done
-  if [ -f "$out/summary.md" ]; then
-    echo "SKIP $out (summary exists)"; return 0
+  if [ -f "$out/DONE" ]; then
+    echo "SKIP $out (complete)"; return 0
+  fi
+  if [ -d "$out" ]; then
+    mv "$out" "$out.partial-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "$out"
   local start=$(date +%s)
@@ -25,7 +30,12 @@ run_arm() { # outdir offset env...
     --samples 2 --offset "$offset" --generate 32 --verify-k 7 \
     --cache-mb 32768 --q8-budget-mb 10240 --readers 4 --timeout 1200 \
     > "$out/driver.log" 2>&1
-  echo "arm $out exit=$? wall=$(($(date +%s) - start))s"
+  local rc=$?
+  if [ "$rc" = 0 ]; then
+    touch "$out/DONE"
+  fi
+  echo "arm $out exit=$rc wall=$(($(date +%s) - start))s"
+  return "$rc"
 }
 # Design: two waves, arms A-D each wave; wave-2 slices are NEW prompts
 # (--offset 2) so coverage is 8 distinct case-pairs per arm at 1 rep each.
@@ -61,4 +71,11 @@ for wave in 1 2; do
     INSIGNIA_GLM53_DF_ADAPTIVE_K=2 \
     INSIGNIA_GLM53_DF_COSTTRACE=1
 done
-echo "AB campaign done: $(date)"
+if find "$ROOT" -mindepth 3 -maxdepth 3 -type f -name DONE |
+    awk 'END { exit(NR == 8 ? 0 : 1) }'; then
+  touch "$ROOT/DONE"
+  echo "AB campaign done: $(date)"
+else
+  echo "AB campaign incomplete: $(date)"
+  exit 1
+fi

@@ -43,8 +43,8 @@ Lane details and shared facts: [compute README](compute/README.md).
    - exact zero-copy host-cache capacity reclaim with a byte-capacity replay
      and allocator lifetime proof.
 2. [Adaptive router-mass pruning](io/02-adaptive-router-mass-pruning.md)
-   - falsify or justify executing fewer than eight experts under explicit
-     quality gates.
+   - **completed: offline reject.** The noncausal oracle saves only 2.878% of
+     records at 1% omitted mass; see `audits/s10-router-mass-pruning.md`.
 3. [Two-phase packed read/upload](io/03-two-phase-packed-read-upload.md)
    - discrete-event ceiling for overlapping body upload with the packed scale
      tail before any production patch.

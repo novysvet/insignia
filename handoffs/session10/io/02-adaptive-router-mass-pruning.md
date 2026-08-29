@@ -1,5 +1,10 @@
 # Handoff 02 — adaptive router-mass pruning
 
+> **Status (2026-08-30): completed and rejected offline.** The verified result
+> is recorded in `audits/s10-router-mass-pruning.md`: a noncausal oracle saves
+> only 2.878% of records at 1% mean omitted mass, and 15% record reduction
+> requires at least 7.425% mean omitted mass. Do not dispatch this task again.
+
 ## Objective
 
 Falsify or justify an approximate mode that executes fewer than all eight

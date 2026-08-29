@@ -26,9 +26,10 @@ analysis, simulators, tests, and patch blueprints only.
    — best exact compute-for-capacity candidate. It asks whether the already
    compact packed-v2 representation can turn fixed-slot waste into roughly
    140 additional host records without adding a hit-path copy.
-2. [Adaptive router-mass pruning](02-adaptive-router-mass-pruning.md) — largest
-   possible byte reduction, but deliberately approximate. A cheap trace-only
-   falsifier must pass before any runtime experiment is proposed.
+2. [Adaptive router-mass pruning](02-adaptive-router-mass-pruning.md) — **now
+   complete and rejected offline**: the 1%-mass noncausal oracle saves only
+   2.878% of records. Do not dispatch again; see
+   `audits/s10-router-mass-pruning.md`.
 3. [Two-phase packed read/upload](03-two-phase-packed-read-upload.md) — exact
    scheduling experiment. Its ceiling may be small because the existing
    four-reader pipeline already overlaps records, so a discrete-event model

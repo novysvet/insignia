@@ -17,6 +17,15 @@ whole-engine prefill check was I/O-confounded (10.4-12.9 s expert read waits,
 3.73-4.69 GB/s) and supports no wall claim. No broad campaign was run. The
 4070 Ti SUPER overclock remained stable with no Xid/CUDA fault.
 
+Adaptive router-mass pruning is now closed as an offline reject; see
+`audits/s10-router-mass-pruning.md`. A checksum-verified 608,044-row analysis
+and independent rerun found that a noncausal oracle saves only 2.878% of
+records at 1% mean omitted mass, while 15% record reduction necessarily drops
+at least 7.425% mean routed mass. Fixed top-6 has only a ~45.1 ms/token
+transfer-channel upper bound under the production 80%-hit/4.7-GiB/s model yet
+removes 15.86% of routed coefficient mass. No implementation or glm-box run is
+warranted, even under the speed-first quality policy.
+
 ### 2026-08-29 (session 9) — compute-for-bandwidth MLA; +81 DFlash expert slots
 
 Full findings: `audits/s9-reclaim-session.md`. Exact on-consumption MLA absorb

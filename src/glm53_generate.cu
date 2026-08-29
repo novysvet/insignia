@@ -2578,6 +2578,8 @@ public:
             require(kMaxChunk() <= insignia::glm53::DFlash2Drafter::kMaxTokens,
                     "prefill chunk exceeds the DFlash2 capture batch");
         }
+        forced_sequential_verify_ =
+            dflash2_on_ && std::getenv("INSIGNIA_GLM53_DF_SEQ_VERIFY") != nullptr;
         // Dense layer -> KDA archive row (recurrent-state replay indexing).
         kda_row_.assign(size_t(layer_count) + 1, -1);
         {
@@ -2772,8 +2774,16 @@ public:
             verify_normed_.reset(size_t(kMaxVerify) * hidden_);
             verify_logits_.reset(size_t(kMaxVerify) * model_.vocab_size());
             verify_arg_.reset(kMaxVerify);
-            kda_snap_.reset(kda_states_.size());
-            conv_snap_.reset(conv_history_.size());
+            if (!forced_sequential_verify_) {
+                kda_snap_.reset(kda_states_.size());
+                conv_snap_.reset(conv_history_.size());
+            } else {
+                const double removed_mib =
+                    (kda_states_.size() + conv_history_.size()) * sizeof(float) /
+                    double(1 << 20);
+                std::printf("DFlash sequential verify: %.1f MiB rollback snapshots removed\n",
+                            removed_mib);
+            }
             // Per (kda layer, token): pre-conv q,k,v + raw gate + raw beta, the
             // exact inputs the recurrence replay needs after a rejected draft.
             kda_arch_.reset(size_t(kda_layers_) * kMaxVerify * (4 * size_t(kda_width_) + kda_heads_));
@@ -2895,6 +2905,7 @@ public:
     void mtp_moe(const float *input, float *output);
     void rollback_kda(int accepted, int position_base);
     // Row-sequential verify controls: snapshot suppression + drafter capture slot.
+    bool forced_sequential_verify_ = false;
     bool verify_may_rollback_ = true;
     int capture_offset_ = 0;
     void set_last_avg(const float *device_row) {
@@ -3995,6 +4006,8 @@ void Runner::mtp_moe(const float *input, float *output) {
 // through the KDA recurrence from the archived pre-conv projections (the
 // layer weights are already resident, so the replay is compute-only).
 void Runner::rollback_kda(int accepted, int position_base) {
+    require(!forced_sequential_verify_,
+            "rollback is unreachable when DFlash sequential verify is forced");
     check(cudaMemcpyAsync(kda_states_.get(), kda_snap_.get(),
                           kda_states_.size() * sizeof(float), cudaMemcpyDeviceToDevice),
           "restore KDA states");
@@ -4802,6 +4815,8 @@ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool cap
         // verify rounds never roll back (their state always stands at the
         // accepted boundary), so they skip these two whole-state copies.
         if (verify_may_rollback_) {
+            require(!forced_sequential_verify_,
+                    "batch verify is forbidden after sequential snapshot elision");
             check(cudaMemcpyAsync(kda_snap_.get(), kda_states_.get(),
                                   kda_states_.size() * sizeof(float), cudaMemcpyDeviceToDevice),
                   "snapshot KDA states");

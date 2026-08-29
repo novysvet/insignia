@@ -1719,8 +1719,13 @@ int expand_bench_main(int argc, char **argv) {
             // packed | escapes | codebook(16) | align4 | prefix(4100).
             for (int projection = 0; projection < 3; ++projection) {
                 esc[projection] = dev[projection] + kPackedScaleBytes;
+                // Engine blob order: packed | escapes | codebook | align4 pad
+                // | prefix - the codebook sits immediately after the escapes
+                // (stage_packed_gpu packed_codebook), NOT +16 beyond. The +16
+                // here made every record-mix launch read a shifted codebook
+                // while truth stayed correct: the s8 fused spot-check FAIL.
                 cb[projection] = dev[projection] + kPackedScaleBytes +
-                                 scales.escape_count + 16;
+                                 scales.escape_count;
                 size_t inner = kPackedScaleBytes + scales.escape_count + 16;
                 inner = (inner + 3) & ~size_t(3);
                 pre[projection] = dev[projection] + inner;

@@ -602,7 +602,6 @@ public:
             check(cudaEventCreateWithFlags(&state.copy_done, cudaEventDisableTiming),
                   "cudaEventCreate expert copy");
         check(cudaStreamCreate(&copy_stream_), "cudaStreamCreate expert copies");
-        check(cudaMalloc(&device_, kPayloadCapacity), "cudaMalloc expert record");
         overlap_reads_ = std::getenv("INSIGNIA_GLM53_EAGER_EXPERT_JOIN") == nullptr;
         l2_mode_ = std::getenv("INSIGNIA_GLM53_PAGECACHE_L2") != nullptr;
         if (const char *filter = std::getenv("INSIGNIA_GLM53_ADMIT_N"))
@@ -1010,6 +1009,7 @@ public:
             active_device_ = device_arena_ + size_t(device_slot) * device_stride_;
             active_device_slot_ = device_slot;
         } else {
+            ensure_device_scratch();
             // Legacy single-scratch path: async H2D on the copy stream lets
             // the copy engine overlap the SMs' previous expert GEMVs instead
             // of stalling the CPU per record. The default-stream GEMVs below
@@ -1603,6 +1603,11 @@ private:
         packed_h2d_bytes_.fetch_add(transported, std::memory_order_relaxed);
         packed_h2d_records_.fetch_add(1, std::memory_order_relaxed);
     }
+    void ensure_device_scratch() {
+        if (!device_)
+            check(cudaMalloc(&device_, kPayloadCapacity), "cudaMalloc expert record");
+    }
+
     // Sizes and allocates the VRAM tier at first expert use, when every
     // startup allocation (dense FP8 residency, drafter, state buffers) has
     // already claimed its VRAM and cudaMemGetInfo reflects steady state.
@@ -1628,9 +1633,12 @@ private:
             cudaGetLastError();  // clear the sticky error and retry smaller
             attempt /= 2;
         }
-        if (attempt < 2) {
-            // A one-slot arena cannot recycle (the active slot is never its
-            // own victim); stay on the legacy single-scratch path instead.
+        const size_t segment_count = compact_device_segments_ ? 42u : 46u;
+        if (attempt < 2 * segment_count) {
+            // Every fixed layer segment needs one active slot plus one legal
+            // recycle victim. A smaller global arena leaves some one-slot
+            // segments and would fail on their second miss; use the exact
+            // single-scratch fallback instead.
             if (device_arena_) {
                 cudaFree(device_arena_);
                 device_arena_ = nullptr;
@@ -2216,8 +2224,6 @@ public:
               "cudaHostAlloc Q8 weights");
         check(cudaHostAlloc(&host_scales_, kScaleCapacity, cudaHostAllocDefault),
               "cudaHostAlloc Q8 scales");
-        check(cudaMalloc(&stream_weights_, kWeightCapacity), "cudaMalloc Q8 weights");
-        check(cudaMalloc(&stream_scales_, kScaleCapacity), "cudaMalloc Q8 scales");
     }
     ~Q8Stager() {
         if (host_weights_) cudaFreeHost(host_weights_);
@@ -2269,6 +2275,7 @@ public:
         }
         require(weight_bytes <= kWeightCapacity && scale_bytes <= kScaleCapacity,
                 "Q8 tensor slice exceeds streaming slot");
+        ensure_stream_slots();
         const auto begin = std::chrono::steady_clock::now();
         index_.read_rows(tensor, row, rows, host_weights_, host_scales_);
         const auto end = std::chrono::steady_clock::now();
@@ -2364,6 +2371,13 @@ public:
     uint64_t resident_bytes() const { return resident_used_; }
 
 private:
+    void ensure_stream_slots() {
+        if (!stream_weights_)
+            check(cudaMalloc(&stream_weights_, kWeightCapacity), "cudaMalloc Q8 weights");
+        if (!stream_scales_)
+            check(cudaMalloc(&stream_scales_, kScaleCapacity), "cudaMalloc Q8 scales");
+    }
+
     struct Resident {
         uint8_t *weights = nullptr;
         uint8_t *scales = nullptr;
@@ -2658,8 +2672,8 @@ public:
         router_.reset(moe_experts_);
         beta_.reset(kda_heads_);
         logits_.reset(model_.vocab_size());
-        kda_states_.reset(size_t(layer_count) * kda_width_ * kda_head_dim_);
-        conv_history_.reset(size_t(layer_count) * 9 * kda_width_);
+        kda_states_.reset(size_t(kda_layers_) * kda_width_ * kda_head_dim_);
+        conv_history_.reset(size_t(kda_layers_) * 9 * kda_width_);
         mla_legacy_ = std::getenv("INSIGNIA_GLM53_MLA_LEGACY") != nullptr;
         kv_fp8_ = !std::getenv("INSIGNIA_GLM53_KV_FP8") ||
                   std::atoi(std::getenv("INSIGNIA_GLM53_KV_FP8")) != 0;
@@ -3233,7 +3247,9 @@ void Runner::mhc(std::string_view stem, std::string_view norm,
 
 void Runner::kda(int layer, const float *input, float *output, int position) {
     const std::string stem = layer_stem(layer) + "self_attn.";
-    float *history = conv_history_.get() + size_t(layer) * 9 * kda_width_;
+    const int row = kda_row_[size_t(layer)];
+    require(row >= 0, "KDA state requested for a non-KDA layer");
+    float *history = conv_history_.get() + size_t(row) * 9 * kda_width_;
     const bool conv_fp32 = model_.tensor(stem + "q_conv1d.weight").type == TensorType::f32;
                     linear(stem + "q_proj.weight", input, q_, kda_width_, hidden_);
                     const void *conv_q = stager_.load(stem + "q_conv1d.weight");
@@ -3252,7 +3268,7 @@ void Runner::kda(int layer, const float *input, float *output, int position) {
     kda_gate_kernel<<<32, 256>>>(gate_8192_, dt_bias, a_log, beta_, kda_heads_, kda_width_);
     check(cudaGetLastError(), "KDA gate launch");
 
-    float *state = kda_states_.get() + size_t(layer) * kda_width_ * kda_head_dim_;
+    float *state = kda_states_.get() + size_t(row) * kda_width_ * kda_head_dim_;
     check(insignia::glm53::kda_decode(state, q_, k_, v_, gate_8192_, beta_, core_,
           kda_heads_, kda_head_dim_), "KDA recurrence");
     linear(stem + "g_a_proj.weight", input, small_a_, f_a_rows_, hidden_);
@@ -3942,8 +3958,8 @@ void Runner::rollback_kda(int accepted, int position_base) {
         const uint16_t *conv_v = reinterpret_cast<const uint16_t *>(stager_.load(stem + "v_conv1d.weight"));
         const float *dt_bias = device_f32(stem + "dt_bias");
         const float *a_log = device_f32(stem + "A_log");
-        float *history = conv_history_.get() + size_t(layer) * 9 * width;
-        float *state = kda_states_.get() + size_t(layer) * width * kda_head_dim_;
+        float *history = conv_history_.get() + size_t(row) * 9 * width;
+        float *state = kda_states_.get() + size_t(row) * width * kda_head_dim_;
         for (int token = 0; token < accepted; ++token) {
             const float *arch = kda_arch_.get() + (size_t(row) * kMaxVerify + token) * stride;
             check(cudaMemcpy(q_, arch, size_t(width) * sizeof(float), cudaMemcpyDeviceToDevice),
@@ -4024,7 +4040,9 @@ void Runner::mhc_multi(std::string_view stem, const float *streams, float *colla
 void Runner::kda_multi(int layer, const float *input, float *output, int tokens, int position_base) {
     const std::string stem = layer_stem(layer) + "self_attn.";
     const int width = kda_width_;
-    float *history = conv_history_.get() + size_t(layer) * 9 * width;
+    const int row = kda_row_[size_t(layer)];
+    require(row >= 0, "KDA state requested for a non-KDA layer");
+    float *history = conv_history_.get() + size_t(row) * 9 * width;
     const bool conv_fp32 = model_.tensor(stem + "q_conv1d.weight").type == TensorType::f32;
     linear_multi(stem + "q_proj.weight", input, c_q_, tokens, width, hidden_);
     if (kda_archive_) archive_kda_rows(layer, c_q_, tokens, 0);
@@ -4052,7 +4070,7 @@ void Runner::kda_multi(int layer, const float *input, float *output, int tokens,
     const float *a_log = device_f32(stem + "A_log");
     linear_multi(stem + "b_proj.weight", input, c_beta_, tokens, kda_heads_, hidden_);
     if (kda_archive_) archive_kda_rows(layer, c_beta_, tokens, 4);
-    float *state = kda_states_.get() + size_t(layer) * width * kda_head_dim_;
+    float *state = kda_states_.get() + size_t(row) * width * kda_head_dim_;
     for (int token = 0; token < tokens; ++token) {
         float *gate = c_gate_.get() + size_t(token) * width;
         float *beta = c_beta_.get() + size_t(token) * kda_heads_;

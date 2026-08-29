@@ -1,5 +1,23 @@
 # progress
 
+### 2026-08-29 (session 9) — compute-for-bandwidth MLA; +81 DFlash expert slots
+
+Full findings: `audits/s9-reclaim-session.md`. Exact on-consumption MLA absorb
+now reconstructs `W_uk`/`W_uv` coefficients from resident E4M3 + FP16 scales,
+trading idle Ada ALU for removal of the 704 MiB FP32 duplicate. Exhaustive GPU
+comparisons at prefixes 8/520/4096 found zero mismatches; real-model top-10 and
+IDs stayed digit-identical. With Task-4's lazy Q8/scratch allocations and
+compact 34-row KDA state, expert slots rose 316->383 scalar and 211->281
+DFlash. Forced sequential verification now omits 145.6 MiB of unreachable
+rollback snapshots, reaching 292 DFlash slots (+81, +38.4%) with hard guards
+against batch rollback. Final glm-box GSM smoke accepted a 3-token block and
+reproduced IDs `1986 374 264 4285`. A focused four-prompt A/B was 4/4 parity;
+paired median ratios improved ~0.7% scalar and ~0.8% DFlash. The long factorial
+was stopped and the harness reduced to the necessary two arms. Task 9 staged
+verification was rejected at its 2.4369% robust maximin ceiling. Full-prompt
+layer-major prefill also landed behind an env gate; one exact two-chunk sample
+improved 8.570->7.188 s (16.1%). No overclock instability was observed.
+
 ### 2026-08-29 (session 8) — packed transport v2 (2D copies + fused expansion); CCT builder bug; U1 settled
 
 Full findings: `audits/s8-gpu-expand-session.md`. Follow-up to 8b3018e

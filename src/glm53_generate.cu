@@ -4971,6 +4971,9 @@ int main(int argc, char **argv) {
                 int v2_kstar = 0;
                 int v2_probe_dir = 1;
                 const bool v2_costtrace = std::getenv("INSIGNIA_GLM53_DF_COSTTRACE") != nullptr;
+                const bool v2_k1_scalar =
+                    std::getenv("INSIGNIA_GLM53_DF_K1_SCALAR") != nullptr;
+                int v2_scalar_rounds = 0;
                 // Sticky union curve d(k)/336k: s6 measured K=2..5 (0.903,
                 // 0.859, 0.825, 0.785), s7 extrapolated K=6..8 (0.754, 0.727,
                 // 0.700); verifies at 1067/1109 records at k=4.
@@ -5030,6 +5033,37 @@ int main(int argc, char **argv) {
                         insignia::glm53::DFlash2Drafter::kMaxCtx) break;
                     int round_verify_k = v2_pick_k(verify_k);
                     const int draft_k = std::min(round_verify_k, generate - int(generated.size()));
+                    // k=1 cannot expose an extra accepted token: truth0 is
+                    // already known from the previous exact target step.
+                    // Skip the drafter entirely and execute that exact scalar
+                    // transition. Periodic k=2 probes still pass through the
+                    // speculative path and can move the controller off k=1.
+                    if (v2_k1_scalar && adaptive_k_mode == 2 && draft_k == 1) {
+                        const uint64_t records_before = runner.expert_records_read();
+                        const auto scalar_begin = std::chrono::steady_clock::now();
+                        generated.push_back(truth0);
+                        double scalar_ms = 0.0;
+                        if (int(generated.size()) < generate) {
+                            top = runner.step(truth0, position + 1, layers, true);
+                            scalar_ms = 1000.0 * std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - scalar_begin).count();
+                            v2_fhat_ms = 0.9 * v2_fhat_ms + 0.1 * scalar_ms;
+                            root = truth0;
+                            truth0 = top.front().first;
+                            ++position;
+                        }
+                        ++rounds;
+                        ++v2_scalar_rounds;
+                        ++accept_hist[1];
+                        accept_total += 1.0;
+                        if (v2_costtrace)
+                            std::printf("costtrace,%d,0,1,0.000,%.3f,0,%.0f,%.4f,%.3f,%d\n",
+                                        rounds, scalar_ms,
+                                        double(runner.expert_records_read() - records_before),
+                                        v2_qhat[1], v2_bhat, v2_kstar);
+                        std::fflush(stdout);
+                        continue;
+                    }
                     if (std::getenv("INSIGNIA_GLM53_DF_DEBUG"))
                         std::fprintf(stderr, "df round %d: anchor %d pos %d truth0 %d\n",
                                      rounds, root, position, truth0);
@@ -5191,12 +5225,13 @@ int main(int argc, char **argv) {
                 for (int id : generated) std::printf(" %d", id);
                 std::printf("\n%zu-token prompt %.3f s; %d greedy tokens in %d DFLASH2-k%d rounds "
                             "(%.2f accepted/round, %d empty; %.1f ms/token; "
-                            "draft %.1f ms/round + verify %.1f ms/verified round (%d verified), "
+                            "draft %.1f ms/spec round + verify %.1f ms/verified round (%d verified), "
                             "fallback %.1f ms)\n",
                             tokens.size(), elapsed, generate, rounds, verify_k,
                             accept_total / rounds, empty_rounds,
                             1000.0 * decode_seconds / generate,
-                            1000.0 * draft_total / rounds,
+                            1000.0 * draft_total /
+                                std::max(1, rounds - v2_scalar_rounds),
                             1000.0 * verify_total / std::max(1, verified_rounds),
                             verified_rounds,
                             1000.0 * fallback_total);
@@ -5205,6 +5240,9 @@ int main(int argc, char **argv) {
                     if (accept_hist[size_t(count)])
                         std::printf(" %d:%d", count, accept_hist[size_t(count)]);
                 std::printf("\n");
+                if (v2_scalar_rounds)
+                    std::printf("  adaptive controller bypassed speculation for %d k=1 rounds\n",
+                                v2_scalar_rounds);
             } else if (mtp_k >= 2 && generate > 1) {
                 // Faithful MTP flow (vLLM deepseek_mtp semantics): each round
                 // drafts K tokens from (embed(root), h(root)) chained through

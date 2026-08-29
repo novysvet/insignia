@@ -12,6 +12,18 @@ size_t nvfp4_workspace_bytes(int cols);
 // Uploads the E2M1 integer and E4M3 scale tables for the current CUDA device.
 cudaError_t initialize_nvfp4();
 
+// Expands one projection's packed 4-bit scale-code stream on-device. The
+// host supplies one exclusive escape-count prefix per 256 packed bytes;
+// output is byte-identical to the AVX2 sidecar decoder.
+cudaError_t expand_nvfp4_scale_nibbles(
+    const uint8_t *packed,
+    const uint8_t *escapes,
+    const uint8_t *codebook,
+    const uint32_t *block_prefix,
+    uint8_t *output,
+    size_t output_bytes,
+    cudaStream_t stream = nullptr);
+
 // Exact checkpoint decode: packed E2M1 x E4M3-per-16 x global FP32.
 cudaError_t nvfp4_gemv_f32(
     const uint8_t *weights,

@@ -761,6 +761,54 @@ void print_result(const char *name, float milliseconds, uint64_t bytes, const Me
                 metrics.relative_l2, metrics.cosine, metrics.max_abs);
 }
 
+// One thread expands one packed byte (two output scale codes). The host
+// supplies an exclusive escape count at every 256-byte block boundary; an
+// in-block scan recovers the exact global escape cursor without serializing
+// the 512 KiB output. All operations are integer/byte moves.
+__global__ __launch_bounds__(256) void expand_scale_nibbles_kernel(
+    const uint8_t *__restrict__ packed,
+    const uint8_t *__restrict__ escapes,
+    const uint8_t *__restrict__ codebook,
+    const uint32_t *__restrict__ block_prefix,
+    uint8_t *__restrict__ output) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const size_t packed_index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint8_t byte = packed[packed_index];
+    const uint8_t low = byte & 15u;
+    const uint8_t high = byte >> 4;
+    const uint32_t mine = uint32_t(low == 15u) + uint32_t(high == 15u);
+
+    uint32_t inclusive = mine;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const uint32_t prior = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) inclusive += prior;
+    }
+    __shared__ uint32_t warp_totals[8], warp_offsets[8];
+    __shared__ uint8_t codes[16];
+    if (threadIdx.x < 16) codes[threadIdx.x] = codebook[threadIdx.x];
+    if (lane == 31) warp_totals[warp] = inclusive;
+    __syncthreads();
+    if (warp == 0) {
+        uint32_t value = lane < 8 ? warp_totals[lane] : 0u;
+        uint32_t warp_inclusive = value;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const uint32_t prior = __shfl_up_sync(0xffffffffu, warp_inclusive, offset);
+            if (lane >= offset) warp_inclusive += prior;
+        }
+        if (lane < 8) warp_offsets[lane] = warp_inclusive - value;
+    }
+    __syncthreads();
+
+    uint32_t escape_at = block_prefix[blockIdx.x] + warp_offsets[warp] + inclusive - mine;
+    const uint8_t first = low == 15u ? escapes[escape_at++] : codes[low];
+    const uint8_t second = high == 15u ? escapes[escape_at] : codes[high];
+    output[2 * packed_index] = first;
+    output[2 * packed_index + 1] = second;
+}
+
 }  // namespace
 
 namespace insignia::glm53 {
@@ -785,6 +833,21 @@ cudaError_t initialize_nvfp4() {
     cudaError_t status = cudaMemcpyToSymbol(c_e4m3, e4m3, sizeof(e4m3));
     if (status != cudaSuccess) return status;
     return cudaMemcpyToSymbol(c_e2i, e2i, sizeof(e2i));
+}
+
+cudaError_t expand_nvfp4_scale_nibbles(
+    const uint8_t *packed, const uint8_t *escapes, const uint8_t *codebook,
+    const uint32_t *block_prefix, uint8_t *output, size_t output_bytes,
+    cudaStream_t stream) {
+    constexpr size_t packed_per_block = 256;
+    if (!packed || !escapes || !codebook || !block_prefix || !output ||
+        !output_bytes || (output_bytes & 1) ||
+        (output_bytes / 2) % packed_per_block)
+        return cudaErrorInvalidValue;
+    const size_t blocks = output_bytes / 2 / packed_per_block;
+    expand_scale_nibbles_kernel<<<unsigned(blocks), 256, 0, stream>>>(
+        packed, escapes, codebook, block_prefix, output);
+    return cudaPeekAtLastError();
 }
 
 cudaError_t nvfp4_gemv_f32(

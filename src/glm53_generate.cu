@@ -548,6 +548,11 @@ class ExpertStager {
 public:
     static constexpr size_t kBodyBytes = 12ull << 20;
     static constexpr size_t kScaleBytes = 1536ull << 10;
+    static constexpr size_t kProjectionBodyBytes = 4ull << 20;
+    static constexpr size_t kProjectionScaleBytes = 512ull << 10;
+    static constexpr size_t kPackedScaleBytes = 256ull << 10;
+    static constexpr size_t kScalePrefixEntries = kPackedScaleBytes / 256 + 1;
+    static constexpr size_t kPackedDeviceCapacity = kScaleBytes + (64ull << 10);
     static constexpr size_t kPayloadCapacity = kBodyBytes + kScaleBytes + 64;
     static constexpr size_t kAlignment = 4096;
     static constexpr size_t kWindowBytes =
@@ -588,8 +593,14 @@ public:
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
             vram_budget_mb_ = std::max(0, std::atoi(budget));
-        if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS"))
+        if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS")) {
+            const char *gpu = std::getenv("INSIGNIA_GLM53_PACKED_GPU");
+            packed_gpu_scales_ = !gpu || std::atoi(gpu) != 0;
             open_packed_experts(path);
+            if (packed_gpu_scales_)
+                check(cudaMalloc(&packed_scale_device_, kPackedDeviceCapacity),
+                      "cudaMalloc packed scale transport");
+        }
         for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
         start_pool();
         load_pin_list();
@@ -607,6 +618,7 @@ public:
         if (device_arena_) cudaFree(device_arena_);
         for (cudaEvent_t &event : device_slot_reads_)
             if (event) cudaEventDestroy(event);
+        if (packed_scale_device_) cudaFree(packed_scale_device_);
         if (device_) cudaFree(device_);
         if (packed_direct_fd_ >= 0) ::close(packed_direct_fd_);
         if (packed_fd_ >= 0) ::close(packed_fd_);
@@ -849,10 +861,8 @@ public:
                 // unrecorded event, which is immediately signalled.
                 check(cudaStreamWaitEvent(copy_stream_, device_slot_reads_[size_t(device_slot)], 0),
                       "order expert slot recycle");
-                check(cudaMemcpyAsync(device_arena_ + size_t(device_slot) * device_stride_,
-                                      state.payload, state.layout.bytes,
-                                      cudaMemcpyHostToDevice, copy_stream_),
-                      "expert record H2D");
+                enqueue_record_copy(state,
+                                    device_arena_ + size_t(device_slot) * device_stride_);
                 check(cudaEventRecord(state.copy_done, copy_stream_), "record expert copy");
                 check(cudaStreamWaitEvent(nullptr, state.copy_done, 0), "order expert copy");
                 state.copy_issued = true;
@@ -873,8 +883,7 @@ public:
             // the device_ scratch is reused across slots and only the
             // legacy-sync semantics keep slot N+1's copy behind slot N's
             // default-stream GEMVs.
-            check(cudaMemcpyAsync(device_, state.payload, state.layout.bytes,
-                                  cudaMemcpyHostToDevice, copy_stream_), "expert record H2D");
+            enqueue_record_copy(state, device_);
             check(cudaEventRecord(state.copy_done, copy_stream_), "record expert copy");
             check(cudaStreamWaitEvent(nullptr, state.copy_done, 0), "order expert copy");
             state.copy_issued = true;
@@ -924,6 +933,9 @@ public:
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
     bool packed_experts() const { return packed_fd_ >= 0; }
+    bool packed_gpu_scales() const { return packed_gpu_scales_; }
+    uint64_t packed_h2d_bytes() const { return packed_h2d_bytes_.load(); }
+    uint64_t packed_h2d_records() const { return packed_h2d_records_.load(); }
     uint64_t packed_expanded_bytes() const { return packed_expanded_bytes_.load(); }
     double packed_expand_seconds() const {
         return packed_expand_nanoseconds_.load() * 1.0e-9;
@@ -932,7 +944,11 @@ private:
     struct Layout {
         std::array<size_t, 3> body{};
         std::array<size_t, 3> scales{};
+        std::array<size_t, 3> packed_body{}, packed_blob{}, packed_device{};
+        std::array<size_t, 3> packed_escapes{}, packed_codebook{}, packed_prefix{};
+        std::array<size_t, 3> packed_blob_bytes{};
         size_t bytes = 0;
+        bool packed_scales = false;
     };
     struct WindowState {
         uint32_t key = kNoKey;
@@ -1010,10 +1026,11 @@ private:
 #endif
         const double fraction = header.source_bytes
             ? double(header.stored_bytes) / double(header.source_bytes) : 1.0;
-        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + AVX2 expand\n",
+        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + %s expand\n",
                     populated, header.stored_bytes / double(1ull << 30),
                     100.0 * (1.0 - fraction),
-                    packed_direct_fd_ >= 0 ? "O_DIRECT" : "buffered I/O");
+                    packed_direct_fd_ >= 0 ? "O_DIRECT" : "buffered I/O",
+                    packed_gpu_scales_ ? "GPU/packed-H2D" : "AVX2/expanded-H2D");
     }
     const PackedExpertIndexEntry &packed_entry(int layer, int expert) const {
         const size_t index = size_t(layer) * model_.experts() + size_t(expert);
@@ -1024,6 +1041,32 @@ private:
     uint64_t source_bytes(int layer, int expert) const {
         return packed_fd_ >= 0 ? packed_entry(layer, expert).padded_bytes
                                : kBodyBytes + kScaleBytes + 3 * sizeof(float);
+    }
+    static uint32_t count_escape_nibbles_256(const uint8_t *packed) {
+        const __m256i nibble_mask = _mm256_set1_epi8(15);
+        const __m256i escape_code = _mm256_set1_epi8(15);
+        uint32_t count = 0;
+        for (size_t offset = 0; offset < 256; offset += 32) {
+            const __m256i bytes =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(packed + offset));
+            const __m256i low = _mm256_and_si256(bytes, nibble_mask);
+            const __m256i high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), nibble_mask);
+            count += uint32_t(__builtin_popcount(uint32_t(_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(low, escape_code)))));
+            count += uint32_t(__builtin_popcount(uint32_t(_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(high, escape_code)))));
+        }
+        return count;
+    }
+    static void build_escape_prefix(const uint8_t *packed, uint32_t escape_count,
+                                    uint32_t *prefix) {
+        uint32_t count = 0;
+        for (size_t block = 0; block + 1 < kScalePrefixEntries; ++block) {
+            prefix[block] = count;
+            count += count_escape_nibbles_256(packed + block * 256);
+        }
+        prefix[kScalePrefixEntries - 1] = count;
+        require(count == escape_count, "packed expert scale escape-count mismatch");
     }
     static void expand_scale_nibbles(const uint8_t *packed, const uint8_t *escapes,
                                      uint32_t escape_count, const uint8_t *codebook,
@@ -1060,8 +1103,74 @@ private:
         }
         require(escape_at == escape_count, "packed expert scale escape overflow");
     }
-    void stage_packed(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
-                      uint8_t *window, int layer, int expert, void *scratch) {
+    void stage_packed_gpu(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                          uint8_t *window, int layer, int expert, void *scratch) {
+        const PackedExpertIndexEntry &entry = packed_entry(layer, expert);
+        require(scratch && entry.padded_bytes <= packed_scratch_bytes_,
+                "packed expert reader scratch is unavailable");
+        pread_exact(packed_direct_fd_ >= 0 ? packed_direct_fd_ : packed_fd_,
+                    entry.offset, scratch, entry.padded_bytes,
+                    "read packed expert record");
+        const auto *header = static_cast<const PackedExpertRecordHeader *>(scratch);
+        require(std::memcmp(header->magic, "XPR1", 4) == 0 &&
+                header->layer == layer && header->expert == expert,
+                "packed expert record key mismatch");
+        const uint8_t *input = static_cast<const uint8_t *>(scratch) + sizeof(*header);
+        const uint8_t *const input_end = static_cast<const uint8_t *>(scratch) + entry.stored_bytes;
+        std::array<const uint8_t *, 3> bodies{}, packed_scales{}, escape_values{};
+        for (int projection = 0; projection < 3; ++projection) {
+            require(size_t(input_end - input) >= kProjectionBodyBytes + kPackedScaleBytes +
+                                                header->escapes[projection],
+                    "truncated packed expert projection");
+            bodies[projection] = input;
+            packed_scales[projection] = input + kProjectionBodyBytes;
+            escape_values[projection] = packed_scales[projection] + kPackedScaleBytes;
+            input = escape_values[projection] + header->escapes[projection];
+        }
+        require(input == input_end, "packed expert record has trailing bytes");
+
+        layout = {};
+        for (int projection = 0; projection < 3; ++projection) {
+            layout.packed_body[projection] = size_t(projection) * kProjectionBodyBytes;
+            std::memcpy(window + layout.packed_body[projection], bodies[projection],
+                        kProjectionBodyBytes);
+            layout.body[projection] = size_t(projection) *
+                                      (kProjectionBodyBytes + kProjectionScaleBytes);
+            layout.scales[projection] = layout.body[projection] + kProjectionBodyBytes;
+            globals[projection] = header->globals[projection];
+        }
+        size_t cursor = kBodyBytes;
+        size_t device_cursor = 0;
+        for (int projection = 0; projection < 3; ++projection) {
+            const size_t blob = cursor;
+            layout.packed_blob[projection] = blob;
+            layout.packed_device[projection] = device_cursor;
+            std::memcpy(window + cursor, packed_scales[projection], kPackedScaleBytes);
+            cursor += kPackedScaleBytes;
+            layout.packed_escapes[projection] = cursor - blob;
+            std::memcpy(window + cursor, escape_values[projection], header->escapes[projection]);
+            cursor += header->escapes[projection];
+            layout.packed_codebook[projection] = cursor - blob;
+            std::memcpy(window + cursor, header->codebooks[projection], 16);
+            cursor += 16;
+            cursor = (cursor + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
+            layout.packed_prefix[projection] = cursor - blob;
+            std::array<uint32_t, kScalePrefixEntries> prefix{};
+            build_escape_prefix(packed_scales[projection], header->escapes[projection],
+                                prefix.data());
+            std::memcpy(window + cursor, prefix.data(), sizeof(prefix));
+            cursor += sizeof(prefix);
+            layout.packed_blob_bytes[projection] = cursor - blob;
+            device_cursor += layout.packed_blob_bytes[projection];
+        }
+        require(cursor <= kPayloadCapacity && device_cursor <= kPackedDeviceCapacity,
+                "packed GPU scale transport exceeds staging capacity");
+        layout.bytes = cursor;
+        layout.packed_scales = true;
+        payload = window;
+    }
+    void stage_packed_cpu(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                          uint8_t *window, int layer, int expert, void *scratch) {
         const PackedExpertIndexEntry &entry = packed_entry(layer, expert);
         require(scratch && entry.padded_bytes <= packed_scratch_bytes_,
                 "packed expert reader scratch is unavailable");
@@ -1102,6 +1211,52 @@ private:
         packed_expanded_bytes_.fetch_add(kBodyBytes + kScaleBytes, std::memory_order_relaxed);
         packed_expand_nanoseconds_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - expand_begin).count()), std::memory_order_relaxed);
+    }
+    void stage_packed(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+                      uint8_t *window, int layer, int expert, void *scratch) {
+        if (packed_gpu_scales_)
+            stage_packed_gpu(layout, globals, payload, window, layer, expert, scratch);
+        else
+            stage_packed_cpu(layout, globals, payload, window, layer, expert, scratch);
+    }
+    void enqueue_record_copy(WindowState &state, uint8_t *destination) {
+        if (!state.layout.packed_scales) {
+            check(cudaMemcpyAsync(destination, state.payload, state.layout.bytes,
+                                  cudaMemcpyHostToDevice, copy_stream_),
+                  "expert record H2D");
+            return;
+        }
+        require(packed_scale_device_, "packed GPU scale scratch is unavailable");
+        uint64_t transported = 0;
+        for (int projection = 0; projection < 3; ++projection) {
+            check(cudaMemcpyAsync(destination + state.layout.body[projection],
+                                  state.payload + state.layout.packed_body[projection],
+                                  kProjectionBodyBytes, cudaMemcpyHostToDevice, copy_stream_),
+                  "packed expert body H2D");
+            transported += kProjectionBodyBytes;
+            uint8_t *blob = packed_scale_device_ + state.layout.packed_device[projection];
+            check(cudaMemcpyAsync(blob,
+                                  state.payload + state.layout.packed_blob[projection],
+                                  state.layout.packed_blob_bytes[projection],
+                                  cudaMemcpyHostToDevice, copy_stream_),
+                  "packed expert scales H2D");
+            transported += state.layout.packed_blob_bytes[projection];
+        }
+        for (int projection = 0; projection < 3; ++projection) {
+            const uint8_t *blob =
+                packed_scale_device_ + state.layout.packed_device[projection];
+            check(insignia::glm53::expand_nvfp4_scale_nibbles(
+                      blob,
+                      blob + state.layout.packed_escapes[projection],
+                      blob + state.layout.packed_codebook[projection],
+                      reinterpret_cast<const uint32_t *>(
+                          blob + state.layout.packed_prefix[projection]),
+                      destination + state.layout.scales[projection],
+                      kProjectionScaleBytes, copy_stream_),
+                  "expand packed expert scales on GPU");
+        }
+        packed_h2d_bytes_.fetch_add(transported, std::memory_order_relaxed);
+        packed_h2d_records_.fetch_add(1, std::memory_order_relaxed);
     }
     // Sizes and allocates the VRAM tier at first expert use, when every
     // startup allocation (dense FP8 residency, drafter, state buffers) has
@@ -1484,7 +1639,9 @@ private:
     std::vector<PackedExpertIndexEntry> packed_entries_;
     size_t packed_scratch_bytes_ = 0;
     std::atomic<uint64_t> packed_expanded_bytes_{0}, packed_expand_nanoseconds_{0};
+    std::atomic<uint64_t> packed_h2d_bytes_{0}, packed_h2d_records_{0};
     uint8_t *host_raw_ = nullptr, *host_ = nullptr, *device_ = nullptr;
+    uint8_t *packed_scale_device_ = nullptr;
     uint8_t *active_device_ = nullptr;
     Layout active_{};
     std::array<float, 3> active_globals_{};
@@ -1498,7 +1655,7 @@ private:
     std::deque<int> demand_queue_[2], prefetch_queue_[2];
     std::unordered_map<uint32_t, int> drive_cache_;
     cudaStream_t copy_stream_ = nullptr;
-    bool stop_ = false;
+    bool stop_ = false, packed_gpu_scales_ = false;
     std::array<int, 8> batch_experts_{};
     std::array<bool, 8> batch_cached_{};
     std::array<bool, 8> batch_admit_{};
@@ -4076,6 +4233,15 @@ std::vector<std::pair<int, float>> Runner::step(
                     (unsigned long long)expert_stager_->prefetch_useful(),
                     (unsigned long long)expert_stager_->prefetch_wasted_observable(),
                     expert_stager_->prefetch_bytes() / double(1ull << 30));
+    if (expert_stager_ && expert_stager_->packed_gpu_scales() &&
+        expert_stager_->packed_h2d_records()) {
+        const uint64_t expanded = expert_stager_->packed_h2d_records() *
+            (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes);
+        std::printf("  packed GPU H2D %.3f GiB (%.3f GiB / %.2f%% PCIe bytes avoided)\n",
+                    expert_stager_->packed_h2d_bytes() / double(1ull << 30),
+                    (expanded - expert_stager_->packed_h2d_bytes()) / double(1ull << 30),
+                    100.0 * (expanded - expert_stager_->packed_h2d_bytes()) / expanded);
+    }
     if (expert_stager_ && expert_stager_->packed_experts() &&
         expert_stager_->packed_expanded_bytes())
         std::printf("  packed expand %.3f GiB in %.3f s (%.2f GiB/s; %.3f ms/record)\n",

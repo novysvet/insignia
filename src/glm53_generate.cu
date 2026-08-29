@@ -1015,6 +1015,9 @@ public:
     uint64_t io_bytes() const { return io_bytes_; }
     uint64_t prefetch_bytes() const { return prefetch_bytes_; }
     uint64_t cache_hits() const { return cache_hits_; }
+    // Demand NVMe record reads started (load_batch misses, F3 fallbacks,
+    // stage_layer unions) - the U3 adaptive-k cost estimator's denominator.
+    uint64_t records_read() const { return records_read_; }
     uint64_t cache_lookups() const { return cache_lookups_; }
     uint64_t prefetch_started() const { return prefetch_started_; }
     uint64_t prefetch_useful() const { return prefetch_useful_; }
@@ -1650,6 +1653,7 @@ private:
         state.l2_shard = -1;
         flight_index_.emplace(key, window);
         lru_push_back(window);
+        if (demand) ++records_read_;
         submit_window(window, demand);
     }
     // Relabeling an adopted prefetch is insufficient: if it has not started,
@@ -2022,6 +2026,7 @@ private:
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
+    uint64_t records_read_ = 0;
     double read_wait_seconds_ = 0.0;
     // VRAM tier: an arena of per-record device slots acts as an LRU above the
     // pinned host windows. A device hit skips both the NVMe read and the PCIe
@@ -2674,6 +2679,10 @@ public:
     void set_last_avg(const float *device_row) {
         check(cudaMemcpyAsync(last_avg_.get(), device_row, size_t(hidden_) * sizeof(float),
                               cudaMemcpyDeviceToDevice), "copy pending hidden");
+    }
+    // U3 adaptive-k cost estimation: demand NVMe record reads so far.
+    uint64_t expert_records_read() const {
+        return expert_stager_ ? expert_stager_->records_read() : 0;
     }
 
 private:
@@ -4742,12 +4751,76 @@ int main(int argc, char **argv) {
                 // beyond it widens the verify expert union for tokens that
                 // get rejected. Cap the draft at EMA-driven headroom; the
                 // verify pass itself stays greedy-exact either way.
-                const bool adaptive_k_on = [] {
+                const int adaptive_k_mode = [] {
                     const char *value = std::getenv("INSIGNIA_GLM53_DF_ADAPTIVE_K");
-                    return !value || std::atoi(value) != 0;
+                    return value ? std::atoi(value) : 1;
                 }();
+                const bool adaptive_k_on = adaptive_k_mode != 0;
                 double accept_ema = 0.0;
                 bool accept_ema_init = false;
+                // Adaptive draft length v2 (DF_ADAPTIVE_K=2): the corrected
+                // speculative economics from audits/s8 §2 --
+                //   T(k) = [D + (1-p1)F + p1 * b * d(k)] / [(1-p1) + sum_j S(j)]
+                // with draft cost D and empty-round fallback F from running
+                // EMAs, per-record cost b from a decayed least-squares
+                // regression of verify wall vs demand record reads (U3),
+                // survival S(j) from censoring-correct per-position hazards,
+                // and d(k) = 42*8*k*ratio[k] from the measured sticky union
+                // curve. 8-point argmax with 1% hysteresis plus a mandatory
+                // +/-1 probe every 16 rounds (probe-less argmax deadlocks at
+                // k=1 with 11-46% regret). Per-round CSV via DF_COSTTRACE.
+                double v2_dhat_ms = 17.0, v2_fhat_ms = 450.0;
+                double v2_qhat[9] = {0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7};
+                double v2_sxx = 0, v2_sxy = 0, v2_sx = 0, v2_sy = 0, v2_sn = 0;
+                double v2_bhat = 1.4;
+                int v2_kstar = 0;
+                int v2_probe_dir = 1;
+                const bool v2_costtrace = std::getenv("INSIGNIA_GLM53_DF_COSTTRACE") != nullptr;
+                // Sticky union curve d(k)/336k: s6 measured K=2..5 (0.903,
+                // 0.859, 0.825, 0.785), s7 extrapolated K=6..8 (0.754, 0.727,
+                // 0.700); verifies at 1067/1109 records at k=4.
+                const double v2_union_ratio[9] = {0.0, 1.0, 0.903, 0.859, 0.825,
+                                                  0.785, 0.754, 0.727, 0.700};
+                auto v2_pick_k = [&](int fallback_k) {
+                    if (!adaptive_k_on) return fallback_k;
+                    if (adaptive_k_mode != 2)
+                        return accept_ema_init
+                                   ? std::clamp(int(accept_ema * 1.3) + 1, 2, fallback_k)
+                                   : fallback_k;
+                    const double p1 = v2_qhat[1];
+                    double denom = 1.0 - p1;
+                    double surv = p1;
+                    double best_t = 1.0e30, t_at_star = 1.0e30;
+                    int best_k = 1;
+                    for (int k = 1; k <= verify_k; ++k) {
+                        denom += surv;  // S(k) enters the accepted-token sum
+                        const double cost = v2_dhat_ms + (1.0 - p1) * v2_fhat_ms +
+                                            p1 * v2_bhat * (42.0 * 8.0 * k * v2_union_ratio[k]);
+                        const double t = cost / denom;
+                        if (k == v2_kstar) t_at_star = t;
+                        if (t < best_t) {
+                            best_t = t;
+                            best_k = k;
+                        }
+                        surv *= v2_qhat[k + 1 > 8 ? 8 : k + 1];
+                    }
+                    if (v2_kstar < 1)
+                        v2_kstar = best_k;
+                    else if (best_k != v2_kstar && best_t < t_at_star * 0.99)
+                        v2_kstar = best_k;  // 1% hysteresis against oscillation
+                    int chosen = v2_kstar;
+                    // Mandatory exploration: a wrong-surface argmax otherwise
+                    // deadlocks (s8: k=1 deadlock at 11-46% regret).
+                    if (rounds && rounds % 16 == 0) {
+                        chosen = v2_kstar + v2_probe_dir;
+                        if (chosen > verify_k || chosen < 1) {
+                            v2_probe_dir = -v2_probe_dir;
+                            chosen = v2_kstar + v2_probe_dir;
+                        }
+                        v2_probe_dir = -v2_probe_dir;
+                    }
+                    return std::clamp(chosen, 1, fallback_k);
+                };
                 const auto decode_begin = std::chrono::steady_clock::now();
                 std::printf("position %zu top10", tokens.size());
                 for (const auto &[id, logit] : top) std::printf(" %d:%.6f", id, logit);
@@ -4760,17 +4833,18 @@ int main(int argc, char **argv) {
                     // past it, fall back to plain greedy steps.
                     if (position + 1 + insignia::glm53::DFlash2Drafter::kBlock >
                         insignia::glm53::DFlash2Drafter::kMaxCtx) break;
-                    int round_verify_k = verify_k;
-                    if (adaptive_k_on && accept_ema_init)
-                        round_verify_k = std::clamp(int(accept_ema * 1.3) + 1, 2, verify_k);
+                    int round_verify_k = v2_pick_k(verify_k);
                     const int draft_k = std::min(round_verify_k, generate - int(generated.size()));
                     if (std::getenv("INSIGNIA_GLM53_DF_DEBUG"))
                         std::fprintf(stderr, "df round %d: anchor %d pos %d truth0 %d\n",
                                      rounds, root, position, truth0);
                     const auto draft_begin = std::chrono::steady_clock::now();
                     const std::vector<int> candidates = runner.df_draft(root, position);
-                    draft_total += std::chrono::duration<double>(
+                    const double draft_ms = 1000.0 * std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - draft_begin).count();
+                    draft_total += draft_ms / 1000.0;
+                    if (adaptive_k_mode == 2)
+                        v2_dhat_ms = 0.9 * v2_dhat_ms + 0.1 * draft_ms;
 
                     // d1 is checked against the exact target argmax carried
                     // from the preceding committed token. A mismatch proves
@@ -4788,20 +4862,31 @@ int main(int argc, char **argv) {
                         // worst.
                         accept_ema = accept_ema_init ? 0.75 * accept_ema : 0.0;
                         accept_ema_init = true;
+                        double fallback_ms = 0.0;
                         if (int(generated.size()) < generate) {
                             const auto fallback_begin = std::chrono::steady_clock::now();
                             top = runner.step(truth0, position + 1, layers, true);
-                            fallback_total += std::chrono::duration<double>(
+                            fallback_ms = 1000.0 * std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - fallback_begin).count();
+                            fallback_total += fallback_ms / 1000.0;
+                            if (adaptive_k_mode == 2) {
+                                v2_fhat_ms = 0.9 * v2_fhat_ms + 0.1 * fallback_ms;
+                                v2_qhat[1] = 0.9 * v2_qhat[1];  // reject at position 1
+                            }
                             root = truth0;
                             truth0 = top.front().first;
                             ++position;
                         }
+                        if (v2_costtrace && adaptive_k_mode == 2)
+                            std::printf("costtrace,%d,%d,0,%.3f,0,%.3f,0,%.4f,%.3f,%d\n",
+                                        rounds, draft_k, draft_ms, fallback_ms,
+                                        v2_qhat[1], v2_bhat, v2_kstar);
                         std::fflush(stdout);
                         continue;
                     }
 
                     const auto verify_begin = std::chrono::steady_clock::now();
+                    const uint64_t verify_records_before = runner.expert_records_read();
                     std::vector<int> arg(static_cast<size_t>(draft_k), 0);
                     int matched = 1;
                     bool df_seq_verify =
@@ -4835,9 +4920,41 @@ int main(int argc, char **argv) {
                         while (matched < draft_k && arg[size_t(matched - 1)] == candidates[size_t(matched)])
                             ++matched;
                     }
-                    verify_total += std::chrono::duration<double>(
+                    const double verify_ms = 1000.0 * std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - verify_begin).count();
+                    verify_total += verify_ms / 1000.0;
                     ++verified_rounds;
+                    if (adaptive_k_mode == 2) {
+                        // Censoring-correct hazard updates: positions 1..matched
+                        // passed; position matched+1 rejected (observable only
+                        // when the round drafted that wide).
+                        for (int j = 1; j <= matched && j <= 8; ++j)
+                            v2_qhat[j] = 0.9 * v2_qhat[j] + 0.1;
+                        if (matched < draft_k && matched + 1 <= 8)
+                            v2_qhat[matched + 1] = 0.9 * v2_qhat[matched + 1];
+                        // U3: online per-record cost. Decayed least squares of
+                        // verify wall on demand record reads; clamped to the
+                        // measured regime band (0.4-2.5 ms/record).
+                        const double records =
+                            double(runner.expert_records_read() - verify_records_before);
+                        constexpr double lambda = 0.95;
+                        v2_sn = lambda * v2_sn + 1.0;
+                        v2_sx = lambda * v2_sx + records;
+                        v2_sy = lambda * v2_sy + verify_ms;
+                        v2_sxx = lambda * v2_sxx + records * records;
+                        v2_sxy = lambda * v2_sxy + records * verify_ms;
+                        if (v2_sn > 20.0 && v2_sxx > v2_sx * v2_sx / v2_sn + 1.0) {
+                            const double slope =
+                                (v2_sxy - v2_sx * v2_sy / v2_sn) /
+                                (v2_sxx - v2_sx * v2_sx / v2_sn);
+                            if (slope > 0.0)
+                                v2_bhat = std::clamp(slope, 0.4, 2.5);
+                        }
+                        if (v2_costtrace)
+                            std::printf("costtrace,%d,%d,%d,%.3f,%.3f,0,%.0f,%.4f,%.3f,%d\n",
+                                        rounds, draft_k, matched, draft_ms, verify_ms,
+                                        records, v2_qhat[1], v2_bhat, v2_kstar);
+                    }
                     accept_ema = accept_ema_init ? 0.75 * accept_ema + 0.25 * matched
                                                  : double(matched);
                     accept_ema_init = true;

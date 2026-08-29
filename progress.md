@@ -1,5 +1,50 @@
 # progress
 
+### 2026-08-29 (session 8) — packed transport v2 (2D copies + fused expansion); CCT builder bug; U1 settled
+
+Full findings: `audits/s8-gpu-expand-session.md`. Follow-up to 8b3018e
+(GPU scale expansion). A 13-agent analysis wave + implementation wave:
+
+- Landed (parity-green, env-gated default-off): `INSIGNIA_GLM53_PACKED_V2=1`
+  merges the per-record H2D into one pitched `cudaMemcpy2DAsync` for the
+  three 4 MiB bodies + one linear blob copy + ONE fused expansion launch
+  (6 memcpy + 3 launches → 2 + 1); `INSIGNIA_GLM53_PACKED_KERNEL=2` selects
+  the warp uint32 expansion kernel (one thread per packed word, 64-bit
+  store, shared pair-table with escape flags, PRMT assembly, 8x fewer
+  blocks, ~12% faster than the byte worker, byte-identical). Escape-tail
+  bounds hardened before window writes (corrupt-record overflow risk).
+  `glm53-expert-bench --expand` microbench added (synthesis at 5 escape
+  rates, byte-exactness gates, kernel/host/transport/record-mix timing).
+- Gates: base parity (unpacked == packed-CPU == packed-GPU at 8b3018e) and
+  v2-knob parity all green — greedy IDs + full-vocab logits byte-identical
+  (140 tokens x 2 prompts x 3 knob combos). Cold A/B: all packed transports
+  within noise of each other (scalar ~405, DFlash k7 ~223 ms/tok); the
+  packed store's ~+5% vs unpacked is the staging window memcpy, not
+  transport — direct-read staging is the next lever. GPU expand removes
+  129 us/record of AVX2 decode from the readers and 5.38% of PCIe bytes.
+- **CCT builder was broken**: `np.argsort(-co)` on uint32 wraps — every
+  table ever built was an anti-signal ranking (shipped cct-gsm8k.table is
+  100% garbage rows). Fixed; `/var/lib/insignia/cct-campaign-v2.table`
+  regenerated from 10 campaign prompts (11,750 tokens), row-verified.
+  Corrected CCT = 28.4% OOS coverage at 1.0x overfetch (cap 8) — keep as
+  a capped reader-pool hint, never a router head.
+- Campaign analytics (16k tokens): U1 settled — the 5.22-bit entropy was
+  small-sample bias (true ~7.3 bits, support ~110-120/layer); exchangeable
+  models now OVER-predict U(K) by 7-16% (one-step stickiness beta~0.165
+  explains 99%); static top-330 VRAM tier covers only ~15% of real decode
+  access; pin-list v3 built (+15-18pp over pin-v2); static-vs-LRU phase
+  transition at B=336 slots. Adaptive-k T(k) accounting corrected (verified
+  round yields `matched` tokens, not 1+Sigma S) — at b=1.8 real text NO k
+  beats scalar (1.026x best); break-even b*=1.74 at p-bar 3.08; estimator
+  needs mandatory k-probes (else deadlocks at k=1, 11-46% regret). Drafter
+  checkpoint is block_size 8 / window 2048 — block-16 hypothesis dead;
+  DFLASH2_FP8 default path was dead on disk, repointed to -fixed.
+- Next queue: direct-read packed staging (kill the 12.8 MiB window memcpy),
+  VRAM-tier residency ordering (20-40 ms/tok), host-tier segment-LRU +
+  acceptance-prefix demote (offline falsifier first), O(1) LRU, pinned
+  router D2H (graph prerequisite), adaptive-k v2 with DF_COSTTRACE, CCT
+  cold-prompt A/B, pin-list v3 adoption.
+
 ### 2026-08-29 (session 7) — 27-agent optimization wave; packed sidecar validated; s6 problems resolved on paper
 
 Full findings and the unsolved-problems list: `audits/s7-optimization-wave.md`.

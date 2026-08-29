@@ -617,6 +617,12 @@ public:
         // real-prompt campaign confirms the trace-replay gain.
         compact_device_segments_ =
             std::getenv("INSIGNIA_GLM53_VRAM_COMPACT_SEGMENTS") != nullptr;
+        // A front-of-batch miss must not blindly evict an expert required a
+        // few canonical slots later.  Spend a handful of integer compares
+        // to retain whole 12.8 MiB records: prefer an entry absent from the
+        // rest of this batch, otherwise evict its farthest-future member.
+        batch_aware_device_victim_ =
+            std::getenv("INSIGNIA_GLM53_VRAM_BATCH_VICTIM") != nullptr;
         // F3 residency ordering: consult the VRAM expert tier before starting
         // an NVMe read. The legacy order only noticed device residency at
         // upload time, after the bytes had already been re-read from disk.
@@ -978,7 +984,7 @@ public:
                 device_slot = found->second;
                 ++device_hits_;
             } else {
-                device_slot = take_device_slot(state.layer);
+                device_slot = take_device_slot(state.layer, slot);
                 // The recycle waits on the victim's read fence: the copy
                 // stream never overwrites bytes a default-stream GEMV may
                 // still be reading. First fill of a fresh slot waits on an
@@ -1654,7 +1660,7 @@ private:
     // round scale (~1,300 distinct records/round >> slots), but the slice
     // for layer L retains its own most recent records, so the measured ~27%
     // adjacent-token routing overlap converts directly into PCIe-free hits.
-    int take_device_slot(int layer) {
+    int take_device_slot(int layer, int upload_slot) {
         const int segments = std::max(
             1, std::min(compact_device_segments_ ? 42 : 46, device_slot_count_));
         const size_t segment = compact_device_segments_
@@ -1665,14 +1671,38 @@ private:
                             ? device_slot_count_
                             : (segment + 1) * device_slot_count_ / segments;
         int victim = -1;
+        int cold_victim = -1;
+        int future_victim = -1;
+        int farthest_future = -1;
         for (int index = begin; index < end; ++index) {
             if (index == active_device_slot_) continue;  // fence not recorded yet
             if (device_slot_pinned_[size_t(index)]) continue;
             if (device_slot_keys_[size_t(index)] == kNoKey) return index;
-            if (victim < 0 ||
-                device_slot_stamps_[size_t(index)] < device_slot_stamps_[size_t(victim)])
-                victim = index;
+            if (!batch_aware_device_victim_) {
+                if (victim < 0 ||
+                    device_slot_stamps_[size_t(index)] < device_slot_stamps_[size_t(victim)])
+                    victim = index;
+                continue;
+            }
+            int future = -1;
+            for (int slot = upload_slot + 1; slot < batch_count_; ++slot)
+                if (device_slot_keys_[size_t(index)] ==
+                    route_key(layer, batch_experts_[size_t(slot)])) {
+                    future = slot;
+                    break;
+                }
+            if (future < 0) {
+                if (cold_victim < 0 ||
+                    device_slot_stamps_[size_t(index)] <
+                        device_slot_stamps_[size_t(cold_victim)])
+                    cold_victim = index;
+            } else if (future > farthest_future) {
+                farthest_future = future;
+                future_victim = index;
+            }
         }
+        if (batch_aware_device_victim_)
+            victim = cold_victim >= 0 ? cold_victim : future_victim;
         require(victim >= 0, "expert VRAM segment needs a recyclable slot");
         device_index_.erase(device_slot_keys_[size_t(victim)]);
         device_slot_keys_[size_t(victim)] = kNoKey;
@@ -2147,6 +2177,7 @@ private:
     int device_slot_count_ = 0;
     int active_device_slot_ = -1;
     bool compact_device_segments_ = false;
+    bool batch_aware_device_victim_ = false;
     bool device_arena_ready_ = false;
     int vram_budget_mb_ = -1;  // -1 = size from free VRAM at first use
     uint64_t device_stamp_ = 0;

@@ -2761,14 +2761,24 @@ public:
             require(df_cache_route_k_ >= 8 && df_cache_route_k_ <= 32,
                     "INSIGNIA_GLM53_DF_CACHE_ROUTE_K must be 8..32");
             require(dflash2_on_, "cache-aware DFlash routing requires DFlash2");
-            require(!df_approx_topm_ && df_approx_mass_ == 0.0f,
-                    "cache-aware routing and expert pruning are separate A/B arms");
+            require(df_approx_mass_ == 0.0f,
+                    "cache-aware routing does not compose with adaptive-mass pruning");
             if (const char *retain = std::getenv("INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN"))
                 df_cache_route_retain_ = std::atoi(retain);
+            else if (df_approx_topm_)
+                df_cache_route_retain_ = df_approx_topm_ - 1;
             if (const char *regret = std::getenv("INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET"))
                 df_cache_route_regret_ = std::strtof(regret, nullptr);
-            require(df_cache_route_retain_ == 6 || df_cache_route_retain_ == 7,
-                    "cache-aware DFlash routing retain must be 6 or 7");
+            if (df_approx_topm_) {
+                require(df_approx_topm_ >= 2 &&
+                            df_cache_route_retain_ == df_approx_topm_ - 1,
+                        "pruned cache routing keeps Top-M-1 and selects one cache-aware tail");
+                require(!df_approx_renorm_,
+                        "pruned cache routing currently preserves original Top-8 weights");
+            } else {
+                require(df_cache_route_retain_ == 6 || df_cache_route_retain_ == 7,
+                        "exact-width cache-aware routing retain must be 6 or 7");
+            }
             require(df_cache_route_regret_ >= 0.0f && df_cache_route_regret_ <= 0.05f,
                     "cache-aware DFlash routing regret must be in [0,0.05]");
             if (const char *joint =
@@ -2785,6 +2795,10 @@ public:
                     "cache guard retain must tighten the base policy and be at most 8");
             std::printf("DFlash2 cache-aware route: top-%d, retain %d, regret %.4f\n",
                         df_cache_route_k_, df_cache_route_retain_, df_cache_route_regret_);
+            if (df_approx_topm_)
+                std::printf("DFlash2 pruned cache route: keep %d strongest, choose slot %d "
+                            "from top-%d\n",
+                            df_cache_route_retain_, df_approx_topm_, df_cache_route_k_);
             if (df_cache_joint_options_)
                 std::printf("DFlash2 joint cache route: %d actions/row, exact union search up to k4\n",
                             df_cache_joint_options_);
@@ -5171,6 +5185,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     std::vector<std::array<float, 32>> candidate_choice(widened_rows);
     std::vector<std::array<float, 8>> router_summary(widened_rows);
     std::vector<std::array<uint32_t, 4>> candidate_residency(widened_rows);
+    std::vector<float> baseline_denominator(widened_rows);
     std::vector<std::array<int, 8>> baseline_experts(
         kda_archive_ && df_cache_route_k_ ? size_t(tokens) : 0);
     for (int token = 0; token < tokens; ++token) {
@@ -5192,6 +5207,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 baseline_experts[size_t(token)][size_t(slot)] = order[slot];
         }
         if (widen_router) {
+            baseline_denominator[size_t(token)] = denominator;
             double raw_sum = 0.0, raw_square_sum = 0.0, score_sum = 0.0;
             float raw_max = -std::numeric_limits<float>::infinity();
             float raw_second = raw_max;
@@ -5237,7 +5253,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_logit_guard_exact_[size_t(verify_row)];
         const int cache_route_retain = logit_guarded
             ? df_cache_guard_retain_ : df_cache_route_retain_;
-        if (kda_archive_ && df_cache_route_k_ && df_cache_route_regret_ > 0.0f &&
+        if (kda_archive_ && df_cache_route_k_ && !df_approx_topm_ &&
+            df_cache_route_regret_ > 0.0f &&
             cache_route_retain < 8 && !df_cache_joint_options_) {
             const auto &candidates = candidate_experts[size_t(token)];
             const auto &residency = candidate_residency[size_t(token)];
@@ -5367,7 +5384,259 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 selection[token][size_t(slot)].second *= scale;
         }
     }
-    if (kda_archive_ && df_cache_joint_options_ && df_cache_route_regret_ > 0.0f) {
+    // Compute-heavy cache-aware pruning: preserve the strongest M-1 experts
+    // and choose only the Mth executed expert from a widened router frontier.
+    // The CPU evaluates the candidate residency and, for k<=4 verify rows, an
+    // exact Cartesian layer-union objective.  This deliberately spends cheap
+    // Raptor Lake scalar work to avoid NVMe reads and PCIe uploads.  We retain
+    // the original Top-8 denominator, so this is fixed-Top-M zero-fill with a
+    // bounded tail substitution rather than a hidden renormalization.
+    if (kda_archive_ && df_approx_topm_ && df_cache_route_k_ &&
+        df_cache_route_regret_ > 0.0f) {
+        struct PrunedCacheChoice {
+            int expert = -1;
+            double regret = 0.0, ratio = 0.0;
+            int disk = 0, h2d = 0;
+        };
+        const int retained = df_cache_route_retain_;
+        const int topm = df_approx_topm_;
+        std::vector<std::vector<PrunedCacheChoice>> options(
+            static_cast<size_t>(tokens));
+        std::vector<std::array<int, 288>> candidate_rank(
+            static_cast<size_t>(tokens));
+        std::vector<uint8_t> guarded(size_t(tokens), 0);
+        std::array<int, 288> union_disk{}, union_h2d{};
+        union_disk.fill(-1);
+        union_h2d.fill(-1);
+        for (int token = 0; token < tokens; ++token) {
+            auto &rank = candidate_rank[size_t(token)];
+            rank.fill(-1);
+            const auto &candidates = candidate_experts[size_t(token)];
+            const auto &residency = candidate_residency[size_t(token)];
+            for (int candidate = 0; candidate < df_cache_route_k_; ++candidate) {
+                const int expert = candidates[size_t(candidate)];
+                rank[size_t(expert)] = candidate;
+                const uint32_t bit = uint32_t(1u) << candidate;
+                const bool device = (residency[2] & bit) != 0;
+                const bool host = (residency[0] & bit) != 0;
+                const bool inflight = (residency[1] & bit) != 0;
+                if (union_disk[size_t(expert)] < 0) {
+                    union_disk[size_t(expert)] = device ? 0 : !(host || inflight);
+                    union_h2d[size_t(expert)] = device ? 0 : 1;
+                }
+            }
+            const int verify_row = capture_offset_ + token;
+            guarded[size_t(token)] = df_logit_guard_on() && verify_row >= 0 &&
+                verify_row < kMaxVerify &&
+                df_logit_guard_exact_[size_t(verify_row)];
+            const auto &baseline = baseline_experts[size_t(token)];
+            double baseline_score = 0.0, score_scale = 0.0;
+            for (int slot = 0; slot < topm; ++slot) {
+                const int candidate = rank[size_t(baseline[size_t(slot)])];
+                require(candidate >= 0,
+                        "pruned cache baseline missing from candidate pool");
+                const double value = candidate_choice[size_t(token)][size_t(candidate)];
+                baseline_score += value;
+                score_scale += std::fabs(value);
+            }
+            double prefix_score = 0.0;
+            for (int slot = 0; slot < retained; ++slot) {
+                const int candidate = rank[size_t(baseline[size_t(slot)])];
+                prefix_score += candidate_choice[size_t(token)][size_t(candidate)];
+            }
+            auto append = [&](int expert) {
+                if (std::find(baseline.begin(), baseline.begin() + retained, expert) !=
+                    baseline.begin() + retained)
+                    return;
+                const int candidate = rank[size_t(expert)];
+                if (candidate < 0) return;
+                PrunedCacheChoice action;
+                action.expert = expert;
+                const double selected_score = prefix_score +
+                    candidate_choice[size_t(token)][size_t(candidate)];
+                action.regret = std::max(0.0, baseline_score - selected_score);
+                action.ratio = score_scale > 0.0 ? action.regret / score_scale : 0.0;
+                if (action.ratio > double(df_cache_route_regret_) + 2.0e-7) return;
+                for (int slot = 0; slot < retained; ++slot) {
+                    const int prefix_expert = baseline[size_t(slot)];
+                    require(union_disk[size_t(prefix_expert)] >= 0,
+                            "pruned cache prefix has no residency");
+                    action.disk += union_disk[size_t(prefix_expert)];
+                    action.h2d += union_h2d[size_t(prefix_expert)];
+                }
+                action.disk += union_disk[size_t(expert)];
+                action.h2d += union_h2d[size_t(expert)];
+                options[size_t(token)].push_back(action);
+            };
+            // The baseline is an invariant action even when tied partial sorts
+            // place it outside the expected candidate rank.
+            append(baseline[size_t(retained)]);
+            if (!guarded[size_t(token)])
+                for (int candidate = 0; candidate < df_cache_route_k_; ++candidate)
+                    append(candidates[size_t(candidate)]);
+            require(!options[size_t(token)].empty(),
+                    "pruned cache route has no feasible action");
+            auto local_less = [&](const PrunedCacheChoice &left,
+                                  const PrunedCacheChoice &right) {
+                if (left.disk != right.disk) return left.disk < right.disk;
+                if (left.h2d != right.h2d) return left.h2d < right.h2d;
+                if (left.regret != right.regret) return left.regret < right.regret;
+                return rank[size_t(left.expert)] < rank[size_t(right.expert)];
+            };
+            std::sort(options[size_t(token)].begin(), options[size_t(token)].end(),
+                      local_less);
+            options[size_t(token)].erase(
+                std::unique(options[size_t(token)].begin(), options[size_t(token)].end(),
+                            [](const PrunedCacheChoice &left,
+                               const PrunedCacheChoice &right) {
+                                return left.expert == right.expert;
+                            }),
+                options[size_t(token)].end());
+            if (df_cache_joint_options_ &&
+                int(options[size_t(token)].size()) > df_cache_joint_options_) {
+                const int baseline_tail = baseline[size_t(retained)];
+                const auto baseline_action = std::find_if(
+                    options[size_t(token)].begin(), options[size_t(token)].end(),
+                    [&](const PrunedCacheChoice &action) {
+                        return action.expert == baseline_tail;
+                    });
+                require(baseline_action != options[size_t(token)].end(),
+                        "pruned cache route lost its baseline action");
+                const PrunedCacheChoice baseline_copy = *baseline_action;
+                options[size_t(token)].resize(size_t(df_cache_joint_options_));
+                if (std::find_if(options[size_t(token)].begin(),
+                                 options[size_t(token)].end(),
+                                 [&](const PrunedCacheChoice &action) {
+                                     return action.expert == baseline_tail;
+                                 }) == options[size_t(token)].end())
+                    options[size_t(token)].back() = baseline_copy;
+            }
+        }
+
+        std::array<int, 8> chosen{};
+        chosen.fill(0);
+        if (df_cache_joint_options_ && tokens <= 4) {
+            std::array<int, 8> trial{};
+            int best_disk = std::numeric_limits<int>::max();
+            int best_h2d = best_disk, best_union = best_disk;
+            double best_regret = std::numeric_limits<double>::infinity();
+            auto search = [&](auto &&self, int row) -> void {
+                if (row != tokens) {
+                    for (int option = 0;
+                         option < int(options[size_t(row)].size()); ++option) {
+                        trial[size_t(row)] = option;
+                        self(self, row + 1);
+                    }
+                    return;
+                }
+                std::array<uint8_t, 288> seen{};
+                int disk = 0, h2d = 0, union_count = 0;
+                double regret = 0.0;
+                auto add = [&](int expert) {
+                    if (seen[size_t(expert)]) return;
+                    seen[size_t(expert)] = 1;
+                    ++union_count;
+                    require(union_disk[size_t(expert)] >= 0,
+                            "pruned joint union contains an unranked expert");
+                    disk += union_disk[size_t(expert)];
+                    h2d += union_h2d[size_t(expert)];
+                };
+                for (int token = 0; token < tokens; ++token) {
+                    const auto &baseline = baseline_experts[size_t(token)];
+                    if (guarded[size_t(token)]) {
+                        for (int slot = 0; slot < topk; ++slot)
+                            add(baseline[size_t(slot)]);
+                    } else {
+                        for (int slot = 0; slot < retained; ++slot)
+                            add(baseline[size_t(slot)]);
+                        const PrunedCacheChoice &action =
+                            options[size_t(token)][size_t(trial[size_t(token)])];
+                        add(action.expert);
+                        regret += action.regret;
+                    }
+                }
+                const bool better = disk < best_disk ||
+                    (disk == best_disk && (h2d < best_h2d ||
+                     (h2d == best_h2d && (union_count < best_union ||
+                      (union_count == best_union && regret < best_regret)))));
+                if (better) {
+                    best_disk = disk;
+                    best_h2d = h2d;
+                    best_union = union_count;
+                    best_regret = regret;
+                    chosen = trial;
+                }
+            };
+            search(search, 0);
+        }
+
+        auto group_cost = [&](bool baseline_cost) {
+            std::array<uint8_t, 288> seen{};
+            std::array<int, 3> cost{};  // union, disk, H2D
+            auto add = [&](int expert) {
+                if (seen[size_t(expert)]) return;
+                seen[size_t(expert)] = 1;
+                ++cost[0];
+                cost[1] += union_disk[size_t(expert)];
+                cost[2] += union_h2d[size_t(expert)];
+            };
+            for (int token = 0; token < tokens; ++token) {
+                const auto &baseline = baseline_experts[size_t(token)];
+                if (guarded[size_t(token)]) {
+                    for (int slot = 0; slot < topk; ++slot)
+                        add(baseline[size_t(slot)]);
+                } else {
+                    for (int slot = 0; slot < retained; ++slot)
+                        add(baseline[size_t(slot)]);
+                    add(baseline_cost ? baseline[size_t(retained)] :
+                        options[size_t(token)][size_t(chosen[size_t(token)])].expert);
+                }
+            }
+            return cost;
+        };
+        if (df_cache_joint_options_ && tokens <= 4) {
+            const auto baseline_cost = group_cost(true);
+            const auto selected_cost = group_cost(false);
+            ++df_cache_joint_groups_;
+            df_cache_joint_baseline_union_ += uint64_t(baseline_cost[0]);
+            df_cache_joint_selected_union_ += uint64_t(selected_cost[0]);
+            df_cache_joint_disk_saved_ += baseline_cost[1] - selected_cost[1];
+            df_cache_joint_h2d_saved_ += baseline_cost[2] - selected_cost[2];
+        }
+        for (int token = 0; token < tokens; ++token) {
+            if (guarded[size_t(token)]) continue;
+            const auto &baseline = baseline_experts[size_t(token)];
+            const int baseline_tail = baseline[size_t(retained)];
+            const PrunedCacheChoice &action =
+                options[size_t(token)][size_t(chosen[size_t(token)])];
+            const auto baseline_action = std::find_if(
+                options[size_t(token)].begin(), options[size_t(token)].end(),
+                [&](const PrunedCacheChoice &candidate) {
+                    return candidate.expert == baseline_tail;
+                });
+            require(baseline_action != options[size_t(token)].end(),
+                    "pruned cache stats lost baseline action");
+            if (action.expert != baseline_tail) {
+                const int candidate =
+                    candidate_rank[size_t(token)][size_t(action.expert)];
+                const float score = 1.0f /
+                    (1.0f + std::exp(-candidate_logits[size_t(token)][size_t(candidate)]));
+                selection[size_t(token)][size_t(retained)] = {
+                    action.expert,
+                    2.5f * score / baseline_denominator[size_t(token)]};
+            }
+            ++df_cache_route_rows_;
+            df_cache_route_changed_ += action.expert != baseline_tail;
+            df_cache_route_substitutions_ += action.expert != baseline_tail;
+            df_cache_route_regret_sum_ += action.ratio;
+            df_cache_route_regret_max_ =
+                std::max(df_cache_route_regret_max_, action.ratio);
+            df_cache_route_disk_saved_ += baseline_action->disk - action.disk;
+            df_cache_route_h2d_saved_ += baseline_action->h2d - action.h2d;
+        }
+    }
+    if (kda_archive_ && !df_approx_topm_ && df_cache_joint_options_ &&
+        df_cache_route_regret_ > 0.0f) {
         struct CacheChoice {
             std::array<int, 8> experts{};
             double regret = 0.0, ratio = 0.0;

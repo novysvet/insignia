@@ -158,6 +158,19 @@ def draft_logit_guard(path: Path, approx: np.ndarray, blocks: list[dict],
               f"| {pearson(values, [s['cos_loss'] for s in samples]):+.4f} "
               f"| {pearson(values, [float(s['mismatch']) for s in samples]):+.4f} |")
 
+    mismatches = [sample for sample in samples if sample["mismatch"]]
+    if mismatches:
+        print("\nTop-1 mismatch risk ranks (1 = first row exactified):")
+        print("| record | risk feature | raw value | risk rank |")
+        print("|---:|---|---:|---:|")
+        for sample in mismatches:
+            for name, sign in risks:
+                ordered = sorted(samples, key=lambda row: sign * row[name], reverse=True)
+                rank = next(index for index, row in enumerate(ordered, start=1)
+                            if row is sample)
+                print(f"| {sample['record']} | {name} | {sample[name]:.6g} "
+                      f"| {rank}/{len(samples)} |")
+
     print("\nCausal per-row fallback frontier (highest predicted risk exactified):")
     print("| risk feature | exact rows | remaining MSE | cosine | top1 mismatches |")
     print("|---|---:|---:|---:|---:|")

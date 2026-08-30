@@ -33,13 +33,17 @@ def pearson(left: list[float], right: list[float]) -> float:
     return covariance / math.sqrt(left_var * right_var) if left_var and right_var else 0.0
 
 
-def read_metrics(path: Path) -> dict[tuple[int, int, int], dict[int, dict[str, float]]]:
-    groups: dict[tuple[int, int, int], dict[int, dict[str, float]]] = defaultdict(dict)
+def read_metrics(path: Path) -> dict[tuple[int, int, int, int], dict[int, dict[str, float]]]:
+    groups: dict[tuple[int, int, int, int], dict[int, dict[str, float]]] = defaultdict(dict)
+    occurrences: Counter[tuple[int, int, int, int]] = Counter()
     with path.open(newline="", encoding="utf-8") as handle:
         for raw in csv.DictReader(handle):
             if raw["semantics"] != "zero":
                 continue
-            key = (int(raw["epoch"]), int(raw["layer"]), int(raw["row"]))
+            base = (int(raw["epoch"]), int(raw["layer"]), int(raw["row"]), int(raw["topm"]))
+            occurrence = occurrences[base]
+            occurrences[base] += 1
+            key = (base[0], base[1], base[2], occurrence)
             topm = int(raw["topm"])
             groups[key][topm] = {name: float(raw[name]) for name in METRICS}
 
@@ -61,7 +65,7 @@ def choose(choices: dict[int, dict[str, float]], threshold: float, min_k: int, m
     return max_k
 
 
-def summarize(groups: dict[tuple[int, int, int], dict[int, dict[str, float]]],
+def summarize(groups: dict[tuple[int, int, int, int], dict[int, dict[str, float]]],
               threshold: float, min_k: int, max_k: int) -> tuple[list[int], list[dict[str, float]]]:
     selected_k, selected_rows = [], []
     for choices in groups.values():
@@ -76,7 +80,7 @@ def format_histogram(values: list[int]) -> str:
     return " ".join(f"k{k}:{100.0 * counts[k] / len(values):.1f}%" for k in sorted(counts))
 
 
-def report(label: str, groups: dict[tuple[int, int, int], dict[int, dict[str, float]]],
+def report(label: str, groups: dict[tuple[int, int, int, int], dict[int, dict[str, float]]],
            thresholds: list[float], min_k: int, max_k: int, profile_threshold: float) -> None:
     print(f"## {label}\n")
     print(f"Rows: {len(groups)}; allowed k: {min_k}..{max_k}; retained weights are not renormalized.\n")
@@ -105,7 +109,7 @@ def report(label: str, groups: dict[tuple[int, int, int], dict[int, dict[str, fl
         print(f"| {topm} | {pearson(omitted, rel_l2):+.4f} | {pearson(omitted, cosine_loss):+.4f} |")
 
     by_layer: dict[int, list[int]] = defaultdict(list)
-    for (_, layer, _), choices in groups.items():
+    for (_, layer, _, _), choices in groups.items():
         by_layer[layer].append(choose(choices, profile_threshold, min_k, max_k))
     print(f"\nLayer profile at mass p={profile_threshold:.3f}:\n")
     print("| layer | mean k |")

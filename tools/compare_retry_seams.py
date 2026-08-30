@@ -36,7 +36,8 @@ def load(path: Path) -> list[Pass]:
             payload = source.read(count * 4)
             if len(payload) != count * 4:
                 raise SystemExit(f"{path}: partial seam payload")
-            records.append((layer, tag, np.frombuffer(payload, dtype="<f4").copy()))
+            if tag in (16, 17):
+                records.append((layer, tag, np.frombuffer(payload, dtype="<f4").copy()))
     passes: list[Pass] = []
     for layer, tag, payload in records:
         if layer == 0:

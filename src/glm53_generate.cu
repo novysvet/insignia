@@ -536,6 +536,44 @@ struct PackedExpertRecordHeader {
 };
 static_assert(sizeof(PackedExpertRecordHeader) == 128);
 
+// Exact-teacher trace for the learned DFlash falsifier. The fixed record is
+// nine cache lines and deliberately contains only causal runtime features plus
+// the exact expert-contribution Gram label. Full target/DFlash logits remain
+// in their existing raw dumps and are joined offline by (epoch,row).
+struct alignas(64) DfFalsifierTraceHeader {
+    char magic[8];
+    uint16_t version, header_bytes;
+    uint32_t record_bytes;
+    uint16_t layer_count, expert_count, topk, hidden_sketch;
+    uint32_t hidden, flags;
+    uint8_t reserved[32];
+};
+static_assert(sizeof(DfFalsifierTraceHeader) == 64);
+
+struct alignas(64) DfFalsifierEventV1 {
+    uint32_t epoch;
+    uint16_t layer;
+    uint8_t row, tokens;
+    uint8_t verify_row, exec_k;
+    uint16_t flags;  // bit 0: MLA layer, bit 1: KDA archive active
+    // Four 8-bit masks: host-ready, host-in-flight, device-resident, pinned.
+    uint32_t residency;
+    std::array<uint16_t, 8> expert;
+    std::array<float, 8> weight;
+    std::array<float, 8> router_logit;
+    std::array<float, 8> router_choice;
+    // raw mean/std/max/second; all-sigmoid sum; selected/all sigmoid mass;
+    // biased top1-top2 gap; entropy of the normalized selected weights.
+    std::array<float, 8> router_summary;
+    std::array<float, 64> hidden_countsketch;
+    // Upper triangle, row-major, of G_ij=dot(w_i e_i,w_j e_j)/hidden.
+    std::array<float, 36> contribution_gram;
+    // exact norm2/hidden, cancellation ratio, exact replay max error,
+    // normalized-input norm2/hidden.
+    std::array<float, 4> tail;
+};
+static_assert(sizeof(DfFalsifierEventV1) == 576);
+
 // One routed-expert record: 3 projections x (4 MiB nibbles + 512 KiB scales)
 // + 12 B globals, streamed with O_DIRECT into a 4096-aligned pinned window.
 // Windows double as a host-RAM LRU: completed records stay resident so a
@@ -1080,6 +1118,23 @@ public:
     uint64_t packed_expanded_bytes() const { return packed_expanded_bytes_.load(); }
     double packed_expand_seconds() const {
         return packed_expand_nanoseconds_.load() * 1.0e-9;
+    }
+    uint32_t residency_mask(int layer, const std::array<int, 8> &experts) {
+        uint32_t result = 0;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            for (int slot = 0; slot < 8; ++slot) {
+                const auto found = flight_index_.find(route_key(layer, experts[size_t(slot)]));
+                if (found == flight_index_.end()) continue;
+                const WindowState &state = windows_[size_t(found->second)];
+                result |= uint32_t(state.done ? 1u : 1u << 8) << slot;
+                if (state.pinned) result |= uint32_t(1u << 24) << slot;
+            }
+        }
+        for (int slot = 0; slot < 8; ++slot)
+            if (device_index_.count(route_key(layer, experts[size_t(slot)])))
+                result |= uint32_t(1u << 16) << slot;
+        return result;
     }
 private:
     struct Layout {
@@ -2621,6 +2676,8 @@ public:
         }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
+        if (const char *path = std::getenv("INSIGNIA_GLM53_DF_FALSIFIER_TRACE"))
+            falsifier_trace_path_ = path;
         forced_sequential_verify_ =
             dflash2_on_ && std::getenv("INSIGNIA_GLM53_DF_SEQ_VERIFY") != nullptr;
         // Dense layer -> KDA archive row (recurrent-state replay indexing).
@@ -2699,16 +2756,37 @@ public:
                 expert_stager_ = std::make_unique<ExpertStager>(model_, host_cache);
             }
         }
-        if (!moe_metrics_path_.empty()) {
-            require(dflash2_on_, "INSIGNIA_GLM53_DF_MOE_METRICS requires DFlash2");
+        if (!moe_metrics_path_.empty() || !falsifier_trace_path_.empty()) {
+            require(dflash2_on_, "DFlash MoE diagnostics require DFlash2");
             require(!df_approx_topm_ && df_approx_mass_ == 0.0f,
-                    "MoE metrics must run on the exact top-8 verification path");
-            require(nvfp4_experts_, "MoE metrics require retained NVFP4 expert outputs");
+                    "MoE diagnostics must run on the exact top-8 verification path");
+            require(nvfp4_experts_, "MoE diagnostics require retained NVFP4 expert outputs");
+        }
+        if (!moe_metrics_path_.empty()) {
             moe_metrics_ = std::fopen(moe_metrics_path_.c_str(), "w");
             require(moe_metrics_, "cannot open DFlash MoE metrics output");
             std::fprintf(moe_metrics_,
                 "epoch,layer,row,topm,semantics,mse,rel_l2,cosine,max_abs,"
                 "norm_ratio,retained_mass,exact_cancel,approx_cancel,replay_max_abs\n");
+        }
+        if (!falsifier_trace_path_.empty()) {
+            falsifier_trace_ = std::fopen(falsifier_trace_path_.c_str(), "wb");
+            require(falsifier_trace_, "cannot open DFlash falsifier trace output");
+            DfFalsifierTraceHeader header{};
+            std::memcpy(header.magic, "INSFAL1", 7);
+            header.version = 1;
+            header.header_bytes = sizeof(header);
+            header.record_bytes = sizeof(DfFalsifierEventV1);
+            header.layer_count = uint16_t(layer_count);
+            header.expert_count = uint16_t(moe_experts_);
+            header.topk = uint16_t(moe_topk_);
+            header.hidden_sketch = 64;
+            header.hidden = uint32_t(hidden_);
+            header.flags = 3;  // Gram divided by hidden; signed CountSketch scaled.
+            require(std::fwrite(&header, sizeof(header), 1, falsifier_trace_) == 1,
+                    "write DFlash falsifier trace header");
+            std::printf("DFlash falsifier exact-teacher trace: %s (%zu-byte records)\n",
+                        falsifier_trace_path_.c_str(), sizeof(DfFalsifierEventV1));
         }
 
         streams_a_.reset(size_t(kStreams) * hidden_);
@@ -3031,7 +3109,10 @@ private:
     void moe_multi(int layer, const float *input, float *output, int tokens);
     void report_moe_metrics(
         int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
-        int tokens);
+        const std::vector<std::array<float, 8>> &selected_logits,
+        const std::vector<std::array<float, 8>> &selected_choice,
+        const std::vector<std::array<float, 8>> &router_summary,
+        const std::vector<uint32_t> &residency, const float *input, int tokens);
     void prefill_layer_chunk_exact(int layer, float *in_place, float *scratch,
                                    int count, int position_base, float *dflash_capture);
     const float *device_f32(std::string_view name);
@@ -3123,7 +3204,9 @@ private:
     std::array<uint64_t, 9> df_approx_k_hist_{};
     std::string moe_metrics_path_;
     FILE *moe_metrics_ = nullptr;
-    std::vector<float> moe_metrics_expert_, moe_metrics_exact_;
+    std::string falsifier_trace_path_;
+    FILE *falsifier_trace_ = nullptr;
+    std::vector<float> moe_metrics_expert_, moe_metrics_exact_, moe_metrics_input_;
     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
     std::unique_ptr<Q8Index> q8_index_;
     std::unique_ptr<Q8Stager> q8_stager_;
@@ -4553,8 +4636,18 @@ void Runner::mlp_multi(std::string_view stem, const float *input, float *output,
 
 void Runner::report_moe_metrics(
     int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
-    int tokens) {
-    require(moe_metrics_ && moe_topk_ == 8, "invalid MoE metrics state");
+    const std::vector<std::array<float, 8>> &selected_logits,
+    const std::vector<std::array<float, 8>> &selected_choice,
+    const std::vector<std::array<float, 8>> &router_summary,
+    const std::vector<uint32_t> &residency, const float *input, int tokens) {
+    require((moe_metrics_ || falsifier_trace_) && moe_topk_ == 8,
+            "invalid MoE diagnostics state");
+    require(selection.size() == size_t(tokens) &&
+                (!falsifier_trace_ ||
+                 (selected_logits.size() == size_t(tokens) &&
+                  selected_choice.size() == size_t(tokens) &&
+                  router_summary.size() == size_t(tokens) && residency.size() == size_t(tokens))),
+            "incomplete MoE diagnostics context");
     const size_t expert_values = size_t(tokens) * moe_topk_ * hidden_;
     const size_t exact_values = size_t(tokens) * hidden_;
     moe_metrics_expert_.resize(expert_values);
@@ -4565,6 +4658,12 @@ void Runner::report_moe_metrics(
     check(cudaMemcpy(moe_metrics_exact_.data(), c_routed_.get(),
                      exact_values * sizeof(float), cudaMemcpyDeviceToHost),
           "download exact routed output");
+    if (falsifier_trace_) {
+        moe_metrics_input_.resize(exact_values);
+        check(cudaMemcpy(moe_metrics_input_.data(), input,
+                         exact_values * sizeof(float), cudaMemcpyDeviceToHost),
+              "download falsifier hidden input");
+    }
 
     for (int row = 0; row < tokens; ++row) {
         const float *expert = moe_metrics_expert_.data() +
@@ -4596,6 +4695,68 @@ void Runner::report_moe_metrics(
         }
         const double exact_norm = std::sqrt(exact_norm2);
         const double exact_cancel = exact_norm > 0.0 ? exact_term_sum / exact_norm : 0.0;
+
+        if (falsifier_trace_) {
+            DfFalsifierEventV1 record{};
+            record.epoch = verify_epoch_;
+            record.layer = uint16_t(layer);
+            record.row = uint8_t(row);
+            record.tokens = uint8_t(tokens);
+            const int verify_row = capture_offset_ + row;
+            require(verify_row >= 0 && verify_row <= 255,
+                    "falsifier verify row is out of range");
+            record.verify_row = uint8_t(verify_row);
+            record.exec_k = 8;
+            record.flags = uint16_t((is_mla_[size_t(layer)] ? 1u : 0u) |
+                                    (kda_archive_ ? 2u : 0u));
+            record.residency = residency[size_t(row)];
+            for (int slot = 0; slot < moe_topk_; ++slot) {
+                record.expert[size_t(slot)] =
+                    uint16_t(selection[size_t(row)][size_t(slot)].first);
+                record.weight[size_t(slot)] =
+                    selection[size_t(row)][size_t(slot)].second;
+                record.router_logit[size_t(slot)] = selected_logits[size_t(row)][size_t(slot)];
+                record.router_choice[size_t(slot)] = selected_choice[size_t(row)][size_t(slot)];
+            }
+            record.router_summary = router_summary[size_t(row)];
+
+            const float *hidden = moe_metrics_input_.data() + size_t(row) * hidden_;
+            double input_norm2 = 0.0;
+            for (int column = 0; column < hidden_; ++column) {
+                uint32_t hash = uint32_t(column + 1) * 0x9e3779b1u;
+                hash ^= hash >> 16;
+                hash *= 0x85ebca6bu;
+                hash ^= hash >> 13;
+                const int bucket = int(hash & 63u);
+                record.hidden_countsketch[size_t(bucket)] +=
+                    (hash & 64u) ? hidden[column] : -hidden[column];
+                input_norm2 += double(hidden[column]) * hidden[column];
+            }
+            const float sketch_scale = std::sqrt(64.0f / float(hidden_));
+            for (float &value : record.hidden_countsketch) value *= sketch_scale;
+
+            std::array<double, 36> gram{};
+            for (int column = 0; column < hidden_; ++column) {
+                std::array<double, 8> contribution{};
+                for (int slot = 0; slot < moe_topk_; ++slot)
+                    contribution[size_t(slot)] =
+                        double(selection[size_t(row)][size_t(slot)].second) *
+                        expert[size_t(slot) * hidden_ + size_t(column)];
+                int index = 0;
+                for (int left = 0; left < moe_topk_; ++left)
+                    for (int right = left; right < moe_topk_; ++right)
+                        gram[size_t(index++)] += contribution[size_t(left)] *
+                                                 contribution[size_t(right)];
+            }
+            for (size_t index = 0; index < gram.size(); ++index)
+                record.contribution_gram[index] = float(gram[index] / hidden_);
+            record.tail = {float(exact_norm2 / hidden_), float(exact_cancel),
+                           float(replay_max), float(input_norm2 / hidden_)};
+            require(std::fwrite(&record, sizeof(record), 1, falsifier_trace_) == 1,
+                    "write DFlash falsifier event");
+        }
+
+        if (!moe_metrics_) continue;
 
         float retained_sum = 0.0f;
         double retained_term_sum = 0.0;
@@ -4635,7 +4796,8 @@ void Runner::report_moe_metrics(
             }
         }
     }
-    std::fflush(moe_metrics_);
+    if (moe_metrics_) std::fflush(moe_metrics_);
+    if (falsifier_trace_) std::fflush(falsifier_trace_);
 }
 
 // Router scores for the whole chunk download once; each distinct expert's
@@ -4658,6 +4820,12 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     const std::vector<float> &bias = host_f32(stem + "gate.e_score_correction_bias");
     require(bias.size() == size_t(experts), "wrong router bias geometry");
     std::vector<std::vector<std::pair<int, float>>> selection(tokens);
+    const bool trace_falsifier = falsifier_trace_ != nullptr;
+    const size_t diagnostic_rows = trace_falsifier ? size_t(tokens) : 0;
+    std::vector<std::array<float, 8>> selected_logits(diagnostic_rows);
+    std::vector<std::array<float, 8>> selected_choice(diagnostic_rows);
+    std::vector<std::array<float, 8>> router_summary(diagnostic_rows);
+    std::vector<uint32_t> diagnostics_residency(diagnostic_rows, 0);
     for (int token = 0; token < tokens; ++token) {
         const float *row = logits.data() + size_t(token) * experts;
         std::vector<float> scores(experts), choice(experts);
@@ -4673,6 +4841,40 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (int slot = 0; slot < topk; ++slot) denominator += scores[order[slot]];
         for (int slot = 0; slot < topk; ++slot)
             selection[token].emplace_back(order[slot], 2.5f * scores[order[slot]] / denominator);
+        if (trace_falsifier) {
+            double raw_sum = 0.0, raw_square_sum = 0.0, score_sum = 0.0;
+            float raw_max = -std::numeric_limits<float>::infinity();
+            float raw_second = raw_max;
+            for (int expert = 0; expert < experts; ++expert) {
+                raw_sum += row[expert];
+                raw_square_sum += double(row[expert]) * row[expert];
+                score_sum += scores[expert];
+                if (row[expert] > raw_max) {
+                    raw_second = raw_max;
+                    raw_max = row[expert];
+                } else if (row[expert] > raw_second) {
+                    raw_second = row[expert];
+                }
+            }
+            float selected_entropy = 0.0f;
+            std::array<int, 8> selected_ids{};
+            for (int slot = 0; slot < topk; ++slot) {
+                selected_ids[size_t(slot)] = order[slot];
+                selected_logits[size_t(token)][size_t(slot)] = row[order[slot]];
+                selected_choice[size_t(token)][size_t(slot)] = choice[order[slot]];
+                const float probability = scores[order[slot]] / denominator;
+                selected_entropy -= probability * std::log(std::max(probability, 1.0e-30f));
+            }
+            const double raw_mean = raw_sum / experts;
+            const double raw_variance =
+                std::max(0.0, raw_square_sum / experts - raw_mean * raw_mean);
+            router_summary[size_t(token)] = {
+                float(raw_mean), float(std::sqrt(raw_variance)), raw_max, raw_second,
+                float(score_sum), float(denominator / score_sum),
+                choice[order[0]] - choice[order[1]], selected_entropy};
+            diagnostics_residency[size_t(token)] =
+                expert_stager_->residency_mask(layer, selected_ids);
+        }
         const int verify_row = capture_offset_ + token;
         const bool logit_guarded = kda_archive_ && df_logit_guard_margin_ > 0.0f &&
             verify_row >= 0 && verify_row < kMaxVerify &&
@@ -5002,8 +5204,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         (size_t(token) * topk + size_t(pick_slot)) * hidden_,
                                     selection[size_t(token)][size_t(pick_slot)].second, hidden_);
             }
-        if (ordered_accumulation && moe_metrics_)
-            report_moe_metrics(layer, selection, tokens);
+        if (ordered_accumulation && (moe_metrics_ || falsifier_trace_))
+            report_moe_metrics(layer, selection, selected_logits, selected_choice,
+                               router_summary, diagnostics_residency, input, tokens);
     }
     if (!nvfp4_experts_)
         mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);

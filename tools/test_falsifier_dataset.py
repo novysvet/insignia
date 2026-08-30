@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Synthetic schema/alignment test for build_falsifier_dataset.py."""
+
+from __future__ import annotations
+
+import argparse
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+from build_falsifier_dataset import EVENT_DTYPE, TRACE_HEADER, build
+
+
+def main() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        trace = root / "teacher.bin"
+        exact_path = root / "exact.f32"
+        approximate_path = root / "approximate.f32"
+        draft_path = root / "draft.f32"
+        output = root / "dataset.npz"
+
+        events = np.zeros(8, dtype=EVENT_DTYPE)
+        cursor = 0
+        for epoch in range(2):
+            for layer in (1, 2):
+                for row in range(2):
+                    event = events[cursor]
+                    event["epoch"] = epoch + 7
+                    event["layer"] = layer
+                    event["row"] = row
+                    event["tokens"] = 2
+                    event["verify_row"] = row
+                    event["exec_k"] = 8
+                    event["expert"] = np.arange(8) + row
+                    event["weight"] = np.linspace(0.6, 0.025, 8)
+                    event["router_summary"] = np.arange(8)
+                    diagonal = np.linspace(0.01, 0.08, 8)
+                    upper = np.zeros(36, dtype=np.float32)
+                    index = 0
+                    for left in range(8):
+                        for right in range(left, 8):
+                            if left == right:
+                                upper[index] = diagonal[left]
+                            index += 1
+                    event["contribution_gram"] = upper
+                    event["tail"][0] = np.sum(diagonal)
+                    cursor += 1
+        header = TRACE_HEADER.pack(b"INSFAL1\0", 1, 64, EVENT_DTYPE.itemsize,
+                                   4, 16, 8, 64, 32, 3, bytes(32))
+        with trace.open("wb") as handle:
+            handle.write(header)
+            events.tofile(handle)
+
+        generator = np.random.default_rng(123)
+        exact = generator.normal(size=(5, 32)).astype("<f4")
+        approximate = exact.copy()
+        exact[3] = 0
+        approximate[3] = 0
+        exact[3, 1] = 10
+        approximate[3, 2] = 10
+        draft = generator.normal(size=(2, 3, 32)).astype("<f4")
+        exact.tofile(exact_path)
+        approximate.tofile(approximate_path)
+        draft.tofile(draft_path)
+
+        build(argparse.Namespace(
+            trace=trace,
+            exact_logits=exact_path,
+            approx_logits=approximate_path,
+            draft_logits=draft_path,
+            output=output,
+            prompt_id="synthetic",
+            family="test",
+            policy="one-flip",
+            vocab=32,
+            verify_k=2,
+            draft_rows=3,
+            top_logits=10,
+            sketch_dim=8,
+            gram_rel_tolerance=1e-6,
+        ))
+        with np.load(output) as dataset:
+            assert dataset["event_meta"].shape == (8, 7)
+            assert dataset["router_features"].shape == (8, 32)
+            assert dataset["contribution_gram"].shape == (8, 36)
+            assert dataset["row_meta"].shape == (4, 4)
+            assert dataset["row_logit_sketch"].shape == (4, 3, 8)
+            assert int(np.sum(dataset["row_labels"][:, 6])) == 1
+            assert tuple(dataset["row_top1"][2]) == (1, 2)
+        print("falsifier dataset synthetic test: PASS")
+
+
+if __name__ == "__main__":
+    main()

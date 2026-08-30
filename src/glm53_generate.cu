@@ -2586,12 +2586,31 @@ public:
                     "INSIGNIA_GLM53_DF_APPROX_TOPM requires DFlash2");
             df_approx_topm_ = requested;
         }
+        if (const char *mass = std::getenv("INSIGNIA_GLM53_DF_APPROX_MASS")) {
+            const float requested = std::strtof(mass, nullptr);
+            require(requested > 0.0f && requested <= 1.0f,
+                    "INSIGNIA_GLM53_DF_APPROX_MASS must be in (0, 1]");
+            require(dflash2_on_, "INSIGNIA_GLM53_DF_APPROX_MASS requires DFlash2");
+            require(!df_approx_topm_,
+                    "choose fixed INSIGNIA_GLM53_DF_APPROX_TOPM or adaptive MASS, not both");
+            df_approx_mass_ = requested;
+            if (const char *min_k = std::getenv("INSIGNIA_GLM53_DF_APPROX_MIN_K"))
+                df_approx_min_k_ = std::atoi(min_k);
+            if (const char *max_k = std::getenv("INSIGNIA_GLM53_DF_APPROX_MAX_K"))
+                df_approx_max_k_ = std::atoi(max_k);
+            require(df_approx_min_k_ >= 1 && df_approx_min_k_ <= df_approx_max_k_ &&
+                        df_approx_max_k_ <= 8,
+                    "adaptive DFlash k requires 1 <= MIN_K <= MAX_K <= 8");
+        }
         df_approx_renorm_ = df_approx_topm_ &&
             std::getenv("INSIGNIA_GLM53_DF_APPROX_RENORM") &&
             std::atoi(std::getenv("INSIGNIA_GLM53_DF_APPROX_RENORM")) != 0;
         if (df_approx_topm_)
             std::printf("DFlash2 approximate verify: top-%d, retained weights %s\n",
                         df_approx_topm_, df_approx_renorm_ ? "renormalized" : "unchanged");
+        if (df_approx_mass_ > 0.0f)
+            std::printf("DFlash2 adaptive verify: mass %.3f, k=%d..%d, retained weights unchanged\n",
+                        df_approx_mass_, df_approx_min_k_, df_approx_max_k_);
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
         forced_sequential_verify_ =
@@ -2674,7 +2693,7 @@ public:
         }
         if (!moe_metrics_path_.empty()) {
             require(dflash2_on_, "INSIGNIA_GLM53_DF_MOE_METRICS requires DFlash2");
-            require(!df_approx_topm_,
+            require(!df_approx_topm_ && df_approx_mass_ == 0.0f,
                     "MoE metrics must run on the exact top-8 verification path");
             require(nvfp4_experts_, "MoE metrics require retained NVFP4 expert outputs");
             moe_metrics_ = std::fopen(moe_metrics_path_.c_str(), "w");
@@ -3084,7 +3103,12 @@ private:
     std::unique_ptr<insignia::glm53::DFlash2Drafter> df_;
     bool dflash2_on_ = false;
     int df_approx_topm_ = 0;
+    float df_approx_mass_ = 0.0f;
+    int df_approx_min_k_ = 3, df_approx_max_k_ = 8;
     bool df_approx_renorm_ = false;
+    uint64_t df_approx_rows_ = 0, df_approx_slots_ = 0;
+    uint64_t df_approx_union_ = 0, df_approx_exact_union_ = 0;
+    std::array<uint64_t, 9> df_approx_k_hist_{};
     std::string moe_metrics_path_;
     FILE *moe_metrics_ = nullptr;
     std::vector<float> moe_metrics_expert_, moe_metrics_exact_;
@@ -4569,7 +4593,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     // Approximation is restricted to provisional DFlash verify rows. Prompt
     // prefill and scalar decode retain all eight routed experts, and the
     // unset path keeps the existing arithmetic and traffic exactly intact.
-    const int exec_topk = kda_archive_ && df_approx_topm_ ? df_approx_topm_ : topk;
+    const bool approximate_verify = kda_archive_ &&
+        (df_approx_topm_ || df_approx_mass_ > 0.0f);
+    std::vector<int> exec_count(size_t(tokens), topk);
     linear_multi(stem + "gate.weight", input, c_router_, tokens, experts, hidden_);
     std::vector<float> logits(size_t(tokens) * experts);
     check(cudaMemcpy(logits.data(), c_router_.get(), logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
@@ -4592,24 +4618,63 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (int slot = 0; slot < topk; ++slot) denominator += scores[order[slot]];
         for (int slot = 0; slot < topk; ++slot)
             selection[token].emplace_back(order[slot], 2.5f * scores[order[slot]] / denominator);
-        if (exec_topk != topk && df_approx_renorm_) {
+        if (kda_archive_ && df_approx_topm_)
+            exec_count[size_t(token)] = df_approx_topm_;
+        else if (kda_archive_ && df_approx_mass_ > 0.0f) {
+            float original_sum = 0.0f;
+            for (int slot = 0; slot < topk; ++slot)
+                original_sum += selection[token][size_t(slot)].second;
+            float retained_sum = 0.0f;
+            int chosen = df_approx_max_k_;
+            for (int slot = 0; slot < df_approx_max_k_; ++slot) {
+                retained_sum += selection[token][size_t(slot)].second;
+                if (slot + 1 >= df_approx_min_k_ &&
+                    retained_sum >= df_approx_mass_ * original_sum) {
+                    chosen = slot + 1;
+                    break;
+                }
+            }
+            exec_count[size_t(token)] = chosen;
+        }
+        if (exec_count[size_t(token)] != topk && df_approx_renorm_) {
             float original_sum = 0.0f, retained_sum = 0.0f;
             for (int slot = 0; slot < topk; ++slot)
                 original_sum += selection[token][size_t(slot)].second;
-            for (int slot = 0; slot < exec_topk; ++slot)
+            for (int slot = 0; slot < exec_count[size_t(token)]; ++slot)
                 retained_sum += selection[token][size_t(slot)].second;
             const float scale = original_sum / retained_sum;
-            for (int slot = 0; slot < exec_topk; ++slot)
+            for (int slot = 0; slot < exec_count[size_t(token)]; ++slot)
                 selection[token][size_t(slot)].second *= scale;
         }
     }
     std::vector<int> distinct;
-    for (const auto &picks : selection)
-        for (int slot = 0; slot < exec_topk; ++slot) {
+    for (int token = 0; token < tokens; ++token) {
+        const auto &picks = selection[size_t(token)];
+        for (int slot = 0; slot < exec_count[size_t(token)]; ++slot) {
             const int expert = picks[size_t(slot)].first;
             if (std::find(distinct.begin(), distinct.end(), expert) == distinct.end())
                 distinct.push_back(expert);
         }
+    }
+    if (approximate_verify) {
+        std::vector<uint8_t> exact_seen(size_t(experts), 0);
+        uint64_t exact_union = 0;
+        for (const auto &picks : selection)
+            for (int slot = 0; slot < topk; ++slot) {
+                const int expert = picks[size_t(slot)].first;
+                if (!exact_seen[size_t(expert)]) {
+                    exact_seen[size_t(expert)] = 1;
+                    ++exact_union;
+                }
+            }
+        df_approx_rows_ += uint64_t(tokens);
+        df_approx_union_ += distinct.size();
+        df_approx_exact_union_ += exact_union;
+        for (int count : exec_count) {
+            df_approx_slots_ += uint64_t(count);
+            ++df_approx_k_hist_[size_t(count)];
+        }
+    }
     if (early_multi_route_on_) {
         const auto &predicted_rows = early_multi_rows_[size_t(layer)];
         require(predicted_rows.size() == size_t(tokens), "missing early multi-route rows");
@@ -4675,7 +4740,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (int expert : distinct) {
             std::vector<int> users;
             for (int token = 0; token < tokens; ++token)
-                for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot)
                     if (selection[size_t(token)][size_t(pick_slot)].first == expert)
                         users.push_back(token);
             const std::string estem = stem + "experts." + std::to_string(expert) + ".";
@@ -4701,7 +4766,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 insignia::bf16_gemv_v2(device, c_act_.get() + size_t(token) * moe_intermediate_,
                                        c_proj_.get() + size_t(token) * hidden_, hidden_, moe_intermediate_);
                 float weight = 0.0f;
-                for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot)
                     if (selection[size_t(token)][size_t(pick_slot)].first == expert)
                         weight = selection[size_t(token)][size_t(pick_slot)].second;
                 scale_add_kernel<<<16, 256>>>(c_routed_.get() + size_t(token) * hidden_,
@@ -4758,7 +4823,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 retained.reserve(size_t(quota));
                 for (int offset = 0; offset < tokens && int(retained.size()) < quota; ++offset) {
                     const int token = (chosen_token + offset) % tokens;
-                    for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot) {
+                    for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot) {
                         const int expert =
                             selection[size_t(token)][size_t(pick_slot)].first;
                         if (std::find(retained.begin(), retained.end(), expert) == retained.end())
@@ -4797,7 +4862,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 std::array<float, kMaxChunkCap> combine{};
                 int total = 0;
                 for (int token = 0; token < tokens; ++token)
-                    for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                    for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot)
                         if (selection[size_t(token)][size_t(pick_slot)].first == expert &&
                             selection[size_t(token)][size_t(pick_slot)].second != 0.0f) {
                             users[size_t(total)] = token;
@@ -4839,7 +4904,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         }
         if (ordered_accumulation)
             for (int token = 0; token < tokens; ++token)
-                for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot)
                     scale_add_kernel<<<16, 256>>>(
                         c_routed_.get() + size_t(token) * hidden_,
                         c_expert_out_.get() +
@@ -4851,7 +4916,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 std::vector<int> chunk_distinct;
                 chunk_distinct.reserve(distinct.size());
                 for (int token = chunk_base; token < chunk_end; ++token)
-                    for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot) {
+                    for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot) {
                         const int expert =
                             selection[size_t(token)][size_t(pick_slot)].first;
                         if (std::find(chunk_distinct.begin(), chunk_distinct.end(), expert) ==
@@ -4860,7 +4925,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     }
                 for (int expert : chunk_distinct)
                     for (int token = chunk_base; token < chunk_end; ++token)
-                        for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                        for (int pick_slot = 0; pick_slot < exec_count[size_t(token)]; ++pick_slot)
                             if (selection[size_t(token)][size_t(pick_slot)].first == expert)
                                 scale_add_kernel<<<16, 256>>>(
                                     c_routed_.get() + size_t(token) * hidden_,
@@ -5446,6 +5511,22 @@ std::vector<std::pair<int, float>> Runner::step(
                     (unsigned long long)early_multi_actual_,
                     (unsigned long long)early_multi_started_,
                     (unsigned long long)early_multi_hints_);
+    if (df_approx_rows_) {
+        const double exact_slots = double(df_approx_rows_) * moe_topk_;
+        std::printf("  DFlash approximate k %.3f mean (%llu/%llu slots, %.1f%% removed)\n",
+                    double(df_approx_slots_) / df_approx_rows_,
+                    (unsigned long long)df_approx_slots_,
+                    (unsigned long long)(df_approx_rows_ * uint64_t(moe_topk_)),
+                    100.0 * (1.0 - df_approx_slots_ / exact_slots));
+        std::printf("  DFlash expert union %llu/%llu records (%.1f%% removed); k histogram",
+                    (unsigned long long)df_approx_union_,
+                    (unsigned long long)df_approx_exact_union_,
+                    100.0 * (1.0 - double(df_approx_union_) / df_approx_exact_union_));
+        for (int k = 1; k <= moe_topk_; ++k)
+            if (df_approx_k_hist_[size_t(k)])
+                std::printf(" k%d=%llu", k, (unsigned long long)df_approx_k_hist_[size_t(k)]);
+        std::fputc('\n', stdout);
+    }
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",
                     q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8",

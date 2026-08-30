@@ -206,6 +206,29 @@ struct Weights {
     Matrix expert_down{256 * 96, 128, random};
     Matrix heads{107, 192, random};
 
+    // Tiny inference-only absorbed views.  K is transposed per head so a
+    // query produces its 64-wide latent-space form without per-event INT8
+    // dequantization; V stays output-row major for the final projection.
+    std::array<float, kHeads * kLatent * kHeadDim> absorbed_k{};
+    std::array<float, kHeads * kHeadDim * kLatent> absorbed_v{};
+
+    Weights() {
+        for (int head = 0; head < kHeads; ++head)
+            for (int d = 0; d < kHeadDim; ++d)
+                for (int latent = 0; latent < kLatent; ++latent) {
+                    const int key_row = head * kHeadDim + d;
+                    absorbed_k[(head * kLatent + latent) * kHeadDim + d]
+                        = static_cast<float>(mla_kv_up.weight[
+                            static_cast<size_t>(key_row) * mla_kv_up.cols + latent])
+                          * mla_kv_up.scale[key_row];
+                    const int value_row = 128 + head * kHeadDim + d;
+                    absorbed_v[(head * kHeadDim + d) * kLatent + latent]
+                        = static_cast<float>(mla_kv_up.weight[
+                            static_cast<size_t>(value_row) * mla_kv_up.cols + latent])
+                          * mla_kv_up.scale[value_row];
+                }
+    }
+
     uint64_t event_macs(bool logical) const {
         const auto count = [logical](const Matrix &matrix) {
             return logical ? matrix.logical_macs() : matrix.macs();
@@ -402,12 +425,11 @@ INSIGNIA_PROFILE_NOINLINE static void causal_mla(
     for (int head = 0; head < kHeads; ++head)
         for (int latent = 0; latent < kLatent; ++latent) {
             float sum = 0.0f;
+            const float *key = weights.absorbed_k.data()
+                + (head * kLatent + latent) * kHeadDim;
             for (int d = 0; d < kHeadDim; ++d) {
                 const int row = head * kHeadDim + d;
-                const float weight = static_cast<float>(weights.mla_kv_up.weight[
-                    static_cast<size_t>(row) * weights.mla_kv_up.cols + latent])
-                    * weights.mla_kv_up.scale[row];
-                sum = std::fma(scratch.temp0[row], weight, sum);
+                sum = std::fma(scratch.temp0[row], key[d], sum);
             }
             scratch.q_absorbed[head][latent] = sum;
         }
@@ -431,22 +453,25 @@ INSIGNIA_PROFILE_NOINLINE static void causal_mla(
             scratch.attention_weights[head][token] = value;
             denominator += value;
         }
-        for (int latent = 0; latent < kLatent; ++latent) {
-            float sum = 0.0f;
-            for (int token = 0; token < history_count; ++token)
-                sum = std::fma(scratch.attention_weights[head][token] / denominator,
-                               scratch.latents[repeat][token][latent], sum);
-            scratch.latent_sum[head][latent] = sum;
+        std::fill(scratch.latent_sum[head].begin(),
+                  scratch.latent_sum[head].end(), 0.0f);
+        const float inverse_denominator = 1.0f / denominator;
+        for (int token = 0; token < history_count; ++token) {
+            const float probability = scratch.attention_weights[head][token]
+                * inverse_denominator;
+            const float *latent_value = scratch.latents[repeat][token].data();
+            for (int latent = 0; latent < kLatent; ++latent)
+                scratch.latent_sum[head][latent] = std::fma(
+                    probability, latent_value[latent],
+                    scratch.latent_sum[head][latent]);
         }
         for (int d = 0; d < kHeadDim; ++d) {
-            const int row = 128 + head * kHeadDim + d;
+            const float *value_weight = weights.absorbed_v.data()
+                + (head * kHeadDim + d) * kLatent;
             float sum = 0.0f;
-            for (int latent = 0; latent < kLatent; ++latent) {
-                const float weight = static_cast<float>(weights.mla_kv_up.weight[
-                    static_cast<size_t>(row) * weights.mla_kv_up.cols + latent])
-                    * weights.mla_kv_up.scale[row];
-                sum = std::fma(weight, scratch.latent_sum[head][latent], sum);
-            }
+            for (int latent = 0; latent < kLatent; ++latent)
+                sum = std::fma(value_weight[latent],
+                               scratch.latent_sum[head][latent], sum);
             scratch.temp3[head * kHeadDim + d] = sum
                 * sigmoid(scratch.temp2[head * kHeadDim + d]);
         }

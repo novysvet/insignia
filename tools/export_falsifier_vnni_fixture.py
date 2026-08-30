@@ -26,14 +26,20 @@ HEADER = struct.Struct("<8sIIQ40s")
 VERSION = 1
 
 
-def export_fixture(checkpoint_path: Path, output: Path, events: int,
+def export_fixture(checkpoint_path: Path | None, output: Path, events: int,
                    seed: int) -> dict[str, object]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = FalsifierMoEConfig(**checkpoint.get("config", {}))
-    if config != FalsifierMoEConfig():
-        raise ValueError("native fixture requires the fixed v1 controller geometry")
-    model = FalsifierMoE(config)
-    model.load_state_dict(checkpoint["model"])
+    if checkpoint_path is None:
+        torch.manual_seed(53)
+        config = FalsifierMoEConfig()
+        model = FalsifierMoE(config)
+    else:
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False)
+        config = FalsifierMoEConfig(**checkpoint.get("config", {}))
+        if config != FalsifierMoEConfig():
+            raise ValueError("native fixture requires the fixed v1 controller geometry")
+        model = FalsifierMoE(config)
+        model.load_state_dict(checkpoint["model"])
     quantization = prepare_quantized_model(model)
     model.eval()
     torch.set_num_threads(1)
@@ -77,7 +83,7 @@ def export_fixture(checkpoint_path: Path, output: Path, events: int,
     output.write_bytes(header + payload)
     return {
         "schema": "insignia-falsifier-vnni-fixture-v1",
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(checkpoint_path) if checkpoint_path else None,
         "output": str(output),
         "events": events,
         "seed": seed,
@@ -92,7 +98,7 @@ def export_fixture(checkpoint_path: Path, output: Path, events: int,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--events", type=int, default=42)

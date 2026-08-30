@@ -2784,6 +2784,18 @@ public:
             std::printf("DFlash2 logit guard: exact row when draft margin < %.3f\n",
                         df_logit_guard_margin_);
         }
+        if (const char *threshold =
+                std::getenv("INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS")) {
+            df_calibration_guard_js_ = std::strtof(threshold, nullptr);
+            require(df_calibration_guard_js_ > 0.0f &&
+                        df_calibration_guard_js_ <= 0.693147181f,
+                    "DFlash calibration JS guard must be in (0, ln(2)]");
+            require(dflash2_on_, "DFlash calibration JS guard requires DFlash2");
+            require(df_approx_topm_ || df_approx_mass_ > 0.0f || df_cache_route_k_,
+                    "DFlash calibration JS guard requires an approximate verification policy");
+            std::printf("DFlash2 calibration guard: exact block when target/draft JS > %.4f\n",
+                        df_calibration_guard_js_);
+        }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
         const char *exact_falsifier_trace =
@@ -3147,6 +3159,16 @@ public:
     // append `rows` verify-captured tokens to the drafter K/V cache.
     std::vector<int> df_draft(int anchor, int position);
     void df_commit(int rows, int pos0) { df_->commit(rows, pos0); }
+    void adopt_df_prior_logits(int row) {
+        if (df_calibration_guard_js_ <= 0.0f) return;
+        require(row >= 0 && row < kMaxVerify, "DFlash prior-logit row is out of range");
+        const size_t vocab = model_.vocab_size();
+        df_prior_logits_host_.resize(vocab);
+        check(cudaMemcpy(df_prior_logits_host_.data(),
+                         verify_logits_.get() + size_t(row) * vocab,
+                         vocab * sizeof(float), cudaMemcpyDeviceToHost),
+              "download accepted DFlash target logits");
+    }
     // Re-key prev_routing_ on the accepted anchor row of the last multi-row
     // verify: moe_multi stored the chunk's LAST row (a rejected draft
     // position after partial acceptance), which then keyed every
@@ -3342,8 +3364,12 @@ private:
     double df_cache_route_regret_sum_ = 0.0, df_cache_route_regret_max_ = 0.0;
     int64_t df_cache_route_disk_saved_ = 0, df_cache_route_h2d_saved_ = 0;
     float df_logit_guard_margin_ = 0.0f;
+    float df_calibration_guard_js_ = 0.0f;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
     uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
+    uint64_t df_calibration_guard_rounds_ = 0, df_calibration_guarded_rounds_ = 0;
+    double df_calibration_js_sum_ = 0.0, df_calibration_js_max_ = 0.0;
+    std::vector<float> df_prior_logits_host_;
     bool df_approx_renorm_ = false;
     uint64_t df_approx_rows_ = 0, df_approx_slots_ = 0;
     uint64_t df_approx_union_ = 0, df_approx_exact_union_ = 0;
@@ -3363,6 +3389,10 @@ private:
     int moe_experts_ = 0, moe_topk_ = 0, moe_intermediate_ = 0;
     int dense_intermediate_ = 0, shared_intermediate_ = 0;
     bool nvfp4_experts_ = false;
+    bool df_logit_guard_on() const {
+        return df_logit_guard_margin_ > 0.0f || df_calibration_guard_js_ > 0.0f;
+    }
+    double dflash_calibration_js(const float *draft) const;
     std::vector<std::string> layer_types_, mlp_types_;
     std::unordered_map<std::string, std::vector<float>> host_cache_;
     std::unordered_map<std::string, std::unique_ptr<DeviceBuffer<float>>> f32_cache_;
@@ -4282,6 +4312,35 @@ int Runner::mtp_forward(int token, const float *hidden_in, int position) {
     return token_out;
 }
 
+double Runner::dflash_calibration_js(const float *draft) const {
+    const size_t vocab = model_.vocab_size();
+    require(df_prior_logits_host_.size() == vocab,
+            "DFlash calibration guard has no previous target logits");
+    const float *prior = df_prior_logits_host_.data();
+    double prior_max = -std::numeric_limits<double>::infinity();
+    double draft_max = prior_max;
+    for (size_t token = 0; token < vocab; ++token) {
+        prior_max = std::max(prior_max, double(prior[token]));
+        draft_max = std::max(draft_max, double(draft[token]));
+    }
+    double prior_sum = 0.0, draft_sum = 0.0;
+    for (size_t token = 0; token < vocab; ++token) {
+        prior_sum += std::exp(double(prior[token]) - prior_max);
+        draft_sum += std::exp(double(draft[token]) - draft_max);
+    }
+    const double prior_log_z = prior_max + std::log(prior_sum);
+    const double draft_log_z = draft_max + std::log(draft_sum);
+    double js = 0.0;
+    for (size_t token = 0; token < vocab; ++token) {
+        const double p = std::exp(double(prior[token]) - prior_log_z);
+        const double q = std::exp(double(draft[token]) - draft_log_z);
+        const double mixture = 0.5 * (p + q);
+        if (p > 0.0) js += 0.5 * p * std::log(p / mixture);
+        if (q > 0.0) js += 0.5 * q * std::log(q / mixture);
+    }
+    return js;
+}
+
 // DFlash2 draft round: stage [anchor, mask x7] embeds, one block forward,
 // lm_head the 7 draft hiddens through the target's FP8 head, then the host
 // selector walks the top-16 candidate lattice.
@@ -4324,6 +4383,19 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
                      cudaMemcpyDeviceToHost),
           "download DFlash2 hp");
     df_logit_guard_exact_.fill(0);
+    if (df_calibration_guard_js_ > 0.0f) {
+        const double js = dflash_calibration_js(df_logits_host_);
+        ++df_calibration_guard_rounds_;
+        df_calibration_js_sum_ += js;
+        df_calibration_js_max_ = std::max(df_calibration_js_max_, js);
+        if (js > df_calibration_guard_js_) {
+            df_logit_guard_exact_.fill(1);
+            ++df_calibration_guarded_rounds_;
+        }
+        if (std::getenv("INSIGNIA_GLM53_DF_DEBUG"))
+            std::fprintf(stderr, "df calibration JS %.9f guard %d\n", js,
+                         js > df_calibration_guard_js_);
+    }
     if (df_logit_guard_margin_ > 0.0f) {
         const int vocab = int(model_.vocab_size());
         for (int verify_row = 0; verify_row < kMaxVerify; ++verify_row) {
@@ -4346,7 +4418,7 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
                     second = value;
                 }
             }
-            df_logit_guard_exact_[size_t(verify_row)] =
+            df_logit_guard_exact_[size_t(verify_row)] |=
                 uint8_t(first - second < df_logit_guard_margin_);
         }
     }
@@ -4535,7 +4607,7 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
     for (size_t consumed = 0; consumed + 1 < tokens.size(); ) {
         begin_verify_epoch();
         const int count = int(std::min<size_t>(verify_k, tokens.size() - 1 - consumed));
-        if (draft_dump || df_logit_guard_margin_ > 0.0f) {
+        if (draft_dump || df_logit_guard_on()) {
             (void)df_draft(anchor, position_base + int(consumed) - 1);
             if (draft_dump) {
                 const size_t draft_values =
@@ -4553,6 +4625,11 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
                          cudaMemcpyDeviceToHost), "download target-forced logits");
         require(std::fwrite(host.data(), sizeof(float), values, dump) == values,
                 "write target-forced logits");
+        if (df_calibration_guard_js_ > 0.0f) {
+            df_prior_logits_host_.resize(size_t(vocab));
+            std::copy_n(host.data() + size_t(count - 1) * vocab, size_t(vocab),
+                        df_prior_logits_host_.data());
+        }
         df_commit(count, position_base + int(consumed));
         anchor = tokens[consumed + size_t(count) - 1];
         consumed += size_t(count);
@@ -5119,7 +5196,12 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             candidate_residency[size_t(token)] = expert_stager_->residency_masks(
                 layer, candidate_experts[size_t(token)].data(), 32);
         }
-        if (kda_archive_ && df_cache_route_k_ && df_cache_route_regret_ > 0.0f) {
+        const int verify_row = capture_offset_ + token;
+        const bool logit_guarded = kda_archive_ && df_logit_guard_on() &&
+            verify_row >= 0 && verify_row < kMaxVerify &&
+            df_logit_guard_exact_[size_t(verify_row)];
+        if (kda_archive_ && df_cache_route_k_ && df_cache_route_regret_ > 0.0f &&
+            !logit_guarded) {
             const auto &candidates = candidate_experts[size_t(token)];
             const auto &residency = candidate_residency[size_t(token)];
             std::array<int, 288> candidate_rank{};
@@ -5217,10 +5299,6 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_cache_route_disk_saved_ += baseline_disk - best_disk;
             df_cache_route_h2d_saved_ += baseline_h2d - best_h2d;
         }
-        const int verify_row = capture_offset_ + token;
-        const bool logit_guarded = kda_archive_ && df_logit_guard_margin_ > 0.0f &&
-            verify_row >= 0 && verify_row < kMaxVerify &&
-            df_logit_guard_exact_[size_t(verify_row)];
         if (logit_guarded)
             exec_count[size_t(token)] = topk;
         else if (kda_archive_ && df_approx_topm_)
@@ -5285,7 +5363,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_approx_slots_ += uint64_t(count);
             ++df_approx_k_hist_[size_t(count)];
         }
-        if (layer == 3 && df_logit_guard_margin_ > 0.0f)
+        if (layer == 3 && df_logit_guard_on())
             for (int token = 0; token < tokens; ++token) {
                 ++df_logit_guard_rows_;
                 const int verify_row = capture_offset_ + token;
@@ -6036,6 +6114,8 @@ std::vector<std::pair<int, float>> Runner::step(
     std::vector<float> host_logits(model_.vocab_size());
     check(cudaMemcpy(host_logits.data(), logits_.get(), host_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
           "download logits");
+    if (df_calibration_guard_js_ > 0.0f)
+        df_prior_logits_host_ = host_logits;
     if (const char *dump_path = std::getenv("INSIGNIA_GLM53_LOGITS_DUMP")) {
         static std::FILE *dump = nullptr;
         if (!dump) dump = std::fopen(dump_path, "wb");
@@ -6164,6 +6244,13 @@ std::vector<std::pair<int, float>> Runner::step(
                     df_cache_route_regret_max_,
                     (long long)df_cache_route_disk_saved_,
                     (long long)df_cache_route_h2d_saved_);
+    if (df_calibration_guard_rounds_)
+        std::printf("  DFlash calibration guard exactified %llu/%llu rounds "
+                    "(JS mean %.6f max %.6f)\n",
+                    (unsigned long long)df_calibration_guarded_rounds_,
+                    (unsigned long long)df_calibration_guard_rounds_,
+                    df_calibration_js_sum_ / df_calibration_guard_rounds_,
+                    df_calibration_js_max_);
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",
                     q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8",
@@ -6537,6 +6624,7 @@ int main(int argc, char **argv) {
                     ++accept_hist[size_t(matched)];
                     for (int i = 0; i < matched && int(generated.size()) < generate; ++i)
                         generated.push_back(candidates[size_t(i)]);
+                    runner.adopt_df_prior_logits(df_seq_verify ? 0 : matched - 1);
                     if (matched < draft_k && !df_seq_verify)
                         runner.rollback_kda(matched, position + 1);
                     // The verify captures cover the candidates; append the

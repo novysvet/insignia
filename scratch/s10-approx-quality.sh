@@ -55,6 +55,7 @@ run() {
       -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
       -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN \
+      -u INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
@@ -75,7 +76,13 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)$ ]]; then
+  if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)-cjs([0-9]+)$ ]]; then
+    tag=$policy
+    run "$policy" INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN="${BASH_REMATCH[2]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.${BASH_REMATCH[3]}" \
+        INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS="0.${BASH_REMATCH[4]}"
+  elif [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)$ ]]; then
     tag=$policy
     run "$policy" INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[1]}" \
         INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN="${BASH_REMATCH[2]}" \

@@ -84,6 +84,53 @@ __attribute__((noinline)) static void vnni_rows(
         return _mm_cvtsi128_si32(sum);
     };
     int row = 0;
+    for (; row + 8 <= rows; row += 8) {
+        __m256i accumulator0 = _mm256_setzero_si256();
+        __m256i accumulator1 = _mm256_setzero_si256();
+        __m256i accumulator2 = _mm256_setzero_si256();
+        __m256i accumulator3 = _mm256_setzero_si256();
+        __m256i accumulator4 = _mm256_setzero_si256();
+        __m256i accumulator5 = _mm256_setzero_si256();
+        __m256i accumulator6 = _mm256_setzero_si256();
+        __m256i accumulator7 = _mm256_setzero_si256();
+        const int8_t *row0 = weight + static_cast<size_t>(row) * cols;
+        const int8_t *row1 = row0 + cols;
+        const int8_t *row2 = row1 + cols;
+        const int8_t *row3 = row2 + cols;
+        const int8_t *row4 = row3 + cols;
+        const int8_t *row5 = row4 + cols;
+        const int8_t *row6 = row5 + cols;
+        const int8_t *row7 = row6 + cols;
+        for (int column = 0; column < cols; column += 32) {
+            const __m256i signed_input = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(input + column));
+            const __m256i unsigned_input = _mm256_xor_si256(signed_input, flip);
+            accumulator0 = _mm256_dpbusd_epi32(accumulator0, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row0 + column)));
+            accumulator1 = _mm256_dpbusd_epi32(accumulator1, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row1 + column)));
+            accumulator2 = _mm256_dpbusd_epi32(accumulator2, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row2 + column)));
+            accumulator3 = _mm256_dpbusd_epi32(accumulator3, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row3 + column)));
+            accumulator4 = _mm256_dpbusd_epi32(accumulator4, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row4 + column)));
+            accumulator5 = _mm256_dpbusd_epi32(accumulator5, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row5 + column)));
+            accumulator6 = _mm256_dpbusd_epi32(accumulator6, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row6 + column)));
+            accumulator7 = _mm256_dpbusd_epi32(accumulator7, unsigned_input,
+                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row7 + column)));
+        }
+        output[row] = horizontal_sum(accumulator0) - correction[row];
+        output[row + 1] = horizontal_sum(accumulator1) - correction[row + 1];
+        output[row + 2] = horizontal_sum(accumulator2) - correction[row + 2];
+        output[row + 3] = horizontal_sum(accumulator3) - correction[row + 3];
+        output[row + 4] = horizontal_sum(accumulator4) - correction[row + 4];
+        output[row + 5] = horizontal_sum(accumulator5) - correction[row + 5];
+        output[row + 6] = horizontal_sum(accumulator6) - correction[row + 6];
+        output[row + 7] = horizontal_sum(accumulator7) - correction[row + 7];
+    }
     for (; row + 4 <= rows; row += 4) {
         __m256i accumulator0 = _mm256_setzero_si256();
         __m256i accumulator1 = _mm256_setzero_si256();

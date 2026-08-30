@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Test whether previous target logits add causal signal beyond router mass."""
+"""Test whether previous target logits add causal signal beyond router mass.
+
+With --approx-logits, also simulate a causal whole-block exact fallback: the
+logits at record b*k are available before verify block b, whose outputs are
+records b*k+1..b*k+k.
+"""
 
 from __future__ import annotations
 
@@ -89,6 +94,82 @@ def logit_features(path: Path, vocab: int, records: list[int]) -> dict[int, dict
     return result
 
 
+def final_logit_guard(exact_path: Path, approx_path: Path, vocab: int,
+                      verify_k: int) -> None:
+    exact_raw = np.memmap(exact_path, dtype="<f4", mode="r")
+    approx_raw = np.memmap(approx_path, dtype="<f4", mode="r")
+    if exact_raw.size != approx_raw.size or exact_raw.size % vocab:
+        raise SystemExit("exact/approx logit dumps have incompatible shapes")
+    exact = exact_raw.reshape((-1, vocab))
+    approx = approx_raw.reshape((-1, vocab))
+    if len(exact) < 2:
+        raise SystemExit("logit guard needs at least two records")
+
+    starts = list(range(0, len(exact) - 1, verify_k))
+    features = logit_features(approx_path, vocab, starts)
+    blocks = []
+    for start in starts:
+        stop = min(start + verify_k + 1, len(exact))
+        rows = []
+        for record in range(start + 1, stop):
+            left = exact[record].astype(np.float64)
+            right = approx[record].astype(np.float64)
+            delta = right - left
+            left_norm = float(np.dot(left, left))
+            right_norm = float(np.dot(right, right))
+            cosine = (float(np.dot(left, right)) / math.sqrt(left_norm * right_norm)
+                      if left_norm and right_norm else 1.0)
+            rows.append({
+                "mse": float(np.dot(delta, delta) / vocab),
+                "cos_loss": 1.0 - cosine,
+                "mismatch": int(np.argmax(left) != np.argmax(right)),
+            })
+        blocks.append({
+            "start": start,
+            "rows": rows,
+            "mse": mean([row["mse"] for row in rows]),
+            "cos_loss": mean([row["cos_loss"] for row in rows]),
+            "mismatch": sum(row["mismatch"] for row in rows),
+            **features[start],
+        })
+
+    print("\nCausal final-logit block risk (--approx-logits):")
+    print("| block | prior record | entropy/logV | top1 p | margin | output rows | MSE | cosine | top1 mismatches |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for index, block in enumerate(blocks):
+        print(f"| {index} | {block['start']} | {block['entropy_norm']:.5f} "
+              f"| {block['top1_p']:.5f} | {block['margin']:.4f} "
+              f"| {len(block['rows'])} | {block['mse']:.4e} "
+              f"| {1.0 - block['cos_loss']:.6f} | {block['mismatch']} |")
+
+    print("\nPrior-logit risk versus the following block (Pearson r):")
+    print("| risk feature | MSE | cosine loss | top1 mismatches |")
+    print("|---|---:|---:|---:|")
+    risks = (("entropy_norm", 1.0), ("top1_p", -1.0), ("margin", -1.0))
+    for name, sign in risks:
+        risk = [sign * block[name] for block in blocks]
+        print(f"| {name} | {pearson(risk, [b['mse'] for b in blocks]):+.4f} "
+              f"| {pearson(risk, [b['cos_loss'] for b in blocks]):+.4f} "
+              f"| {pearson(risk, [float(b['mismatch']) for b in blocks]):+.4f} |")
+
+    print("\nCausal whole-block fallback frontier (highest predicted risk exactified):")
+    print("| risk feature | exact blocks | exact output rows | remaining MSE | cosine | top1 mismatches |")
+    print("|---|---:|---:|---:|---:|---:|")
+    total_rows = sum(len(block["rows"]) for block in blocks)
+    for name, sign in risks:
+        order = sorted(range(len(blocks)), key=lambda i: sign * blocks[i][name], reverse=True)
+        for guarded_count in sorted({0, math.ceil(len(blocks) / 4), math.ceil(len(blocks) / 2)}):
+            guarded = set(order[:guarded_count])
+            rows = [row for index, block in enumerate(blocks) if index not in guarded
+                    for row in block["rows"]]
+            exact_rows = total_rows - len(rows)
+            mse = math.fsum(row["mse"] for row in rows) / total_rows
+            cos_loss = math.fsum(row["cos_loss"] for row in rows) / total_rows
+            mismatches = sum(row["mismatch"] for row in rows)
+            print(f"| {name} | {guarded_count}/{len(blocks)} | {exact_rows}/{total_rows} "
+                  f"| {mse:.4e} | {1.0 - cos_loss:.6f} | {mismatches} |")
+
+
 def residuals(x: list[float], y: list[float]) -> list[float]:
     x_mean, y_mean = mean(x), mean(y)
     variance = math.fsum((value - x_mean) ** 2 for value in x)
@@ -106,6 +187,8 @@ def main() -> None:
     parser.add_argument("--verify-k", type=int, default=4)
     parser.add_argument("--mass", type=float, default=0.8)
     parser.add_argument("--min-k", type=int, default=3)
+    parser.add_argument("--approx-logits", type=Path,
+                        help="approximate final-logit dump for causal block fallback analysis")
     args = parser.parse_args()
 
     groups = read_metrics(args.metrics)
@@ -168,6 +251,9 @@ def main() -> None:
               f"| {pearson(uncertainty, targets['rel_mean']):+.4f} "
               f"| {pearson(uncertainty, targets['rel_resid']):+.4f} "
               f"| {pearson(uncertainty, targets['cos_resid']):+.4f} |")
+
+    if args.approx_logits:
+        final_logit_guard(args.logits, args.approx_logits, args.vocab, args.verify_k)
 
 
 if __name__ == "__main__":

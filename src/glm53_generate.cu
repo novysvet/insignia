@@ -4862,7 +4862,10 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
         const char *value = std::getenv("INSIGNIA_GLM53_DF_VERIFY_K");
         return std::clamp(value ? std::atoi(value) : 4, 1, kMaxVerify);
     }();
-    verify_may_rollback_ = false;
+    // Teacher forcing normally consumes every row and therefore elides the
+    // rollback snapshot. Post-verify exact retry is the one exception: it
+    // must restore the state that preceded this approximate chunk.
+    verify_may_rollback_ = df_retry_top1_drop_ > 0.0f;
     for (size_t consumed = 0; consumed + 1 < tokens.size(); ) {
         begin_verify_epoch();
         const int count = int(std::min<size_t>(verify_k, tokens.size() - 1 - consumed));
@@ -6659,11 +6662,7 @@ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool cap
         // restored and replayed to the accepted boundary. Row-sequential
         // verify rounds never roll back (their state always stands at the
         // accepted boundary), so they skip these two whole-state copies.
-        // An exact retry has just restored these arrays from the original
-        // round-start snapshot.  Preserve that snapshot: copying the restored
-        // state back into the same source buffers is redundant, formed a
-        // reciprocal async D2D sequence, and corrupted layer-0 KDA replay.
-        if (verify_may_rollback_ && !df_retry_replay_) {
+        if (verify_may_rollback_) {
             require(!forced_sequential_verify_,
                     "batch verify is forbidden after sequential snapshot elision");
             check(cudaMemcpyAsync(kda_snap_.get(), kda_states_.get(),

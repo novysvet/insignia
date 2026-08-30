@@ -20,9 +20,12 @@ class FakeTokenizer:
 class BenchmarkMathArenaTest(unittest.TestCase):
     def setUp(self):
         self.row = {
+            "_row": 0,
             "problem_idx": 7,
             "problem": "Prove that one plus one is two.",
             "formal_statement": "theorem one_add_one : 1 + 1 = 2 := by\n  sorry",
+            "source": "synthetic",
+            "title": "Synthetic",
         }
 
     def test_prompt_is_explicitly_one_shot_and_contains_both_statements(self):

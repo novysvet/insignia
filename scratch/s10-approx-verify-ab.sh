@@ -79,6 +79,9 @@ run() {
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN \
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX \
       -u INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS \
+      -u INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P \
+      -u INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP \
+      -u INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
@@ -179,6 +182,17 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8 \
         INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.05 \
         INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS=.60
+    ;;
+  top4cacheuncertainty8|top4cacheuncertainty6)
+    guard_k=${PLAN##*uncertainty}
+    run "top4-cache32-e0010-joint8-up447-ud304-uk$guard_k" \
+        INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P=.446991 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP=.303715 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="$guard_k"
     ;;
   top4cachebalancedpacked)
     run top4-cache-balanced-expanded INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
@@ -330,7 +344,7 @@ case "$PLAN" in
     run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
     ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, top4guard, top4prefix, top4context, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, cachejointguard, cachejointguardreverse, cachejointguardretain, cachejointguardretainreverse, packedjoint, packedjointreverse, or packedslots" >&2
+    echo "unknown PLAN (see case labels in this script; uncertainty plans are top4cacheuncertainty8/6)" >&2
     exit 64
     ;;
 esac

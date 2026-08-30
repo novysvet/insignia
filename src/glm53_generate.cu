@@ -2829,6 +2829,32 @@ public:
             std::printf("DFlash2 calibration guard: exact block when target/draft JS > %.4f\n",
                         df_calibration_guard_js_);
         }
+        if (const char *threshold =
+                std::getenv("INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P"))
+            df_uncertainty_top1_p_ = std::strtof(threshold, nullptr);
+        if (const char *threshold =
+                std::getenv("INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP"))
+            df_uncertainty_top1_drop_ = std::strtof(threshold, nullptr);
+        if (df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f) {
+            require(dflash2_on_, "DFlash uncertainty guard requires DFlash2");
+            require(df_approx_topm_ > 0,
+                    "DFlash uncertainty guard currently requires fixed Top-M verification");
+            require(df_uncertainty_top1_p_ >= 0.0f &&
+                        df_uncertainty_top1_p_ < 1.0f &&
+                        df_uncertainty_top1_drop_ >= 0.0f &&
+                        df_uncertainty_top1_drop_ < 1.0f,
+                    "DFlash uncertainty probabilities must be in [0,1)");
+            if (const char *guard_k =
+                    std::getenv("INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K"))
+                df_uncertainty_guard_k_ = std::atoi(guard_k);
+            require(df_uncertainty_guard_k_ > df_approx_topm_ &&
+                        df_uncertainty_guard_k_ <= 8,
+                    "DFlash uncertainty guard k must exceed Top-M and be at most 8");
+            std::printf("DFlash2 distribution guard: p<=%.6f or adjacent p drop>=%.6f; "
+                        "causal-prefix k%d\n",
+                        df_uncertainty_top1_p_, df_uncertainty_top1_drop_,
+                        df_uncertainty_guard_k_);
+        }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
         const char *exact_falsifier_trace =
@@ -3404,7 +3430,10 @@ private:
     float df_logit_guard_margin_ = 0.0f;
     bool df_logit_guard_prefix_ = true;
     float df_calibration_guard_js_ = 0.0f;
+    float df_uncertainty_top1_p_ = 0.0f, df_uncertainty_top1_drop_ = 0.0f;
+    int df_uncertainty_guard_k_ = 8;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
+    std::array<uint8_t, kMaxVerify> df_logit_guard_k_{};
     uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
     uint64_t df_calibration_guard_rounds_ = 0, df_calibration_guarded_rounds_ = 0;
     double df_calibration_js_sum_ = 0.0, df_calibration_js_max_ = 0.0;
@@ -3429,7 +3458,15 @@ private:
     int dense_intermediate_ = 0, shared_intermediate_ = 0;
     bool nvfp4_experts_ = false;
     bool df_logit_guard_on() const {
-        return df_logit_guard_margin_ > 0.0f || df_calibration_guard_js_ > 0.0f;
+        return df_logit_guard_margin_ > 0.0f || df_calibration_guard_js_ > 0.0f ||
+            df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f;
+    }
+    void guard_dflash_row(int row, int k) {
+        require(row >= 0 && row < kMaxVerify && k >= 1 && k <= 8,
+                "DFlash guard row/k is out of range");
+        df_logit_guard_exact_[size_t(row)] = 1;
+        df_logit_guard_k_[size_t(row)] = uint8_t(std::max<int>(
+            df_logit_guard_k_[size_t(row)], k));
     }
     double dflash_calibration_js(const float *draft) const;
     std::vector<std::string> layer_types_, mlp_types_;
@@ -4422,18 +4459,64 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
                      cudaMemcpyDeviceToHost),
           "download DFlash2 hp");
     df_logit_guard_exact_.fill(0);
+    df_logit_guard_k_.fill(0);
     if (df_calibration_guard_js_ > 0.0f) {
         const double js = dflash_calibration_js(df_logits_host_);
         ++df_calibration_guard_rounds_;
         df_calibration_js_sum_ += js;
         df_calibration_js_max_ = std::max(df_calibration_js_max_, js);
         if (js > df_calibration_guard_js_) {
-            df_logit_guard_exact_.fill(1);
+            for (int row = 0; row < kMaxVerify; ++row)
+                guard_dflash_row(row, 8);
             ++df_calibration_guarded_rounds_;
         }
         if (std::getenv("INSIGNIA_GLM53_DF_DEBUG"))
             std::fprintf(stderr, "df calibration JS %.9f guard %d\n", js,
                          js > df_calibration_guard_js_);
+    }
+    if (df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f) {
+        constexpr int rows = insignia::glm53::DFlash2Drafter::kDrafts;
+        const int vocab = int(model_.vocab_size());
+        std::array<double, rows> top1_probability{};
+        for (int draft_row = 0; draft_row < rows; ++draft_row) {
+            const float *logits = df_logits_host_ + size_t(draft_row) * vocab;
+            double maximum = -std::numeric_limits<double>::infinity();
+            for (int token = 0; token < vocab; ++token)
+                maximum = std::max(maximum, double(logits[token]));
+            double normalizer = 0.0;
+            for (int token = 0; token < vocab; ++token)
+                normalizer += std::exp(double(logits[token]) - maximum);
+            top1_probability[size_t(draft_row)] = 1.0 / normalizer;
+        }
+        int highest_guard = -1;
+        // Target output after verify row r predicts candidate r+1, whose
+        // causal uncertainty is DFlash row r+1.  The probability drop from
+        // row r to r+1 measures within-block confidence collapse and was the
+        // strongest held-out hard-prompt failure signal (12/12 capture when
+        // composed with an absolute p threshold).
+        for (int verify_row = 0; verify_row + 1 < rows; ++verify_row) {
+            const int current = verify_row + 1;
+            const double probability = top1_probability[size_t(current)];
+            const double drop = top1_probability[size_t(current - 1)] - probability;
+            const bool low = df_uncertainty_top1_p_ > 0.0f &&
+                probability <= df_uncertainty_top1_p_;
+            const bool collapsed = df_uncertainty_top1_drop_ > 0.0f &&
+                drop >= df_uncertainty_top1_drop_;
+            if (low || collapsed) {
+                guard_dflash_row(verify_row, df_uncertainty_guard_k_);
+                highest_guard = verify_row;
+            }
+        }
+        if (df_logit_guard_prefix_)
+            for (int verify_row = 0; verify_row <= highest_guard; ++verify_row)
+                guard_dflash_row(verify_row, df_uncertainty_guard_k_);
+        if (std::getenv("INSIGNIA_GLM53_DF_DEBUG")) {
+            std::fprintf(stderr, "df distribution p");
+            for (double probability : top1_probability)
+                std::fprintf(stderr, " %.6f", probability);
+            std::fprintf(stderr, " highest_guard %d k%d\n", highest_guard,
+                         df_uncertainty_guard_k_);
+        }
     }
     if (df_logit_guard_margin_ > 0.0f) {
         const int vocab = int(model_.vocab_size());
@@ -4443,7 +4526,7 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
             // row r+1 is the same-position risk signal. The final draft row
             // has no look-ahead row, so keep it exact.
             if (verify_row + 1 >= insignia::glm53::DFlash2Drafter::kDrafts) {
-                df_logit_guard_exact_[size_t(verify_row)] = 1;
+                guard_dflash_row(verify_row, 8);
                 continue;
             }
             const float *row = df_logits_host_ + size_t(verify_row + 1) * vocab;
@@ -4459,7 +4542,7 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
                 }
             }
             if (first - second < df_logit_guard_margin_) {
-                df_logit_guard_exact_[size_t(verify_row)] = 1;
+                guard_dflash_row(verify_row, 8);
                 highest_margin_guard = verify_row;
             }
         }
@@ -4469,7 +4552,7 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
         // prefix exact. Do not propagate the final no-lookahead sentinel above.
         if (df_logit_guard_prefix_)
             for (int verify_row = 0; verify_row <= highest_margin_guard; ++verify_row)
-                df_logit_guard_exact_[size_t(verify_row)] = 1;
+                guard_dflash_row(verify_row, 8);
     }
     static const bool df_debug = std::getenv("INSIGNIA_GLM53_DF_DEBUG") != nullptr;
     if (df_debug) {
@@ -5353,8 +5436,11 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_cache_route_disk_saved_ += baseline_disk - best_disk;
             df_cache_route_h2d_saved_ += baseline_h2d - best_h2d;
         }
-        if (logit_guarded)
-            exec_count[size_t(token)] = topk;
+        if (logit_guarded) {
+            const int guarded_k = df_logit_guard_k_[size_t(verify_row)]
+                ? int(df_logit_guard_k_[size_t(verify_row)]) : topk;
+            exec_count[size_t(token)] = guarded_k;
+        }
         else if (kda_archive_ && df_approx_topm_)
             exec_count[size_t(token)] = df_approx_topm_;
         else if (kda_archive_ && df_approx_mass_ > 0.0f) {
@@ -5405,6 +5491,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         std::vector<std::array<int, 288>> candidate_rank(
             static_cast<size_t>(tokens));
         std::vector<uint8_t> guarded(size_t(tokens), 0);
+        std::vector<uint8_t> guarded_exec_k(
+            static_cast<size_t>(tokens), static_cast<uint8_t>(topm));
         std::array<int, 288> union_disk{}, union_h2d{};
         union_disk.fill(-1);
         union_h2d.fill(-1);
@@ -5429,6 +5517,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             guarded[size_t(token)] = df_logit_guard_on() && verify_row >= 0 &&
                 verify_row < kMaxVerify &&
                 df_logit_guard_exact_[size_t(verify_row)];
+            if (guarded[size_t(token)])
+                guarded_exec_k[size_t(token)] = df_logit_guard_k_[size_t(verify_row)]
+                    ? df_logit_guard_k_[size_t(verify_row)] : uint8_t(topk);
             const auto &baseline = baseline_experts[size_t(token)];
             double baseline_score = 0.0, score_scale = 0.0;
             for (int slot = 0; slot < topm; ++slot) {
@@ -5544,7 +5635,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 for (int token = 0; token < tokens; ++token) {
                     const auto &baseline = baseline_experts[size_t(token)];
                     if (guarded[size_t(token)]) {
-                        for (int slot = 0; slot < topk; ++slot)
+                        for (int slot = 0; slot < guarded_exec_k[size_t(token)]; ++slot)
                             add(baseline[size_t(slot)]);
                     } else {
                         for (int slot = 0; slot < retained; ++slot)
@@ -5583,7 +5674,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             for (int token = 0; token < tokens; ++token) {
                 const auto &baseline = baseline_experts[size_t(token)];
                 if (guarded[size_t(token)]) {
-                    for (int slot = 0; slot < topk; ++slot)
+                    for (int slot = 0; slot < guarded_exec_k[size_t(token)]; ++slot)
                         add(baseline[size_t(slot)]);
                 } else {
                     for (int slot = 0; slot < retained; ++slot)
@@ -6769,8 +6860,12 @@ std::vector<std::pair<int, float>> Runner::step(
         std::fputc('\n', stdout);
         if (df_logit_guard_rows_)
             std::printf("  DFlash logit guard %s %llu/%llu verify rows (%.1f%%)\n",
-                        df_cache_route_k_ && df_cache_guard_retain_ < 8
-                            ? "tightened" : "exactified",
+                        (df_uncertainty_top1_p_ > 0.0f ||
+                         df_uncertainty_top1_drop_ > 0.0f) &&
+                                df_uncertainty_guard_k_ < 8
+                            ? "raised-k" :
+                        (df_cache_route_k_ && df_cache_guard_retain_ < 8
+                            ? "tightened" : "exactified"),
                         (unsigned long long)df_logit_guarded_rows_,
                         (unsigned long long)df_logit_guard_rows_,
                         100.0 * df_logit_guarded_rows_ / df_logit_guard_rows_);

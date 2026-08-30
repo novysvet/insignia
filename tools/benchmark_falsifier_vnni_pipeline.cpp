@@ -34,6 +34,9 @@ constexpr int kHeadDim = 32;
 constexpr int kLatent = 64;
 constexpr int kMaxHistory = 336;
 constexpr int kScratchWidth = 768;
+constexpr int kTargetExperts = 288;
+constexpr int kTargetLayers = 45;
+constexpr int kMaxVerifyRows = 8;
 
 #if defined(INSIGNIA_FALSIFIER_PROFILE)
 #define INSIGNIA_PROFILE_NOINLINE __attribute__((noinline))
@@ -253,6 +256,28 @@ struct Weights {
     Matrix expert_down{256 * 96, 128, random};
     Matrix heads{107, 192, random};
 
+    // Small tensors remain FP32. They are bandwidth-negligible, participate
+    // in normalization/routing directly, and are not covered by the INT8
+    // matrix policy.
+    std::array<float, kWidth> logit_norm{};
+    std::array<float, kWidth> candidate_norm{};
+    std::array<float, kWidth> router_norm{};
+    std::array<float, kWidth> hidden_norm{};
+    std::array<float, kWidth> cache_norm{};
+    std::array<float, kTargetExperts * 16> target_expert_embedding{};
+    std::array<float, kWidth * 16> position_weight{};
+    std::array<float, kTargetLayers * kWidth> layer_embedding{};
+    std::array<float, kMaxVerifyRows * kWidth> row_embedding{};
+    std::array<float, 16> mhc_base_logits{};
+    std::array<float, kWidth> attention_norm{};
+    std::array<float, kLatent> mla_kv_norm{};
+    std::array<float, kWidth> moe_norm{};
+    std::array<float, 96> latent_norm{};
+    std::array<float, 4> attention_stream_scale{};
+    std::array<float, 4> moe_stream_scale{};
+    std::array<float, 256> routing_bias{};
+    std::array<float, kWidth> final_norm{};
+
     // Tiny inference-only absorbed views.  K is transposed per head so a
     // query produces its 64-wide latent-space form without per-event INT8
     // dequantization; V stays output-row major for the final projection.
@@ -262,6 +287,16 @@ struct Weights {
     uint64_t manifest_checksum = 0;
 
     Weights() {
+        for (float *normalizer : {
+                 logit_norm.data(), candidate_norm.data(), router_norm.data(),
+                 hidden_norm.data(), cache_norm.data(), attention_norm.data(),
+                 moe_norm.data(), final_norm.data()})
+            std::fill_n(normalizer, kWidth, 1.0f);
+        mla_kv_norm.fill(1.0f);
+        latent_norm.fill(1.0f);
+        attention_stream_scale.fill(0.10f);
+        moe_stream_scale.fill(0.10f);
+        for (int i = 0; i < 4; ++i) mhc_base_logits[i * 4 + i] = 4.0f;
         rebuild_absorbed();
     }
 
@@ -288,7 +323,7 @@ struct Weights {
         VnniFileHeader header{};
         file.read(reinterpret_cast<char *>(&header), sizeof(header));
         if (!file || std::memcmp(header.magic, "IFVNNI1\0", 8) != 0
-            || header.version != 1)
+            || (header.version != 1 && header.version != 2))
             throw std::runtime_error("invalid Falsifier VNNI file header");
         std::array<std::pair<const char *, Matrix *>, 24> matrices{{
             {"encoder.logit", &logit},
@@ -316,8 +351,11 @@ struct Weights {
             {"cell.expert_down", &expert_down},
             {"heads", &heads},
         }};
-        if (header.matrix_count != matrices.size())
-            throw std::runtime_error("VNNI matrix-count mismatch");
+        constexpr size_t raw_count = 18;
+        const size_t expected_entries = matrices.size()
+            + (header.version == 2 ? raw_count : 0);
+        if (header.matrix_count != expected_entries)
+            throw std::runtime_error("VNNI entry-count mismatch");
         uint64_t combined = 0;
         for (auto [expected_name, matrix] : matrices) {
             VnniMatrixHeader matrix_header{};
@@ -331,6 +369,7 @@ struct Weights {
                 || matrix_header.rows != static_cast<uint32_t>(matrix->rows)
                 || matrix_header.logical_cols != static_cast<uint32_t>(matrix->logical_cols)
                 || matrix_header.padded_cols != static_cast<uint32_t>(matrix->cols)
+                || matrix_header.reserved != 0
                 || matrix_header.payload_bytes != expected_payload)
                 throw std::runtime_error("VNNI matrix metadata mismatch: "
                                          + std::string(expected_name));
@@ -354,6 +393,63 @@ struct Weights {
             file.seekg(static_cast<std::streamoff>(padding), std::ios::cur);
             combined = (combined << 1) | (combined >> 63);
             combined ^= matrix_header.payload_checksum;
+        }
+        if (header.version == 2) {
+            struct RawTarget {
+                const char *name;
+                float *data;
+                size_t count;
+            };
+            const std::array<RawTarget, raw_count> raw{{
+                {"encoder.logit_norm", logit_norm.data(), logit_norm.size()},
+                {"encoder.candidate_norm", candidate_norm.data(), candidate_norm.size()},
+                {"encoder.router_norm", router_norm.data(), router_norm.size()},
+                {"encoder.hidden_norm", hidden_norm.data(), hidden_norm.size()},
+                {"encoder.cache_norm", cache_norm.data(), cache_norm.size()},
+                {"encoder.expert_embedding", target_expert_embedding.data(),
+                 target_expert_embedding.size()},
+                {"encoder.position", position_weight.data(), position_weight.size()},
+                {"encoder.layer_embedding", layer_embedding.data(), layer_embedding.size()},
+                {"encoder.row_embedding", row_embedding.data(), row_embedding.size()},
+                {"cell.mhc_base", mhc_base_logits.data(), mhc_base_logits.size()},
+                {"cell.attention_norm", attention_norm.data(), attention_norm.size()},
+                {"cell.mla_kv_norm", mla_kv_norm.data(), mla_kv_norm.size()},
+                {"cell.moe_norm", moe_norm.data(), moe_norm.size()},
+                {"cell.latent_norm", latent_norm.data(), latent_norm.size()},
+                {"cell.attention_scale", attention_stream_scale.data(),
+                 attention_stream_scale.size()},
+                {"cell.moe_scale", moe_stream_scale.data(), moe_stream_scale.size()},
+                {"cell.routing_bias", routing_bias.data(), routing_bias.size()},
+                {"final_norm", final_norm.data(), final_norm.size()},
+            }};
+            for (const RawTarget &target : raw) {
+                VnniMatrixHeader tensor_header{};
+                file.read(reinterpret_cast<char *>(&tensor_header),
+                          sizeof(tensor_header));
+                const std::string actual_name(
+                    tensor_header.name,
+                    std::find(tensor_header.name, tensor_header.name + 32, '\0'));
+                const uint64_t payload_bytes = target.count * sizeof(float);
+                if (!file || actual_name != target.name
+                    || tensor_header.rows != target.count
+                    || tensor_header.logical_cols != 1
+                    || tensor_header.padded_cols != 1
+                    || tensor_header.reserved != 1
+                    || tensor_header.payload_bytes != payload_bytes)
+                    throw std::runtime_error("VNNI raw metadata mismatch: "
+                                             + std::string(target.name));
+                std::vector<uint8_t> payload(static_cast<size_t>(payload_bytes));
+                file.read(reinterpret_cast<char *>(payload.data()), payload.size());
+                if (!file || fnv1a(payload.data(), payload.size())
+                        != tensor_header.payload_checksum)
+                    throw std::runtime_error("VNNI raw checksum mismatch: "
+                                             + std::string(target.name));
+                std::memcpy(target.data, payload.data(), payload.size());
+                const uint64_t padding = (64 - (payload_bytes & 63)) & 63;
+                file.seekg(static_cast<std::streamoff>(padding), std::ios::cur);
+                combined = (combined << 1) | (combined >> 63);
+                combined ^= tensor_header.payload_checksum;
+            }
         }
         if (!file || combined != header.manifest_checksum)
             throw std::runtime_error("VNNI manifest checksum mismatch");
@@ -433,11 +529,14 @@ static void linear(const Matrix &matrix, const float *input, float *output,
                      scratch.accumulator.data(), output);
 }
 
-static void rms_norm(float *value, int width) {
+static void rms_norm(float *value, int width, const float *weight = nullptr) {
     float square = 0.0f;
     for (int i = 0; i < width; ++i) square = std::fma(value[i], value[i], square);
     const float scale = 1.0f / std::sqrt(square / width + 1.0e-6f);
-    for (int i = 0; i < width; ++i) value[i] *= scale;
+    if (weight)
+        for (int i = 0; i < width; ++i) value[i] *= scale * weight[i];
+    else
+        for (int i = 0; i < width; ++i) value[i] *= scale;
 }
 
 static float sigmoid(float value) {
@@ -468,9 +567,10 @@ INSIGNIA_PROFILE_NOINLINE static void mix_streams(
     linear(weights.mhc_dynamic, context, scratch.mix_logits.data(), scratch);
     for (int row = 0; row < 4; ++row)
         for (int column = 0; column < 4; ++column) {
-            const float diagonal = row == column ? 4.0f : 0.0f;
             scratch.mix_matrix[row * 4 + column] = std::exp(std::clamp(
-                scratch.mix_logits[row * 4 + column] + diagonal, -12.0f, 12.0f));
+                scratch.mix_logits[row * 4 + column]
+                    + weights.mhc_base_logits[row * 4 + column],
+                -12.0f, 12.0f));
         }
     for (int iteration = 0; iteration < 6; ++iteration) {
         for (int row = 0; row < 4; ++row) {
@@ -541,7 +641,7 @@ INSIGNIA_PROFILE_NOINLINE static void causal_mla(
     const Weights &weights, Scratch &scratch, int repeat, int history_count,
     const float *input, float *output) {
     std::copy_n(input, kWidth, scratch.temp4.data());
-    rms_norm(scratch.temp4.data(), kWidth);
+    rms_norm(scratch.temp4.data(), kWidth, weights.attention_norm.data());
     const float input_scale = quantize_vector(
         scratch.temp4.data(), kWidth, weights.mla_q.cols, scratch.quantized.data());
     linear_quantized(weights.mla_q, scratch.quantized.data(), input_scale,
@@ -550,7 +650,7 @@ INSIGNIA_PROFILE_NOINLINE static void causal_mla(
                      scratch.accumulator.data(), scratch.temp1.data());
     linear_quantized(weights.mla_gate, scratch.quantized.data(), input_scale,
                      scratch.accumulator.data(), scratch.temp2.data());
-    rms_norm(scratch.temp1.data(), kLatent);
+    rms_norm(scratch.temp1.data(), kLatent, weights.mla_kv_norm.data());
     std::copy_n(scratch.temp1.data(), kLatent,
                 scratch.latents[repeat][history_count - 1].data());
 
@@ -615,7 +715,7 @@ INSIGNIA_PROFILE_NOINLINE static void causal_mla(
 INSIGNIA_PROFILE_NOINLINE static void stable_moe(
     const Weights &weights, Scratch &scratch, const float *input, float *output) {
     std::copy_n(input, kWidth, scratch.temp4.data());
-    rms_norm(scratch.temp4.data(), kWidth);
+    rms_norm(scratch.temp4.data(), kWidth, weights.moe_norm.data());
     const float input_scale = quantize_vector(
         scratch.temp4.data(), kWidth, weights.moe_router.cols,
         scratch.quantized.data());
@@ -627,24 +727,25 @@ INSIGNIA_PROFILE_NOINLINE static void stable_moe(
                      scratch.accumulator.data(), scratch.temp2.data());
 
     int selected[3] = {-1, -1, -1};
-    float selected_score[3] = {-1.0f, -1.0f, -1.0f};
+    float selected_biased[3] = {-1.0f, -1.0f, -1.0f};
     for (int expert = 0; expert < 256; ++expert)
         scratch.temp0[expert] = sigmoid(scratch.temp0[expert]);
     for (int expert = 0; expert < 256; ++expert) {
-        const float score = scratch.temp0[expert];
+        const float score = scratch.temp0[expert] + weights.routing_bias[expert];
         for (int rank = 0; rank < 3; ++rank)
-            if (score > selected_score[rank]) {
+            if (score > selected_biased[rank]) {
                 for (int move = 2; move > rank; --move) {
-                    selected_score[move] = selected_score[move - 1];
+                    selected_biased[move] = selected_biased[move - 1];
                     selected[move] = selected[move - 1];
                 }
-                selected_score[rank] = score;
+                selected_biased[rank] = score;
                 selected[rank] = expert;
                 break;
             }
     }
-    const float expert_weight0 = selected_score[0]
-        / std::max(selected_score[0] + selected_score[1], 1.0e-12f);
+    const float expert_weight0 = scratch.temp0[selected[0]]
+        / std::max(scratch.temp0[selected[0]] + scratch.temp0[selected[1]],
+                   1.0e-12f);
     const float expert_weight1 = 1.0f - expert_weight0;
 
     const float latent_scale = quantize_vector(
@@ -669,7 +770,7 @@ INSIGNIA_PROFILE_NOINLINE static void stable_moe(
     for (int d = 0; d < 96; ++d)
         scratch.temp3[d] = expert_weight0 * scratch.expert_output[0][d]
             + expert_weight1 * scratch.expert_output[1][d];
-    rms_norm(scratch.temp3.data(), 96);
+    rms_norm(scratch.temp3.data(), 96, weights.latent_norm.data());
     linear(weights.latent_up, scratch.temp3.data(), scratch.temp0.data(), scratch);
 
     situ_glu(scratch.temp2.data(), scratch.temp3.data(), 384);
@@ -679,39 +780,98 @@ INSIGNIA_PROFILE_NOINLINE static void stable_moe(
 }
 
 INSIGNIA_PROFILE_NOINLINE static void encode(
-    const Weights &weights, Scratch &scratch, int layer, int row) {
+    const Weights &weights, Scratch &scratch, int layer, int row,
+    int verify_rows) {
     linear(weights.logit, scratch.input.data(), scratch.streams[0].data(), scratch);
-    rms_norm(scratch.streams[0].data(), kWidth);
+    rms_norm(scratch.streams[0].data(), kWidth, weights.logit_norm.data());
+
+    std::array<float, 32> candidate_logit{};
+    std::array<float, 32> candidate_choice{};
+    float logit_mean = 0.0f;
+    float choice_mean = 0.0f;
+    for (int candidate = 0; candidate < 32; ++candidate) {
+        candidate_logit[candidate] = scratch.input[candidate];
+        candidate_choice[candidate] = scratch.input[32 + candidate];
+        logit_mean += candidate_logit[candidate];
+        choice_mean += candidate_choice[candidate];
+    }
+    logit_mean *= 1.0f / 32.0f;
+    choice_mean *= 1.0f / 32.0f;
+    float logit_variance = 0.0f;
+    float choice_variance = 0.0f;
+    for (int candidate = 0; candidate < 32; ++candidate) {
+        const float logit_delta = candidate_logit[candidate] - logit_mean;
+        const float choice_delta = candidate_choice[candidate] - choice_mean;
+        logit_variance = std::fma(logit_delta, logit_delta, logit_variance);
+        choice_variance = std::fma(choice_delta, choice_delta, choice_variance);
+    }
+    const float inverse_logit_std = 1.0f / std::max(
+        std::sqrt(logit_variance / 31.0f), 1.0e-4f);
+    const float inverse_choice_std = 1.0f / std::max(
+        std::sqrt(choice_variance / 31.0f), 1.0e-4f);
+    float maximum_choice = -std::numeric_limits<float>::infinity();
+    for (int candidate = 0; candidate < 32; ++candidate) {
+        candidate_logit[candidate]
+            = (candidate_logit[candidate] - logit_mean) * inverse_logit_std;
+        candidate_choice[candidate]
+            = (candidate_choice[candidate] - choice_mean) * inverse_choice_std;
+        maximum_choice = std::max(maximum_choice, candidate_choice[candidate]);
+    }
+    float choice_denominator = 0.0f;
+    for (float choice : candidate_choice)
+        choice_denominator += std::exp(choice - maximum_choice);
 
     std::fill(scratch.streams[1].begin(), scratch.streams[1].end(), 0.0f);
     for (int candidate = 0; candidate < 32; ++candidate) {
-        for (int d = 0; d < 32; ++d)
-            scratch.temp4[d] = scratch.input[(d + candidate * 7 + layer + row) % 224];
+        const int target_expert
+            = (layer * 37 + row * 17 + candidate * 11) % kTargetExperts;
+        std::copy_n(weights.target_expert_embedding.data() + target_expert * 16,
+                    16, scratch.temp4.data());
+        scratch.temp4[16] = candidate_logit[candidate];
+        scratch.temp4[17] = candidate_choice[candidate];
+        for (int bit = 0; bit < 4; ++bit)
+            scratch.temp4[18 + bit]
+                = scratch.input[64 + candidate * 4 + bit] > 0.0f ? 1.0f : 0.0f;
+        scratch.temp4[22] = static_cast<float>(candidate) / 31.0f;
+        std::fill(scratch.temp4.begin() + 23, scratch.temp4.begin() + 32, 0.0f);
         linear(weights.candidate_a, scratch.temp4.data(), scratch.temp0.data(), scratch);
         silu(scratch.temp0.data(), 64);
         linear(weights.candidate_b, scratch.temp0.data(), scratch.temp1.data(), scratch);
-        rms_norm(scratch.temp1.data(), kWidth);
-        const float pool = 1.0f / 32.0f;
+        rms_norm(scratch.temp1.data(), kWidth, weights.candidate_norm.data());
+        const float pool = std::exp(candidate_choice[candidate] - maximum_choice)
+            / choice_denominator;
         for (int d = 0; d < kWidth; ++d)
             scratch.streams[1][d] += pool * scratch.temp1[d];
     }
     linear(weights.router_tail, scratch.input.data(), scratch.temp0.data(), scratch);
-    rms_norm(scratch.temp0.data(), kWidth);
+    rms_norm(scratch.temp0.data(), kWidth, weights.router_norm.data());
     for (int d = 0; d < kWidth; ++d) scratch.streams[1][d] += scratch.temp0[d];
 
     linear(weights.hidden, scratch.input.data(), scratch.streams[2].data(), scratch);
-    rms_norm(scratch.streams[2].data(), kWidth);
-    for (int d = 0; d < kWidth; ++d)
-        scratch.streams[2][d] += 0.001f * float((layer * 13 + row * 7 + d) & 31);
+    rms_norm(scratch.streams[2].data(), kWidth, weights.hidden_norm.data());
+    std::array<float, 16> position{};
+    position[0] = static_cast<float>(layer) / (kTargetLayers - 1);
+    position[1] = static_cast<float>(row) / (kMaxVerifyRows - 1);
+    position[4] = static_cast<float>(verify_rows) / kMaxVerifyRows;
+    for (int d = 0; d < kWidth; ++d) {
+        float position_value = 0.0f;
+        for (int p = 0; p < 16; ++p)
+            position_value = std::fma(
+                weights.position_weight[d * 16 + p], position[p],
+                position_value);
+        scratch.streams[2][d] += position_value
+            + weights.layer_embedding[layer * kWidth + d]
+            + weights.row_embedding[row * kWidth + d];
+    }
 
     linear(weights.cache, scratch.input.data(), scratch.streams[3].data(), scratch);
-    rms_norm(scratch.streams[3].data(), kWidth);
+    rms_norm(scratch.streams[3].data(), kWidth, weights.cache_norm.data());
 }
 
 INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
     const Weights &weights, Scratch &scratch, int layer, int row,
     int verify_rows) {
-    encode(weights, scratch, layer, row);
+    encode(weights, scratch, layer, row, verify_rows);
     collapse_streams(scratch, scratch.block_history[0].data());
     const int history_count = std::min(kMaxHistory, layer * verify_rows + row + 1);
     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -721,18 +881,20 @@ INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
                    scratch.temp0.data(), scratch.temp1.data());
         for (int stream = 0; stream < 4; ++stream)
             for (int d = 0; d < kWidth; ++d)
-                scratch.streams[stream][d] += 0.1f * scratch.temp1[d];
+            scratch.streams[stream][d] += weights.attention_stream_scale[stream]
+                * scratch.temp1[d];
         collapse_streams(scratch, scratch.temp2.data());
         stable_moe(weights, scratch, scratch.temp2.data(), scratch.temp3.data());
         for (int stream = 0; stream < 4; ++stream)
             for (int d = 0; d < kWidth; ++d)
-                scratch.streams[stream][d] += 0.1f * scratch.temp3[d];
+            scratch.streams[stream][d] += weights.moe_stream_scale[stream]
+                * scratch.temp3[d];
         collapse_streams(scratch, scratch.temp2.data());
         mix_streams(weights, scratch, scratch.temp2.data());
         collapse_streams(scratch, scratch.block_history[repeat + 1].data());
     }
     depth_attention(weights, scratch, 4, scratch.temp0.data());
-    rms_norm(scratch.temp0.data(), kWidth);
+    rms_norm(scratch.temp0.data(), kWidth, weights.final_norm.data());
     linear(weights.heads, scratch.temp0.data(), scratch.temp1.data(), scratch);
     uint64_t checksum = 0;
     for (int i = 0; i < 107; i += 7) {

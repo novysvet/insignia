@@ -18,8 +18,11 @@ from falsifier_moe import FalsifierMoE, FalsifierMoEConfig
 
 MAGIC = b"IFVNNI1\0"
 FILE_HEADER = struct.Struct("<8sIIQ40s")
-MATRIX_HEADER = struct.Struct("<32sIIIIQQ")
+ENTRY_HEADER = struct.Struct("<32sIIIIQQ")
 MASK64 = (1 << 64) - 1
+FORMAT_VERSION = 2
+ENTRY_QUANTIZED_MATRIX = 0
+ENTRY_FLOAT_TENSOR = 1
 
 
 def fnv1a(payload: bytes) -> int:
@@ -108,6 +111,33 @@ def matrix_sources(state: dict[str, torch.Tensor]
     yield "heads", head_weight, head_bias
 
 
+def raw_sources(state: dict[str, torch.Tensor]
+                ) -> Iterable[tuple[str, np.ndarray]]:
+    """Small tensors kept in FP32 by the native controller policy."""
+    entries = (
+        ("encoder.logit_norm", "encoder.logit.1.weight"),
+        ("encoder.candidate_norm", "encoder.candidate.3.weight"),
+        ("encoder.router_norm", "encoder.router_tail.1.weight"),
+        ("encoder.hidden_norm", "encoder.hidden.1.weight"),
+        ("encoder.cache_norm", "encoder.cache.1.weight"),
+        ("encoder.expert_embedding", "encoder.expert_embedding.weight"),
+        ("encoder.position", "encoder.position.weight"),
+        ("encoder.layer_embedding", "encoder.layer_embedding.weight"),
+        ("encoder.row_embedding", "encoder.row_embedding.weight"),
+        ("cell.mhc_base", "cell.mixer.base_logits"),
+        ("cell.attention_norm", "cell.attention_norm.weight"),
+        ("cell.mla_kv_norm", "cell.attention.kv_norm.weight"),
+        ("cell.moe_norm", "cell.moe_norm.weight"),
+        ("cell.latent_norm", "cell.moe.latent_norm.weight"),
+        ("cell.attention_scale", "cell.attention_stream_scale"),
+        ("cell.moe_scale", "cell.moe_stream_scale"),
+        ("cell.routing_bias", "cell.moe.routing_bias"),
+        ("final_norm", "final_norm.weight"),
+    )
+    for export_name, state_name in entries:
+        yield export_name, tensor(state, state_name)
+
+
 def encode_matrix(name: str, weight: np.ndarray, bias: np.ndarray
                   ) -> tuple[bytes, dict[str, object]]:
     if weight.ndim != 2 or bias.shape != (weight.shape[0],):
@@ -132,9 +162,9 @@ def encode_matrix(name: str, weight: np.ndarray, bias: np.ndarray
         scale.tobytes(order="C"), bias.astype("<f4", copy=False).tobytes(order="C"),
     ))
     checksum = fnv1a(payload)
-    header = MATRIX_HEADER.pack(
+    header = ENTRY_HEADER.pack(
         name.encode("ascii").ljust(32, b"\0"), rows, logical_cols,
-        padded_cols, 0, len(payload), checksum)
+        padded_cols, ENTRY_QUANTIZED_MATRIX, len(payload), checksum)
     padding = b"\0" * ((-len(payload)) & 63)
     return header + payload + padding, {
         "name": name,
@@ -149,17 +179,42 @@ def encode_matrix(name: str, weight: np.ndarray, bias: np.ndarray
     }
 
 
+def encode_raw(name: str, value: np.ndarray
+               ) -> tuple[bytes, dict[str, object]]:
+    contiguous = np.ascontiguousarray(value, dtype="<f4")
+    payload = contiguous.reshape(-1).tobytes(order="C")
+    checksum = fnv1a(payload)
+    header = ENTRY_HEADER.pack(
+        name.encode("ascii").ljust(32, b"\0"), contiguous.size, 1, 1,
+        ENTRY_FLOAT_TENSOR, len(payload), checksum)
+    padding = b"\0" * ((-len(payload)) & 63)
+    return header + payload + padding, {
+        "name": name,
+        "shape": list(contiguous.shape),
+        "elements": contiguous.size,
+        "payload_bytes": len(payload),
+        "payload_checksum": checksum,
+    }
+
+
 def export(checkpoint: Path | None, output: Path) -> dict[str, object]:
     state = load_state(checkpoint)
     encoded: list[bytes] = []
     matrices: list[dict[str, object]] = []
+    raw_tensors: list[dict[str, object]] = []
     manifest = 0
     for name, weight, bias in matrix_sources(state):
         blob, metadata = encode_matrix(name, weight, bias)
         encoded.append(blob)
         matrices.append(metadata)
         manifest = rotate_left_one(manifest) ^ int(metadata["payload_checksum"])
-    header = FILE_HEADER.pack(MAGIC, 1, len(encoded), manifest, bytes(40))
+    for name, value in raw_sources(state):
+        blob, metadata = encode_raw(name, value)
+        encoded.append(blob)
+        raw_tensors.append(metadata)
+        manifest = rotate_left_one(manifest) ^ int(metadata["payload_checksum"])
+    header = FILE_HEADER.pack(
+        MAGIC, FORMAT_VERSION, len(encoded), manifest, bytes(40))
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as file:
         file.write(header)
@@ -167,18 +222,22 @@ def export(checkpoint: Path | None, output: Path) -> dict[str, object]:
             file.write(blob)
     file_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
     report = {
-        "schema": "insignia-falsifier-vnni-export-v1",
+        "schema": "insignia-falsifier-vnni-export-v2",
+        "format_version": FORMAT_VERSION,
         "checkpoint": str(checkpoint) if checkpoint else None,
         "output": str(output),
         "file_bytes": output.stat().st_size,
         "file_sha256": file_sha256,
         "manifest_checksum": manifest,
+        "entry_count": len(encoded),
         "matrix_count": len(matrices),
+        "raw_tensor_count": len(raw_tensors),
         "minimum_weight_cosine": min(item["weight_cosine"] for item in matrices),
         "maximum_weight_mse": max(item["weight_mse"] for item in matrices),
         "maximum_weight_abs_error": max(
             item["weight_max_abs_error"] for item in matrices),
         "matrices": matrices,
+        "raw_tensors": raw_tensors,
     }
     return report
 

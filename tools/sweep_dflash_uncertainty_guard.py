@@ -120,6 +120,8 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=24)
     parser.add_argument("--whole-block", action="store_true",
                         help="retry/guard every row when any post-verify row is risky")
+    parser.add_argument("--pre-only", action="store_true",
+                        help="rank only draft-side signals available before target execution")
     args = parser.parse_args()
     cases = [load_case(specification) for specification in args.case]
     if args.hard_case not in {case.name for case in cases}:
@@ -162,6 +164,15 @@ def main() -> None:
         ("target_top1_p", "draft_top1_p"),
         ("target_top1_p", "draft_entropy_delta"),
     ]
+    if args.pre_only:
+        orientations = {
+            feature: direction for feature, direction in orientations.items()
+            if feature.startswith("draft_")
+        }
+        families = [
+            family for family in families
+            if all(feature in orientations for feature in family)
+        ]
     results = []
     seen = set()
     for family in families:

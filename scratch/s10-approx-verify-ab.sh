@@ -55,7 +55,8 @@ COMMON=(
 )
 PLAN_ENV=()
 if [[ $PLAN == packedslots || $PLAN == packedjoint ||
-      $PLAN == packedjointreverse || $PLAN == top4cachebalancedpacked ]]; then
+      $PLAN == packedjointreverse || $PLAN == top4cachebalancedpacked ||
+      $PLAN == top4cachebalancedpackedreverse ]]; then
   PLAN_ENV=(
     INSIGNIA_GLM53_PACKED_EXPERTS=/var/lib/insignia/glm53-experts-nvfp4x-v2.igx
     INSIGNIA_GLM53_PACKED_V2=1
@@ -189,6 +190,17 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010 \
         INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8 \
         INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
+    ;;
+  top4cachebalancedpackedreverse)
+    run top4-cache-balanced-packed INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8 \
+        INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
+    run top4-cache-balanced-expanded INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8
     ;;
   cache)
     run cache32-r7-e0025 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \

@@ -2809,10 +2809,17 @@ public:
         if (const char *prefill_approx =
                 std::getenv("INSIGNIA_GLM53_PREFILL_APPROX_MOE")) {
             prefill_approx_moe_ = std::atoi(prefill_approx) != 0;
+            if (const char *first =
+                    std::getenv("INSIGNIA_GLM53_PREFILL_APPROX_FIRST_LAYER"))
+                prefill_approx_first_layer_ = std::atoi(first);
             require(!prefill_approx_moe_ || df_approx_topm_ || df_approx_mass_ > 0.0f,
                     "approximate prefill needs DF_APPROX_TOPM or DF_APPROX_MASS");
+            require(prefill_approx_first_layer_ >= 0 &&
+                        prefill_approx_first_layer_ < int(model_.layers()),
+                    "PREFILL_APPROX_FIRST_LAYER is outside the model");
             if (prefill_approx_moe_)
-                std::printf("prefill approximate MoE: reuse DFlash %s policy%s\n",
+                std::printf("prefill approximate MoE: layers %d..%u reuse DFlash %s policy%s\n",
+                            prefill_approx_first_layer_, model_.layers() - 1,
                             df_approx_topm_ ? "fixed-k" : "adaptive-mass",
                             df_cache_route_k_ ? " + cache-aware tail" : "");
         }
@@ -3446,6 +3453,7 @@ private:
     bool prefetch_on_ = true, deep_checks_ = false, trace_layers_ = false;
     bool full_layer_major_active_ = false;
     bool prefill_approx_moe_ = false;
+    int prefill_approx_first_layer_ = 0;
     bool early_route_on_ = false, early_route_prefetch_ = false;
     int early_route_prefetch_n_ = 8;
     uint64_t early_route_hits_ = 0, early_route_total_ = 0;
@@ -5397,7 +5405,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     // policy; scalar decode and the unset prefill path retain all eight routed
     // experts and keep the existing arithmetic and traffic exactly intact.
     const bool approximate_prefill =
-        full_layer_major_active_ && prefill_approx_moe_;
+        full_layer_major_active_ && prefill_approx_moe_ &&
+        layer >= prefill_approx_first_layer_;
     const bool approximate_pass = kda_archive_ || approximate_prefill;
     const bool approximate_moe = approximate_pass &&
         (df_approx_topm_ || df_approx_mass_ > 0.0f || df_cache_route_k_);

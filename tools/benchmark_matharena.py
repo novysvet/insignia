@@ -207,6 +207,8 @@ def base_environment(args: argparse.Namespace, policy: str) -> dict[str, str]:
         "1" if args.prefill_full_layer_major else "0")
     environment["INSIGNIA_GLM53_PREFILL_APPROX_MOE"] = (
         "1" if args.prefill_approx_moe and policy != "exact" else "0")
+    environment["INSIGNIA_GLM53_PREFILL_APPROX_FIRST_LAYER"] = str(
+        args.prefill_approx_first_layer)
     return environment
 
 
@@ -410,6 +412,8 @@ def main() -> None:
                         help="use the full-prompt layer-major prefill path")
     parser.add_argument("--prefill-approx-moe", action="store_true",
                         help="apply each non-exact policy's MoE pruning during layer-major prefill")
+    parser.add_argument("--prefill-approx-first-layer", type=int, default=0,
+                        help="keep target layers below this index exact during approximate prefill")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--list-only", action="store_true")
     parser.add_argument("--show-problems", action="store_true")
@@ -421,6 +425,8 @@ def main() -> None:
         parser.error("--quality-tokens cannot be negative")
     if args.max_ppl_delta < 0:
         parser.error("--max-ppl-delta cannot be negative")
+    if not 0 <= args.prefill_approx_first_layer < 45:
+        parser.error("--prefill-approx-first-layer must be in 0..44")
     if args.candidate_only and (not args.policy or args.quality_tokens):
         parser.error("--candidate-only requires an explicit --policy and --quality-tokens 0")
 
@@ -532,6 +538,7 @@ def main() -> None:
         "max_ppl_delta": args.max_ppl_delta,
         "prefill_full_layer_major": args.prefill_full_layer_major,
         "prefill_approx_moe": args.prefill_approx_moe,
+        "prefill_approx_first_layer": args.prefill_approx_first_layer,
         "results": all_results,
     }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(args.output)

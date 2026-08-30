@@ -335,6 +335,14 @@ def make_optimizer(model: FalsifierMoE, name: str, learning_rate: float,
             "Dion/Muon optimizer requested; install "
             "git+https://github.com/microsoft/dion.git") from error
     groups = model.dion_parameter_groups()
+    # This controller intentionally contains many rectangular matrix shapes
+    # (modality encoders, per-head MLA blocks, and per-expert blocks).  The
+    # official fullgraph optimizer helpers specialize by shape, so their
+    # default limit of eight recompiles is too small even for one valid step.
+    torch._dynamo.config.recompile_limit = max(
+        torch._dynamo.config.recompile_limit, 128)
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        torch._dynamo.config.accumulated_recompile_limit, 1024)
     if name in ("dion3", "dion3-qkclip"):
         return Dion3(groups, lr=learning_rate, fraction=dion_fraction,
                      weight_decay=weight_decay, use_polar_express=False)

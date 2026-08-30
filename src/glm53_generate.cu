@@ -2915,7 +2915,8 @@ public:
     // the next layer so the complete 288-record expert layer stays hot.
     void prefill_prompt_full_layer_major(const std::vector<int> &tokens);
     void prefill(const std::vector<int> &tokens, int position_base, bool capture = false);
-    void force_logits(const std::vector<int> &tokens, int position_base, const char *dump_path);
+    void force_logits(const std::vector<int> &tokens, int position_base, int anchor,
+                      const char *dump_path);
     // MTP speculative decoding surface.
     int mtp_k() const { return mtp_draft_total_; }
     const float *last_avg() const { return last_avg_.get(); }
@@ -4237,7 +4238,7 @@ int Runner::verify_token(int token, int position) {
 // multi-row verifier and dump full-vocabulary logits for apples-to-apples
 // quality comparisons. Record 0 is the already-computed prompt-final logits;
 // record i predicts forced token i under the same forced prefix in every arm.
-void Runner::force_logits(const std::vector<int> &tokens, int position_base,
+void Runner::force_logits(const std::vector<int> &tokens, int position_base, int anchor,
                           const char *dump_path) {
     require(df_ && !tokens.empty(), "target-forced logits require DFlash2 and tokens");
     require(dump_path && *dump_path, "target-forced logits require an output path");
@@ -4248,6 +4249,9 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base,
                 "target-forced token is outside vocabulary");
     std::FILE *dump = std::fopen(dump_path, "wb");
     require(dump, "cannot open target-forced logits dump");
+    const char *draft_path = std::getenv("INSIGNIA_GLM53_FORCE_DF_LOGITS_DUMP");
+    std::FILE *draft_dump = draft_path ? std::fopen(draft_path, "wb") : nullptr;
+    require(!draft_path || draft_dump, "cannot open target-forced DFlash logits dump");
     const int vocab = int(model_.vocab_size());
     std::vector<float> host(size_t(kMaxVerify) * vocab);
     check(cudaMemcpy(host.data(), logits_.get(), size_t(vocab) * sizeof(float),
@@ -4262,6 +4266,14 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base,
     verify_may_rollback_ = false;
     for (size_t consumed = 0; consumed + 1 < tokens.size(); ) {
         const int count = int(std::min<size_t>(verify_k, tokens.size() - 1 - consumed));
+        if (draft_dump) {
+            (void)df_draft(anchor, position_base + int(consumed) - 1);
+            const size_t draft_values =
+                size_t(insignia::glm53::DFlash2Drafter::kDrafts) * vocab;
+            require(std::fwrite(df_logits_host_, sizeof(float), draft_values, draft_dump) ==
+                        draft_values,
+                    "write target-forced DFlash logits");
+        }
         std::vector<int> chunk(tokens.begin() + consumed, tokens.begin() + consumed + count);
         capture_offset_ = 0;
         prefill(chunk, position_base + int(consumed), true);
@@ -4271,11 +4283,14 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base,
         require(std::fwrite(host.data(), sizeof(float), values, dump) == values,
                 "write target-forced logits");
         df_commit(count, position_base + int(consumed));
+        anchor = tokens[consumed + size_t(count) - 1];
         consumed += size_t(count);
     }
     verify_may_rollback_ = true;
     std::fclose(dump);
+    if (draft_dump) std::fclose(draft_dump);
     std::printf("target-forced logits: %zu records -> %s\n", tokens.size(), dump_path);
+    if (draft_path) std::printf("target-forced DFlash logits -> %s\n", draft_path);
 }
 
 void Runner::mhc_multi(std::string_view stem, const float *streams, float *collapsed, int tokens) {
@@ -5614,7 +5629,7 @@ int main(int argc, char **argv) {
         if (const char *forced = std::getenv("INSIGNIA_GLM53_FORCE_TOKENS")) {
             std::vector<int> forced_tokens = parse_token_list(forced);
             require(!forced_tokens.empty(), "target-forced token list is empty");
-            runner.force_logits(forced_tokens, int(tokens.size()),
+            runner.force_logits(forced_tokens, int(tokens.size()), tokens.back(),
                                 std::getenv("INSIGNIA_GLM53_FORCE_LOGITS_DUMP"));
             return 0;
         }

@@ -53,6 +53,7 @@ run() {
       -u INSIGNIA_GLM53_DF_MOE_METRICS \
       "${COMMON[@]}" "$@" \
       INSIGNIA_GLM53_FORCE_LOGITS_DUMP="$OUT/$tag-logits.f32" \
+      INSIGNIA_GLM53_FORCE_DF_LOGITS_DUMP="$OUT/$tag-draft-logits.f32" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 1 "$FP8" \
       > "$OUT/$tag.log" 2>&1
   grep -E '^target-forced logits|^DFlash2 (approximate|adaptive) verify' "$OUT/$tag.log"

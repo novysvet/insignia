@@ -2861,6 +2861,32 @@ public:
                         df_uncertainty_top1_p_, df_uncertainty_top1_drop_,
                         df_uncertainty_guard_k_, df_uncertainty_hold_rounds_);
         }
+        if (const char *encoded = std::getenv("INSIGNIA_GLM53_DF_EXACT_ROUNDS")) {
+            require(dflash2_on_ && df_approx_topm_ > 0,
+                    "DFlash diagnostic exact rounds require approximate DFlash2 verification");
+            const char *cursor = encoded;
+            while (*cursor) {
+                char *end = nullptr;
+                const long round = std::strtol(cursor, &end, 10);
+                require(end != cursor && round >= 0 && round <= 4096,
+                        "DFlash exact-round list contains an invalid round");
+                df_diagnostic_exact_rounds_.push_back(int(round));
+                if (!*end) break;
+                require(*end == ',' && end[1],
+                        "DFlash exact-round list must be comma-separated integers");
+                cursor = end + 1;
+            }
+            std::sort(df_diagnostic_exact_rounds_.begin(),
+                      df_diagnostic_exact_rounds_.end());
+            df_diagnostic_exact_rounds_.erase(
+                std::unique(df_diagnostic_exact_rounds_.begin(),
+                            df_diagnostic_exact_rounds_.end()),
+                df_diagnostic_exact_rounds_.end());
+            std::printf("DFlash2 diagnostic exact rounds:");
+            for (int round : df_diagnostic_exact_rounds_)
+                std::printf(" %d", round);
+            std::printf("\n");
+        }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
         const char *exact_falsifier_trace =
@@ -3439,6 +3465,8 @@ private:
     float df_uncertainty_top1_p_ = 0.0f, df_uncertainty_top1_drop_ = 0.0f;
     int df_uncertainty_guard_k_ = 8, df_uncertainty_hold_rounds_ = 0;
     int df_uncertainty_hold_left_ = 0;
+    uint64_t df_draft_round_ = 0;
+    std::vector<int> df_diagnostic_exact_rounds_;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
     std::array<uint8_t, kMaxVerify> df_logit_guard_k_{};
     uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
@@ -3466,7 +3494,8 @@ private:
     bool nvfp4_experts_ = false;
     bool df_logit_guard_on() const {
         return df_logit_guard_margin_ > 0.0f || df_calibration_guard_js_ > 0.0f ||
-            df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f;
+            df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f ||
+            !df_diagnostic_exact_rounds_.empty();
     }
     void guard_dflash_row(int row, int k) {
         require(row >= 0 && row < kMaxVerify && k >= 1 && k <= 8,
@@ -4467,6 +4496,11 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
           "download DFlash2 hp");
     df_logit_guard_exact_.fill(0);
     df_logit_guard_k_.fill(0);
+    const int draft_round = int(df_draft_round_++);
+    if (std::binary_search(df_diagnostic_exact_rounds_.begin(),
+                           df_diagnostic_exact_rounds_.end(), draft_round))
+        for (int row = 0; row < kMaxVerify; ++row)
+            guard_dflash_row(row, 8);
     if (df_uncertainty_hold_left_ > 0) {
         for (int row = 0; row < kMaxVerify; ++row)
             guard_dflash_row(row, df_uncertainty_guard_k_);

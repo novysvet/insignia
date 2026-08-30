@@ -96,6 +96,17 @@ nll delta (B-A) total +2.0  ppl A 1.1587 -> B 1.1893
         self.assertEqual(candidate["INSIGNIA_GLM53_PREFILL_APPROX_MOE"], "1")
         self.assertEqual(candidate["INSIGNIA_GLM53_PREFILL_APPROX_FIRST_LAYER"], "4")
 
+    def test_cache_route_regret_is_an_explicit_ab(self):
+        args = SimpleNamespace(
+            q8_budget_mb=10240, cache_mb=32768, readers=4,
+            dflash_fp8="/tmp/df", verify_k=4,
+            prefill_full_layer_major=True, prefill_approx_moe=True,
+            prefill_approx_first_layer=0, cache_route_regret=.0005)
+        exact = benchmark.base_environment(args, "exact")
+        candidate = benchmark.base_environment(args, "top6-cache")
+        self.assertNotIn("INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET", exact)
+        self.assertEqual(candidate["INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET"], "0.0005")
+
     def test_candidate_only_report_does_not_require_exact(self):
         result = {
             "ids": [1, 2], "text": "candidate text",

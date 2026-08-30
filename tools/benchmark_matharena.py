@@ -201,6 +201,9 @@ def base_environment(args: argparse.Namespace, policy: str) -> dict[str, str]:
         "INSIGNIA_GLM53_DF_BATCH_VERIFY": "1",
         **POLICIES[policy],
     })
+    if policy == "top6-cache":
+        environment["INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET"] = (
+            f"{getattr(args, 'cache_route_regret', .001):g}")
     # Keep the harness switch a true A/B even when the engine automatically
     # selects full-prompt layer-major scheduling for multi-chunk prompts.
     environment["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"] = (
@@ -414,6 +417,8 @@ def main() -> None:
                         help="apply each non-exact policy's MoE pruning during layer-major prefill")
     parser.add_argument("--prefill-approx-first-layer", type=int, default=0,
                         help="keep target layers below this index exact during approximate prefill")
+    parser.add_argument("--cache-route-regret", type=float, default=.001,
+                        help="maximum cache-aware Top-6 router regret")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--list-only", action="store_true")
     parser.add_argument("--show-problems", action="store_true")
@@ -427,6 +432,8 @@ def main() -> None:
         parser.error("--max-ppl-delta cannot be negative")
     if not 0 <= args.prefill_approx_first_layer < 45:
         parser.error("--prefill-approx-first-layer must be in 0..44")
+    if args.cache_route_regret < 0:
+        parser.error("--cache-route-regret cannot be negative")
     if args.candidate_only and (not args.policy or args.quality_tokens):
         parser.error("--candidate-only requires an explicit --policy and --quality-tokens 0")
 
@@ -539,6 +546,7 @@ def main() -> None:
         "prefill_full_layer_major": args.prefill_full_layer_major,
         "prefill_approx_moe": args.prefill_approx_moe,
         "prefill_approx_first_layer": args.prefill_approx_first_layer,
+        "cache_route_regret": args.cache_route_regret,
         "results": all_results,
     }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(args.output)

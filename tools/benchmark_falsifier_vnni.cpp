@@ -21,18 +21,19 @@
 
 struct Matrix {
     int rows;
+    int logical_cols;
     int cols;
     std::vector<int8_t> weight;
     std::vector<int32_t> correction;
 
     Matrix(int output, int input, std::mt19937 &random)
-        : rows(output), cols(input), weight(static_cast<size_t>(output) * input),
+        : rows(output), logical_cols(input), cols((input + 31) & ~31),
+          weight(static_cast<size_t>(output) * cols, 0),
           correction(output) {
-        if ((input & 31) != 0) throw std::runtime_error("VNNI K must be a multiple of 32");
         std::uniform_int_distribution<int> distribution(-127, 127);
         for (int row = 0; row < rows; ++row) {
             int32_t sum = 0;
-            for (int column = 0; column < cols; ++column) {
+            for (int column = 0; column < logical_cols; ++column) {
                 const int8_t value = static_cast<int8_t>(distribution(random));
                 weight[static_cast<size_t>(row) * cols + column] = value;
                 sum += value;
@@ -42,6 +43,9 @@ struct Matrix {
     }
 
     uint64_t macs() const { return static_cast<uint64_t>(rows) * cols; }
+    uint64_t logical_macs() const {
+        return static_cast<uint64_t>(rows) * logical_cols;
+    }
 };
 
 __attribute__((noinline)) static void vnni_gemv_rows(
@@ -130,6 +134,23 @@ struct ControllerWeights {
         return encoder + 3 * (depth + mla + moe);
     }
 
+    uint64_t event_logical_macs() const {
+        const uint64_t encoder = logit.logical_macs() + hidden.logical_macs()
+            + cache.logical_macs() + router_tail.logical_macs()
+            + 32 * (candidate_a.logical_macs() + candidate_b.logical_macs());
+        const uint64_t depth = depth_q.logical_macs() + depth_k.logical_macs()
+            + depth_v.logical_macs() + depth_out.logical_macs();
+        const uint64_t mla = mla_q.logical_macs() + mla_kv_down.logical_macs()
+            + mla_kv_up.logical_macs() + mla_gate.logical_macs()
+            + mla_out.logical_macs();
+        const uint64_t moe = moe_router.logical_macs() + latent_down.logical_macs()
+            + latent_up.logical_macs() + shared_gate_up.logical_macs()
+            + shared_down.logical_macs()
+            + 2 * (static_cast<uint64_t>(256) * 96
+                   + static_cast<uint64_t>(96) * 128);
+        return encoder + 3 * (depth + mla + moe);
+    }
+
 private:
     // Declared last in source but initialized first by C++ member order is not
     // possible, so use an inline static deterministic generator instead.
@@ -141,16 +162,16 @@ struct Scratch {
     std::vector<int8_t> x64 = std::vector<int8_t>(64);
     std::vector<int8_t> x96 = std::vector<int8_t>(96);
     std::vector<int8_t> x128 = std::vector<int8_t>(128);
-    std::vector<int8_t> x144 = std::vector<int8_t>(144);
+    std::vector<int8_t> x160 = std::vector<int8_t>(160);
     std::vector<int8_t> x192 = std::vector<int8_t>(192);
-    std::vector<int8_t> x208 = std::vector<int8_t>(208);
+    std::vector<int8_t> x224 = std::vector<int8_t>(224);
     std::vector<int8_t> x384 = std::vector<int8_t>(384);
     std::vector<int32_t> output = std::vector<int32_t>(768);
 
     explicit Scratch(int seed) {
         std::mt19937 random(seed);
         std::uniform_int_distribution<int> distribution(-127, 127);
-        for (auto *buffer : {&x32, &x64, &x96, &x128, &x144, &x192, &x208, &x384})
+        for (auto *buffer : {&x32, &x64, &x96, &x128, &x160, &x192, &x224, &x384})
             for (int8_t &value : *buffer) value = static_cast<int8_t>(distribution(random));
     }
 };
@@ -164,11 +185,11 @@ static int32_t scalar_dot(const int8_t *weight, const int8_t *input, int width) 
 static void verify_kernel(const ControllerWeights &weights) {
     Scratch scratch(19);
     std::vector<int32_t> output(weights.logit.rows);
-    gemv(weights.logit, scratch.x208, output);
+    gemv(weights.logit, scratch.x224, output);
     for (int row = 0; row < weights.logit.rows; ++row) {
         const int32_t expected = scalar_dot(
             weights.logit.weight.data() + static_cast<size_t>(row) * weights.logit.cols,
-            scratch.x208.data(), weights.logit.cols);
+            scratch.x224.data(), weights.logit.cols);
         if (output[row] != expected)
             throw std::runtime_error("VPDPBUSD correction mismatch at row " + std::to_string(row));
     }
@@ -176,9 +197,9 @@ static void verify_kernel(const ControllerWeights &weights) {
 
 static uint64_t run_event(const ControllerWeights &w, Scratch &s, int layer, int pass_seed) {
     uint64_t checksum = 0;
-    gemv(w.logit, s.x208, s.output);
+    gemv(w.logit, s.x224, s.output);
     gemv(w.hidden, s.x64, s.output);
-    gemv(w.cache, s.x144, s.output);
+    gemv(w.cache, s.x160, s.output);
     gemv(w.router_tail, s.x32, s.output);
     for (int candidate = 0; candidate < 32; ++candidate) {
         gemv(w.candidate_a, s.x32, s.output);
@@ -264,6 +285,7 @@ int main(int argc, char **argv) {
     (void)measure(weights, threads, 1);
     const Measurement measured = measure(weights, threads, iterations);
     const uint64_t macs_per_event = weights.event_macs();
+    const uint64_t logical_macs_per_event = weights.event_logical_macs();
     const uint64_t events_per_round = static_cast<uint64_t>(threads) * 42;
     const double round_ms = measured.milliseconds / iterations;
     const double total_macs = double(macs_per_event) * events_per_round * iterations;
@@ -274,7 +296,10 @@ int main(int argc, char **argv) {
         << "  \"threads\": " << threads << ",\n"
         << "  \"verify_rows\": " << threads << ",\n"
         << "  \"iterations\": " << iterations << ",\n"
+        << "  \"logical_macs_per_event\": " << logical_macs_per_event << ",\n"
         << "  \"macs_per_event\": " << macs_per_event << ",\n"
+        << "  \"padding_overhead_percent\": "
+        << (100.0 * (double(macs_per_event) / logical_macs_per_event - 1.0)) << ",\n"
         << "  \"macs_per_round\": " << macs_per_event * events_per_round << ",\n"
         << "  \"round_ms\": " << round_ms << ",\n"
         << "  \"layer_group_ms\": " << round_ms / 42.0 << ",\n"

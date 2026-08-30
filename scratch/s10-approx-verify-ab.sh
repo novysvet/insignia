@@ -7,6 +7,7 @@ set -euo pipefail
 PROMPT=${1:-/var/lib/insignia/tracecampaign/prompts/p02.csv}
 GENERATE=${2:-32}
 LABEL=${3:-p02-k4-g32}
+PLAN=${4:-full}
 BIN=/var/tmp/insignia-build/glm53-generate
 MODEL=/var/lib/insignia/glm53-flash-text
 INDEX=/var/lib/insignia/glm53-flash-text.index
@@ -43,12 +44,24 @@ run() {
 }
 
 run exact-a
-run top6 INSIGNIA_GLM53_DF_APPROX_TOPM=6
-run top4-zero INSIGNIA_GLM53_DF_APPROX_TOPM=4
-run top4-renorm INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
-    INSIGNIA_GLM53_DF_APPROX_RENORM=1
+case "$PLAN" in
+  full)
+    run top6 INSIGNIA_GLM53_DF_APPROX_TOPM=6
+    run top4-zero INSIGNIA_GLM53_DF_APPROX_TOPM=4
+    run top4-renorm INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_APPROX_RENORM=1
+    ;;
+  frontier)
+    run top5 INSIGNIA_GLM53_DF_APPROX_TOPM=5
+    run top4-zero INSIGNIA_GLM53_DF_APPROX_TOPM=4
+    ;;
+  *)
+    echo "PLAN must be full or frontier" >&2
+    exit 64
+    ;;
+esac
 run exact-b
 
-printf '%s\n' "$BIN" "$PROMPT" "$GENERATE" > "$OUT/config.txt"
+printf '%s\n' "$BIN" "$PROMPT" "$GENERATE" "$PLAN" > "$OUT/config.txt"
 sha256sum "$BIN" "$PROMPT" > "$OUT/SHA256SUMS"
 echo "RESULTS=$OUT"

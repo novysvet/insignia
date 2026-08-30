@@ -82,6 +82,7 @@ run() {
       -u INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P \
       -u INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP \
       -u INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K \
+      -u INSIGNIA_GLM53_DF_UNCERTAINTY_HOLD_ROUNDS \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
@@ -193,6 +194,18 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P=.446991 \
         INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP=.303715 \
         INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="$guard_k"
+    ;;
+  top4cacheuncertaintyhold8)
+    run top4-cache32-e0010-joint8-up447-ud304-uk8-h2-m050 \
+        INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P=.446991 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP=.303715 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K=8 \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_HOLD_ROUNDS=2 \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.05
     ;;
   top4cachebalancedpacked)
     run top4-cache-balanced-expanded INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
@@ -344,7 +357,7 @@ case "$PLAN" in
     run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
     ;;
   *)
-    echo "unknown PLAN (see case labels in this script; uncertainty plans are top4cacheuncertainty8/6)" >&2
+    echo "unknown PLAN (see case labels in this script; uncertainty plans are top4cacheuncertainty8/6/hold8)" >&2
     exit 64
     ;;
 esac

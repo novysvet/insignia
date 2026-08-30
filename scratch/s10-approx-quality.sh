@@ -67,6 +67,7 @@ run() {
       -u INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P \
       -u INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP \
       -u INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K \
+      -u INSIGNIA_GLM53_DF_UNCERTAINTY_HOLD_ROUNDS \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
@@ -89,7 +90,33 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])-up([0-9]+)-ud([0-9]+)-uk([5-8])$ ]]; then
+  if [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])-up([0-9]+)-ud([0-9]+)-uk([5-8])-h([0-8])-m([0-9]+)$ ]]; then
+    tag=$policy
+    probability=$(awk -v raw="${BASH_REMATCH[5]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    drop=$(awk -v raw="${BASH_REMATCH[6]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    margin=$(awk -v raw="${BASH_REMATCH[9]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[2]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.${BASH_REMATCH[3]}" \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS="${BASH_REMATCH[4]}" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P="$probability" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP="$drop" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="${BASH_REMATCH[7]}" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_HOLD_ROUNDS="${BASH_REMATCH[8]}" \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN="$margin"
+  elif [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])-up([0-9]+)-ud([0-9]+)-uk([5-8])-h([0-8])$ ]]; then
+    tag=$policy
+    probability=$(awk -v raw="${BASH_REMATCH[5]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    drop=$(awk -v raw="${BASH_REMATCH[6]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[2]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.${BASH_REMATCH[3]}" \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS="${BASH_REMATCH[4]}" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P="$probability" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP="$drop" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="${BASH_REMATCH[7]}" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_HOLD_ROUNDS="${BASH_REMATCH[8]}"
+  elif [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])-up([0-9]+)-ud([0-9]+)-uk([5-8])$ ]]; then
     tag=$policy
     probability=$(awk -v raw="${BASH_REMATCH[5]}" 'BEGIN { printf "%.6f", raw / 1000 }')
     drop=$(awk -v raw="${BASH_REMATCH[6]}" 'BEGIN { printf "%.6f", raw / 1000 }')

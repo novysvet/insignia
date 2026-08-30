@@ -2847,13 +2847,19 @@ public:
             if (const char *guard_k =
                     std::getenv("INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K"))
                 df_uncertainty_guard_k_ = std::atoi(guard_k);
+            if (const char *hold =
+                    std::getenv("INSIGNIA_GLM53_DF_UNCERTAINTY_HOLD_ROUNDS"))
+                df_uncertainty_hold_rounds_ = std::atoi(hold);
             require(df_uncertainty_guard_k_ > df_approx_topm_ &&
                         df_uncertainty_guard_k_ <= 8,
                     "DFlash uncertainty guard k must exceed Top-M and be at most 8");
+            require(df_uncertainty_hold_rounds_ >= 0 &&
+                        df_uncertainty_hold_rounds_ <= 8,
+                    "DFlash uncertainty hold must be 0..8 rounds");
             std::printf("DFlash2 distribution guard: p<=%.6f or adjacent p drop>=%.6f; "
-                        "causal-prefix k%d\n",
+                        "causal-prefix k%d, hold %d rounds\n",
                         df_uncertainty_top1_p_, df_uncertainty_top1_drop_,
-                        df_uncertainty_guard_k_);
+                        df_uncertainty_guard_k_, df_uncertainty_hold_rounds_);
         }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
@@ -3431,7 +3437,8 @@ private:
     bool df_logit_guard_prefix_ = true;
     float df_calibration_guard_js_ = 0.0f;
     float df_uncertainty_top1_p_ = 0.0f, df_uncertainty_top1_drop_ = 0.0f;
-    int df_uncertainty_guard_k_ = 8;
+    int df_uncertainty_guard_k_ = 8, df_uncertainty_hold_rounds_ = 0;
+    int df_uncertainty_hold_left_ = 0;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
     std::array<uint8_t, kMaxVerify> df_logit_guard_k_{};
     uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
@@ -4460,6 +4467,11 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
           "download DFlash2 hp");
     df_logit_guard_exact_.fill(0);
     df_logit_guard_k_.fill(0);
+    if (df_uncertainty_hold_left_ > 0) {
+        for (int row = 0; row < kMaxVerify; ++row)
+            guard_dflash_row(row, df_uncertainty_guard_k_);
+        --df_uncertainty_hold_left_;
+    }
     if (df_calibration_guard_js_ > 0.0f) {
         const double js = dflash_calibration_js(df_logits_host_);
         ++df_calibration_guard_rounds_;
@@ -4510,12 +4522,15 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
         if (df_logit_guard_prefix_)
             for (int verify_row = 0; verify_row <= highest_guard; ++verify_row)
                 guard_dflash_row(verify_row, df_uncertainty_guard_k_);
+        if (highest_guard >= 0)
+            df_uncertainty_hold_left_ = std::max(
+                df_uncertainty_hold_left_, df_uncertainty_hold_rounds_);
         if (std::getenv("INSIGNIA_GLM53_DF_DEBUG")) {
             std::fprintf(stderr, "df distribution p");
             for (double probability : top1_probability)
                 std::fprintf(stderr, " %.6f", probability);
-            std::fprintf(stderr, " highest_guard %d k%d\n", highest_guard,
-                         df_uncertainty_guard_k_);
+            std::fprintf(stderr, " highest_guard %d k%d hold_left %d\n", highest_guard,
+                         df_uncertainty_guard_k_, df_uncertainty_hold_left_);
         }
     }
     if (df_logit_guard_margin_ > 0.0f) {

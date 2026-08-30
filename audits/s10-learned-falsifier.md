@@ -355,3 +355,79 @@ bit-identical v2 layout and Gram validation.
 The quality harness now captures a separate feature trace for every
 approximate policy arm. This closes the trajectory mismatch before fitting any
 learned baseline or Falsifier-MoE.
+
+### Live validation
+
+Targeted p02/p10/p12 cache-route captures each produced 1,302 events (42 sparse
+layers x 31 verification rows) and joined without an epoch/layer/row mismatch.
+Comparing p10's old exact-teacher features with its new on-policy features
+showed why the correction is mandatory:
+
+- only 31/1,302 hidden CountSketches remained bit-identical;
+- hidden-sketch cosine mean/p01/min was 0.98243/0.86004/0.77137;
+- relative hidden-sketch L2 median/p95/max was 13.33%/37.37%/68.50%;
+- the baseline top-eight route differed at 811/1,302 events (1,259 expert-ID
+  substitutions), and top-32 candidate overlap fell as low as 43.75%.
+
+## Previous-logit calibration guard
+
+The first compute-rich falsifier arm is
+`INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS=<threshold>`. The engine retains the
+previous accepted target's full logits, compares them with DFlash row zero via
+exact full-vocabulary Jensen-Shannon divergence, and suppresses approximate
+expert routing for the block when risk exceeds the threshold. This spends
+14700KF math to avoid an unsafe bandwidth optimization; it does not fetch any
+additional expert outputs. Accepted target logits add one 620 KiB D2H copy per
+round.
+
+At JS=0.6000 on p12, runtime reproduced the offline first-block value exactly
+(0.656733). It exactified only epoch 1; epochs 2--8 stayed cache-aware. The
+guard retained 955/1,086 (87.9%) of cache substitutions while changing quality:
+
+| metric | cache route | + JS guard | change |
+|---|---:|---:|---:|
+| top-1 agreement | 31/32 | 32/32 | flip removed |
+| mean cosine | 0.991227 | 0.992543 | +0.001316 |
+| mean MSE | 0.1391 | 0.1230 | -11.6% |
+| mean KL | 0.008453 | 0.004430 | -47.6% |
+| mean JS | 0.001960 | 0.001028 | -47.6% |
+| forced-token PPL | 1.0790 | 1.0573 | -2.0% |
+
+The p12 free-generation bracket was storage-noisy (exact controls 624.6 and
+474.2 ms/token). Cache route measured 557.0 ms/token and guarded cache route
+523.7 ms/token, so no decode win is claimed. Draft time increased from 17.9 to
+21.5 ms/speculative round: about 3.6 ms/round or 1.2 ms/token at 2.91 accepted
+tokens/round. The risky first p12 round rejected before target verification, so
+the free-generation guard did not alter that sequence; this is useful evidence
+that the guard pays little but must be validated on prompts where the risky
+block actually verifies.
+
+### Prompt-held-out CPU baseline
+
+`tools/train_falsifier_baseline.py` now builds two causal feature views and
+runs nested prompt-held-out ridge evaluation without sklearn/PyTorch:
+
+- `logit_features`: previous-target/current-DFlash scalars plus three 64-wide
+  vocabulary CountSketches;
+- `full_runtime_features`: the logit view plus on-policy hidden/router/cache
+  aggregates, executed-vs-baseline action features, coarse layer bins, and
+  deterministic route sketches.
+
+The risk target combines MSE, cosine damage, KL, JS, and a high penalty for a
+top-1 flip. With only p02/p10/p12 (93 rows total), the honest result is mixed:
+
+| features | held out | NRMSE / train-constant | Spearman | top-25% risk captured | flip rank |
+|---|---|---:|---:|---:|---:|
+| logits | p02 | 1.001 | 0.208 | 28.8% | - |
+| logits | p10 | 0.988 | 0.116 | 39.2% | - |
+| logits | p12 | 0.997 | 0.256 | 44.0% | 7/31 |
+| full runtime | p02 | 1.019 | 0.093 | 20.6% | - |
+| full runtime | p10 | 0.951 | 0.303 | 39.4% | - |
+| full runtime | p12 | 0.963 | 0.441 | 37.8% | 19/31 |
+
+Previous logits alone rank the one held-out flip inside the top quarter, while
+the much wider runtime view improves continuous ranking on p10/p12 but
+overfits the flip. This is evidence for the previous-logit hypothesis and
+against deploying the 1.8M-parameter Falsifier-MoE from three prompts. The
+pipeline is ready; prompt diversity and on-policy interventions are now the
+binding constraint.

@@ -2887,6 +2887,23 @@ public:
                 std::printf(" %d", round);
             std::printf("\n");
         }
+        if (const char *threshold =
+                std::getenv("INSIGNIA_GLM53_DF_RETRY_TOP1_DROP")) {
+            df_retry_top1_drop_ = std::strtof(threshold, nullptr);
+            require(dflash2_on_ && df_approx_topm_ > 0,
+                    "DFlash post-verify retry requires fixed Top-M DFlash2 verification");
+            require(df_retry_top1_drop_ > 0.0f && df_retry_top1_drop_ < 1.0f,
+                    "DFlash retry target-probability drop must be in (0,1)");
+            require(std::getenv("INSIGNIA_GLM53_DF_BATCH_VERIFY") &&
+                        !std::getenv("INSIGNIA_GLM53_DF_SEQ_VERIFY"),
+                    "DFlash post-verify retry requires forced batch verification");
+            check(cudaHostAlloc(&df_retry_logits_host_,
+                                size_t(kMaxVerify) * model_.vocab_size() * sizeof(float),
+                                cudaHostAllocDefault),
+                  "pin DFlash2 retry target-logit buffer");
+            std::printf("DFlash2 post-verify exact retry: target top-1 probability drop "
+                        ">= %.6f\n", df_retry_top1_drop_);
+        }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
         const char *exact_falsifier_trace =
@@ -3251,7 +3268,7 @@ public:
     std::vector<int> df_draft(int anchor, int position);
     void df_commit(int rows, int pos0) { df_->commit(rows, pos0); }
     void adopt_df_prior_logits(int row) {
-        if (df_calibration_guard_js_ <= 0.0f) return;
+        if (df_calibration_guard_js_ <= 0.0f && df_retry_top1_drop_ <= 0.0f) return;
         require(row >= 0 && row < kMaxVerify, "DFlash prior-logit row is out of range");
         const size_t vocab = model_.vocab_size();
         df_prior_logits_host_.resize(vocab);
@@ -3260,6 +3277,13 @@ public:
                          vocab * sizeof(float), cudaMemcpyDeviceToHost),
               "download accepted DFlash target logits");
     }
+    bool dflash_retry_needed(int rows);
+    void begin_dflash_exact_retry() {
+        for (int row = 0; row < kMaxVerify; ++row)
+            guard_dflash_row(row, 8);
+        df_retry_replay_ = true;
+    }
+    void end_dflash_exact_retry() { df_retry_replay_ = false; }
     // Re-key prev_routing_ on the accepted anchor row of the last multi-row
     // verify: moe_multi stored the chunk's LAST row (a rejected draft
     // position after partial acceptance), which then keyed every
@@ -3465,6 +3489,10 @@ private:
     float df_uncertainty_top1_p_ = 0.0f, df_uncertainty_top1_drop_ = 0.0f;
     int df_uncertainty_guard_k_ = 8, df_uncertainty_hold_rounds_ = 0;
     int df_uncertainty_hold_left_ = 0;
+    float df_retry_top1_drop_ = 0.0f;
+    bool df_retry_replay_ = false;
+    uint64_t df_retry_rounds_ = 0, df_retry_triggered_rounds_ = 0;
+    double df_retry_drop_sum_ = 0.0, df_retry_drop_max_ = 0.0;
     uint64_t df_draft_round_ = 0;
     std::vector<int> df_diagnostic_exact_rounds_;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
@@ -3484,6 +3512,7 @@ private:
     bool falsifier_feature_only_ = false;
     std::vector<float> moe_metrics_expert_, moe_metrics_exact_, moe_metrics_input_;
     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
+    float *df_retry_logits_host_ = nullptr;
     std::unique_ptr<Q8Index> q8_index_;
     std::unique_ptr<Q8Stager> q8_stager_;
     int hidden_ = 0, kda_width_ = 0, kda_heads_ = 0, kda_head_dim_ = 0, f_a_rows_ = 0;
@@ -3495,7 +3524,7 @@ private:
     bool df_logit_guard_on() const {
         return df_logit_guard_margin_ > 0.0f || df_calibration_guard_js_ > 0.0f ||
             df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f ||
-            !df_diagnostic_exact_rounds_.empty();
+            df_retry_top1_drop_ > 0.0f || !df_diagnostic_exact_rounds_.empty();
     }
     void guard_dflash_row(int row, int k) {
         require(row >= 0 && row < kMaxVerify && k >= 1 && k <= 8,
@@ -4453,6 +4482,54 @@ double Runner::dflash_calibration_js(const float *draft) const {
     return js;
 }
 
+// The first-pass verifier has already paid for target logits but has not yet
+// committed recurrent state.  A sharp confidence collapse inside the block is
+// an unusually strong on-policy failure signal.  Spend CPU softmax work and,
+// when it fires, restore the round-start KDA/conv snapshot and execute the
+// identical candidate block once more with all eight experts.
+bool Runner::dflash_retry_needed(int rows) {
+    if (df_retry_top1_drop_ <= 0.0f) return false;
+    require(rows >= 1 && rows <= kMaxVerify && df_retry_logits_host_,
+            "DFlash retry row geometry is invalid");
+    const size_t vocab = model_.vocab_size();
+    require(df_prior_logits_host_.size() == vocab,
+            "DFlash retry has no previous target logits");
+    check(cudaMemcpy(df_retry_logits_host_, verify_logits_.get(),
+                     size_t(rows) * vocab * sizeof(float), cudaMemcpyDeviceToHost),
+          "download DFlash retry target logits");
+    const auto probability = [&](const float *logits) {
+        double maximum = -std::numeric_limits<double>::infinity();
+        for (size_t token = 0; token < vocab; ++token)
+            maximum = std::max(maximum, double(logits[token]));
+        double normalizer = 0.0;
+        for (size_t token = 0; token < vocab; ++token)
+            normalizer += std::exp(double(logits[token]) - maximum);
+        return 1.0 / normalizer;
+    };
+    double previous = probability(df_prior_logits_host_.data());
+    double largest_drop = -std::numeric_limits<double>::infinity();
+    std::array<double, kMaxVerify> row_probability{};
+    for (int row = 0; row < rows; ++row) {
+        const double current = probability(
+            df_retry_logits_host_ + size_t(row) * vocab);
+        row_probability[size_t(row)] = current;
+        largest_drop = std::max(largest_drop, previous - current);
+        previous = current;
+    }
+    ++df_retry_rounds_;
+    df_retry_drop_sum_ += largest_drop;
+    df_retry_drop_max_ = std::max(df_retry_drop_max_, largest_drop);
+    const bool retry = largest_drop >= df_retry_top1_drop_;
+    df_retry_triggered_rounds_ += retry;
+    if (std::getenv("INSIGNIA_GLM53_DF_DEBUG")) {
+        std::fprintf(stderr, "df post-verify target p");
+        for (int row = 0; row < rows; ++row)
+            std::fprintf(stderr, " %.6f", row_probability[size_t(row)]);
+        std::fprintf(stderr, " max_drop %.6f retry %d\n", largest_drop, retry);
+    }
+    return retry;
+}
+
 // DFlash2 draft round: stage [anchor, mask x7] embeds, one block forward,
 // lm_head the 7 draft hiddens through the target's FP8 head, then the host
 // selector walks the top-16 candidate lattice.
@@ -4801,12 +4878,18 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
         std::vector<int> chunk(tokens.begin() + consumed, tokens.begin() + consumed + count);
         capture_offset_ = 0;
         prefill(chunk, position_base + int(consumed), true);
+        if (dflash_retry_needed(count)) {
+            rollback_kda(0, position_base + int(consumed));
+            begin_dflash_exact_retry();
+            prefill(chunk, position_base + int(consumed), true);
+            end_dflash_exact_retry();
+        }
         const size_t values = size_t(count) * vocab;
         check(cudaMemcpy(host.data(), verify_logits_.get(), values * sizeof(float),
                          cudaMemcpyDeviceToHost), "download target-forced logits");
         require(std::fwrite(host.data(), sizeof(float), values, dump) == values,
                 "write target-forced logits");
-        if (df_calibration_guard_js_ > 0.0f) {
+        if (df_calibration_guard_js_ > 0.0f || df_retry_top1_drop_ > 0.0f) {
             df_prior_logits_host_.resize(size_t(vocab));
             std::copy_n(host.data() + size_t(count - 1) * vocab, size_t(vocab),
                         df_prior_logits_host_.data());
@@ -5309,7 +5392,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     std::vector<std::vector<std::pair<int, float>>> selection(tokens);
     // Prompt prefill is not part of the speculative verify trajectory; only
     // widen and emit the fixed records once the KDA replay archive is active.
-    const bool trace_falsifier = falsifier_trace_ != nullptr && kda_archive_;
+    const bool trace_falsifier = falsifier_trace_ != nullptr && kda_archive_ &&
+        !df_retry_replay_;
     const bool widen_router = trace_falsifier || (kda_archive_ && df_cache_route_k_);
     const size_t widened_rows = widen_router ? size_t(tokens) : 0;
     std::vector<std::array<uint16_t, 32>> candidate_experts(widened_rows);
@@ -6793,7 +6877,7 @@ std::vector<std::pair<int, float>> Runner::step(
     std::vector<float> host_logits(model_.vocab_size());
     check(cudaMemcpy(host_logits.data(), logits_.get(), host_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
           "download logits");
-    if (df_calibration_guard_js_ > 0.0f)
+    if (df_calibration_guard_js_ > 0.0f || df_retry_top1_drop_ > 0.0f)
         df_prior_logits_host_ = host_logits;
     if (const char *dump_path = std::getenv("INSIGNIA_GLM53_LOGITS_DUMP")) {
         static std::FILE *dump = nullptr;
@@ -6946,6 +7030,12 @@ std::vector<std::pair<int, float>> Runner::step(
                     (unsigned long long)df_calibration_guard_rounds_,
                     df_calibration_js_sum_ / df_calibration_guard_rounds_,
                     df_calibration_js_max_);
+    if (df_retry_rounds_)
+        std::printf("  DFlash post-verify retried %llu/%llu rounds "
+                    "(target-p drop mean %.6f max %.6f)\n",
+                    (unsigned long long)df_retry_triggered_rounds_,
+                    (unsigned long long)df_retry_rounds_,
+                    df_retry_drop_sum_ / df_retry_rounds_, df_retry_drop_max_);
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",
                     q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8",
@@ -7272,8 +7362,14 @@ int main(int argc, char **argv) {
                     } else {
                         const std::vector<int> verify_candidates(
                             candidates.begin(), candidates.begin() + draft_k);
-                        const std::pair<int, std::vector<int>> verdict =
+                        std::pair<int, std::vector<int>> verdict =
                             runner.verify_round(verify_candidates, position + 1);
+                        if (runner.dflash_retry_needed(draft_k)) {
+                            runner.rollback_kda(0, position + 1);
+                            runner.begin_dflash_exact_retry();
+                            verdict = runner.verify_round(verify_candidates, position + 1);
+                            runner.end_dflash_exact_retry();
+                        }
                         arg = verdict.second;
                         while (matched < draft_k && arg[size_t(matched - 1)] == candidates[size_t(matched)])
                             ++matched;

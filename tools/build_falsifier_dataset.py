@@ -18,9 +18,9 @@ from pathlib import Path
 import numpy as np
 
 
-TRACE_HEADER = struct.Struct("<8sHHIHHHHII32s")
+TRACE_HEADER = struct.Struct("<8sHHIHHHHHHII28s")
 TRACE_MAGIC = b"INSFAL1\0"
-TRACE_VERSION = 1
+TRACE_VERSION = 2
 
 EVENT_DTYPE = np.dtype([
     ("epoch", "<u4"),
@@ -30,17 +30,19 @@ EVENT_DTYPE = np.dtype([
     ("verify_row", "u1"),
     ("exec_k", "u1"),
     ("flags", "<u2"),
-    ("residency", "<u4"),
+    ("candidate_residency", "<u4", (4,)),
     ("expert", "<u2", (8,)),
     ("weight", "<f4", (8,)),
-    ("router_logit", "<f4", (8,)),
-    ("router_choice", "<f4", (8,)),
+    ("candidate_expert", "<u2", (32,)),
+    ("candidate_logit", "<f4", (32,)),
+    ("candidate_choice", "<f4", (32,)),
     ("router_summary", "<f4", (8,)),
     ("hidden_countsketch", "<f4", (64,)),
     ("contribution_gram", "<f4", (36,)),
     ("tail", "<f4", (4,)),
+    ("reserved", "u1", (52,)),
 ])
-assert EVENT_DTYPE.itemsize == 576
+assert EVENT_DTYPE.itemsize == 896
 
 ROW_SCALAR_NAMES = (
     "prior_entropy_norm", "prior_top1_p", "prior_margin",
@@ -68,12 +70,13 @@ def read_trace(path: Path) -> tuple[dict[str, int], np.memmap]:
     if len(raw) != TRACE_HEADER.size:
         raise SystemExit(f"{path}: truncated falsifier header")
     (magic, version, header_bytes, record_bytes, layers, experts, topk,
-     hidden_sketch, hidden, flags, _) = TRACE_HEADER.unpack(raw)
+     candidate_k, hidden_sketch, _, hidden, flags, _) = TRACE_HEADER.unpack(raw)
     if magic != TRACE_MAGIC:
         raise SystemExit(f"{path}: bad falsifier magic {magic!r}")
     if version != TRACE_VERSION or header_bytes != TRACE_HEADER.size:
         raise SystemExit(f"{path}: unsupported falsifier schema v{version}/{header_bytes}")
-    if record_bytes != EVENT_DTYPE.itemsize or topk != 8 or hidden_sketch != 64:
+    if (record_bytes != EVENT_DTYPE.itemsize or topk != 8 or candidate_k != 32 or
+            hidden_sketch != 64):
         raise SystemExit(f"{path}: unsupported falsifier record geometry")
     payload = path.stat().st_size - header_bytes
     if payload < 0 or payload % record_bytes:
@@ -86,6 +89,7 @@ def read_trace(path: Path) -> tuple[dict[str, int], np.memmap]:
         "layers": layers,
         "experts": experts,
         "topk": topk,
+        "candidate_k": candidate_k,
         "hidden": hidden,
         "flags": flags,
     }, events
@@ -190,9 +194,15 @@ def event_derived(events: np.ndarray, epoch_rank: dict[int, int]) -> tuple[np.nd
                 counts[int(expert)] = counts.get(int(expert), 0) + 1
         group_counts[key] = counts
     for index, event in enumerate(events):
-        residency = int(event["residency"])
-        for group in range(4):
-            result[index, group] = ((residency >> (8 * group)) & 0xFF).bit_count() / 8.0
+        candidate_rank = {int(expert): rank
+                          for rank, expert in enumerate(event["candidate_expert"])}
+        missing = [int(expert) for expert in event["expert"] if int(expert) not in candidate_rank]
+        if missing:
+            raise SystemExit(f"baseline experts absent from top-32 candidates: {missing}")
+        for group, mask in enumerate(event["candidate_residency"]):
+            resident = sum((int(mask) >> candidate_rank[int(expert)]) & 1
+                           for expert in event["expert"])
+            result[index, group] = resident / 8.0
         epoch = int(event["epoch"])
         layer = int(event["layer"])
         row = int(event["verify_row"])
@@ -351,7 +361,7 @@ def build(args: argparse.Namespace) -> None:
                          f"{float(np.quantile(relative, 0.99)):.3g}")
 
     metadata = {
-        "schema": "insignia-falsifier-dataset-v1",
+        "schema": "insignia-falsifier-dataset-v2",
         "trace": str(args.trace),
         "prompt_id": args.prompt_id,
         "family": args.family,
@@ -373,13 +383,16 @@ def build(args: argparse.Namespace) -> None:
         args.output,
         metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
         event_meta=np.stack((events["epoch"], events["layer"], events["verify_row"],
-                             events["tokens"], events["flags"], events["residency"],
-                             events["exec_k"]), axis=1).astype(np.int64),
+                             events["tokens"], events["flags"], events["exec_k"]),
+                            axis=1).astype(np.int64),
         event_row_index=event_row_index,
         expert_ids=events["expert"].astype(np.int16),
+        candidate_ids=events["candidate_expert"].astype(np.int16),
+        candidate_logits=events["candidate_logit"].astype(np.float32),
+        candidate_choice=events["candidate_choice"].astype(np.float32),
+        candidate_residency=events["candidate_residency"].astype(np.uint32),
         expert_multiplicity=multiplicity,
-        router_features=np.concatenate((events["weight"], events["router_logit"],
-                                        events["router_choice"], events["router_summary"]),
+        router_features=np.concatenate((events["weight"], events["router_summary"]),
                                        axis=1).astype(np.float32),
         hidden_countsketch=events["hidden_countsketch"].astype(np.float32),
         event_derived=derived,

@@ -35,6 +35,11 @@ def main() -> None:
                     event["exec_k"] = 8
                     event["expert"] = np.arange(8) + row
                     event["weight"] = np.linspace(0.6, 0.025, 8)
+                    event["candidate_expert"] = np.arange(32)
+                    event["candidate_logit"] = np.linspace(4, 1, 32)
+                    event["candidate_choice"] = np.linspace(1, 0, 32)
+                    event["candidate_residency"] = np.asarray(
+                        [0x0000FFFF, 0, 0x00FF00FF, 0], dtype=np.uint32)
                     event["router_summary"] = np.arange(8)
                     diagonal = np.linspace(0.01, 0.08, 8)
                     upper = np.zeros(36, dtype=np.float32)
@@ -47,8 +52,8 @@ def main() -> None:
                     event["contribution_gram"] = upper
                     event["tail"][0] = np.sum(diagonal)
                     cursor += 1
-        header = TRACE_HEADER.pack(b"INSFAL1\0", 1, 64, EVENT_DTYPE.itemsize,
-                                   4, 16, 8, 64, 32, 3, bytes(32))
+        header = TRACE_HEADER.pack(b"INSFAL1\0", 2, 64, EVENT_DTYPE.itemsize,
+                                   4, 64, 8, 32, 64, 0, 32, 3, bytes(28))
         with trace.open("wb") as handle:
             handle.write(header)
             events.tofile(handle)
@@ -82,8 +87,10 @@ def main() -> None:
             gram_rel_tolerance=1e-6,
         ))
         with np.load(output) as dataset:
-            assert dataset["event_meta"].shape == (8, 7)
-            assert dataset["router_features"].shape == (8, 32)
+            assert dataset["event_meta"].shape == (8, 6)
+            assert dataset["router_features"].shape == (8, 16)
+            assert dataset["candidate_ids"].shape == (8, 32)
+            assert dataset["candidate_residency"].shape == (8, 4)
             assert dataset["contribution_gram"].shape == (8, 36)
             assert dataset["row_meta"].shape == (4, 4)
             assert dataset["row_logit_sketch"].shape == (4, 3, 8)

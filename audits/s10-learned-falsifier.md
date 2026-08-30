@@ -63,7 +63,7 @@ Available before a verify round:
 
 Available at sparse layer `l`, before its expert union is staged:
 
-- top-eight expert IDs for every verify row;
+- baseline top-eight and widened top-32 expert IDs for every verify row;
 - raw router logits, sigmoid scores, bias-adjusted choice scores, normalized
   routed weights, gaps, entropy, and cumulative mass;
 - overlap with earlier rows, layers, rounds, predicted routes, and the current
@@ -105,6 +105,26 @@ price of one union member.
 
 The exact Gram matrix, local prefix frontier, and downstream full-logit errors
 are labels. They are never runtime features.
+
+## Cache-aware near-tie substitution
+
+Expert pruning and expert substitution are separate action dimensions. Pruning
+reduces compute and union size by executing fewer than eight baseline experts.
+Substitution retains eight-way compute but replaces a low-ranked baseline
+expert with a top-16/32 near tie that is already resident. The latter can avoid
+a 12.8 MiB record even when quality requires k=8.
+
+The trace schema therefore records top-32 IDs, raw logits, corrected choice
+scores, and four 32-bit residency masks in addition to the baseline top eight.
+The original top-eight partial sort still executes unchanged; widened sorting
+is diagnostics-only and cannot perturb the effective model.
+
+The first substitution controller holds the top six or seven baseline experts
+fixed and lets the joint solver choose the tail under both a learned damage
+bound and actual union-transfer cost. Router-score regret is a feature and a
+weak prior, not a quality label. Alternative-expert teacher labels require
+targeted on-policy interventions because the baseline contribution Gram cannot
+describe an expert that was not executed.
 
 ## Model: Falsifier-MoE v0
 
@@ -296,9 +316,9 @@ strictly better, not merely its average validation loss.
 
 ## Immediate implementation order
 
-1. Emit one fixed-size event record containing router context, residency,
-   hidden CountSketch, and the 36-value contribution Gram label while the exact
-   MoE diagnostic path already has all eight outputs.
+1. Emit one fixed-size event record containing top-32 router context and
+   residency, hidden CountSketch, and the 36-value baseline contribution Gram
+   label while the exact MoE diagnostic path already has all eight outputs.
 2. Assemble event records with target/DFlash logits into prompt-sharded NPZ
    datasets and reject any epoch/row alignment mismatch.
 3. Fit logistic/tree/dense baselines before installing a training stack.
@@ -306,4 +326,3 @@ strictly better, not merely its average validation loss.
 5. Integrate shadow inference and measure overhead.
 6. Add the joint union-aware solver, first for prefix k and then for arbitrary
    subsets if the held-out frontier justifies it.
-

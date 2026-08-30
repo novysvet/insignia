@@ -60,7 +60,8 @@ run() {
   grep -E '^target-forced logits|^DFlash2 (approximate|adaptive) verify' "$OUT/$tag.log"
 }
 
-run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv"
+run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
+    INSIGNIA_GLM53_DF_FALSIFIER_TRACE="$OUT/falsifier-events.bin"
 "$PY" "$REPO/tools/summarize_moe_metrics.py" "$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 

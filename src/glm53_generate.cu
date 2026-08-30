@@ -532,36 +532,38 @@ struct PackedExpertRecordHeader {
     uint32_t escapes[3];
     float globals[3];
     uint8_t codebooks[3][16];
-    uint8_t reserved[48];
+    uint8_t reserved[52];
 };
 static_assert(sizeof(PackedExpertRecordHeader) == 128);
 
 // Exact-teacher trace for the learned DFlash falsifier. The fixed record is
-// nine cache lines and deliberately contains only causal runtime features plus
-// the exact expert-contribution Gram label. Full target/DFlash logits remain
+// fourteen cache lines and deliberately contains only causal runtime features
+// plus the exact expert-contribution Gram label. Full target/DFlash logits remain
 // in their existing raw dumps and are joined offline by (epoch,row).
 struct alignas(64) DfFalsifierTraceHeader {
     char magic[8];
     uint16_t version, header_bytes;
     uint32_t record_bytes;
-    uint16_t layer_count, expert_count, topk, hidden_sketch;
+    uint16_t layer_count, expert_count, topk, candidate_k, hidden_sketch, reserved16;
     uint32_t hidden, flags;
-    uint8_t reserved[32];
+    uint8_t reserved[28];
 };
 static_assert(sizeof(DfFalsifierTraceHeader) == 64);
 
-struct alignas(64) DfFalsifierEventV1 {
+struct alignas(64) DfFalsifierEventV2 {
     uint32_t epoch;
     uint16_t layer;
     uint8_t row, tokens;
     uint8_t verify_row, exec_k;
     uint16_t flags;  // bit 0: MLA layer, bit 1: KDA archive active
-    // Four 8-bit masks: host-ready, host-in-flight, device-resident, pinned.
-    uint32_t residency;
+    // Four 32-bit candidate masks: host-ready, host-in-flight,
+    // device-resident, pinned.
+    std::array<uint32_t, 4> candidate_residency;
     std::array<uint16_t, 8> expert;
     std::array<float, 8> weight;
-    std::array<float, 8> router_logit;
-    std::array<float, 8> router_choice;
+    std::array<uint16_t, 32> candidate_expert;
+    std::array<float, 32> candidate_logit;
+    std::array<float, 32> candidate_choice;
     // raw mean/std/max/second; all-sigmoid sum; selected/all sigmoid mass;
     // biased top1-top2 gap; entropy of the normalized selected weights.
     std::array<float, 8> router_summary;
@@ -571,8 +573,9 @@ struct alignas(64) DfFalsifierEventV1 {
     // exact norm2/hidden, cancellation ratio, exact replay max error,
     // normalized-input norm2/hidden.
     std::array<float, 4> tail;
+    uint8_t reserved[48];
 };
-static_assert(sizeof(DfFalsifierEventV1) == 576);
+static_assert(sizeof(DfFalsifierEventV2) == 896);
 
 // One routed-expert record: 3 projections x (4 MiB nibbles + 512 KiB scales)
 // + 12 B globals, streamed with O_DIRECT into a 4096-aligned pinned window.
@@ -1119,21 +1122,23 @@ public:
     double packed_expand_seconds() const {
         return packed_expand_nanoseconds_.load() * 1.0e-9;
     }
-    uint32_t residency_mask(int layer, const std::array<int, 8> &experts) {
-        uint32_t result = 0;
+    std::array<uint32_t, 4> residency_masks(int layer, const uint16_t *experts,
+                                            int count) {
+        require(count >= 1 && count <= 32, "residency probe count must be 1..32");
+        std::array<uint32_t, 4> result{};
         {
             std::lock_guard<std::mutex> lock(pool_mutex_);
-            for (int slot = 0; slot < 8; ++slot) {
+            for (int slot = 0; slot < count; ++slot) {
                 const auto found = flight_index_.find(route_key(layer, experts[size_t(slot)]));
                 if (found == flight_index_.end()) continue;
                 const WindowState &state = windows_[size_t(found->second)];
-                result |= uint32_t(state.done ? 1u : 1u << 8) << slot;
-                if (state.pinned) result |= uint32_t(1u << 24) << slot;
+                result[size_t(state.done ? 0 : 1)] |= uint32_t(1u) << slot;
+                if (state.pinned) result[3] |= uint32_t(1u) << slot;
             }
         }
-        for (int slot = 0; slot < 8; ++slot)
+        for (int slot = 0; slot < count; ++slot)
             if (device_index_.count(route_key(layer, experts[size_t(slot)])))
-                result |= uint32_t(1u << 16) << slot;
+                result[2] |= uint32_t(1u) << slot;
         return result;
     }
 private:
@@ -2774,19 +2779,20 @@ public:
             require(falsifier_trace_, "cannot open DFlash falsifier trace output");
             DfFalsifierTraceHeader header{};
             std::memcpy(header.magic, "INSFAL1", 7);
-            header.version = 1;
+            header.version = 2;
             header.header_bytes = sizeof(header);
-            header.record_bytes = sizeof(DfFalsifierEventV1);
+            header.record_bytes = sizeof(DfFalsifierEventV2);
             header.layer_count = uint16_t(layer_count);
             header.expert_count = uint16_t(moe_experts_);
             header.topk = uint16_t(moe_topk_);
+            header.candidate_k = 32;
             header.hidden_sketch = 64;
             header.hidden = uint32_t(hidden_);
             header.flags = 3;  // Gram divided by hidden; signed CountSketch scaled.
             require(std::fwrite(&header, sizeof(header), 1, falsifier_trace_) == 1,
                     "write DFlash falsifier trace header");
             std::printf("DFlash falsifier exact-teacher trace: %s (%zu-byte records)\n",
-                        falsifier_trace_path_.c_str(), sizeof(DfFalsifierEventV1));
+                        falsifier_trace_path_.c_str(), sizeof(DfFalsifierEventV2));
         }
 
         streams_a_.reset(size_t(kStreams) * hidden_);
@@ -3109,10 +3115,12 @@ private:
     void moe_multi(int layer, const float *input, float *output, int tokens);
     void report_moe_metrics(
         int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
-        const std::vector<std::array<float, 8>> &selected_logits,
-        const std::vector<std::array<float, 8>> &selected_choice,
+        const std::vector<std::array<uint16_t, 32>> &candidate_experts,
+        const std::vector<std::array<float, 32>> &candidate_logits,
+        const std::vector<std::array<float, 32>> &candidate_choice,
         const std::vector<std::array<float, 8>> &router_summary,
-        const std::vector<uint32_t> &residency, const float *input, int tokens);
+        const std::vector<std::array<uint32_t, 4>> &candidate_residency,
+        const float *input, int tokens);
     void prefill_layer_chunk_exact(int layer, float *in_place, float *scratch,
                                    int count, int position_base, float *dflash_capture);
     const float *device_f32(std::string_view name);
@@ -4636,17 +4644,21 @@ void Runner::mlp_multi(std::string_view stem, const float *input, float *output,
 
 void Runner::report_moe_metrics(
     int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
-    const std::vector<std::array<float, 8>> &selected_logits,
-    const std::vector<std::array<float, 8>> &selected_choice,
+    const std::vector<std::array<uint16_t, 32>> &candidate_experts,
+    const std::vector<std::array<float, 32>> &candidate_logits,
+    const std::vector<std::array<float, 32>> &candidate_choice,
     const std::vector<std::array<float, 8>> &router_summary,
-    const std::vector<uint32_t> &residency, const float *input, int tokens) {
+    const std::vector<std::array<uint32_t, 4>> &candidate_residency,
+    const float *input, int tokens) {
     require((moe_metrics_ || falsifier_trace_) && moe_topk_ == 8,
             "invalid MoE diagnostics state");
     require(selection.size() == size_t(tokens) &&
                 (!falsifier_trace_ ||
-                 (selected_logits.size() == size_t(tokens) &&
-                  selected_choice.size() == size_t(tokens) &&
-                  router_summary.size() == size_t(tokens) && residency.size() == size_t(tokens))),
+                 (candidate_experts.size() == size_t(tokens) &&
+                  candidate_logits.size() == size_t(tokens) &&
+                  candidate_choice.size() == size_t(tokens) &&
+                  router_summary.size() == size_t(tokens) &&
+                  candidate_residency.size() == size_t(tokens))),
             "incomplete MoE diagnostics context");
     const size_t expert_values = size_t(tokens) * moe_topk_ * hidden_;
     const size_t exact_values = size_t(tokens) * hidden_;
@@ -4697,7 +4709,7 @@ void Runner::report_moe_metrics(
         const double exact_cancel = exact_norm > 0.0 ? exact_term_sum / exact_norm : 0.0;
 
         if (falsifier_trace_) {
-            DfFalsifierEventV1 record{};
+            DfFalsifierEventV2 record{};
             record.epoch = verify_epoch_;
             record.layer = uint16_t(layer);
             record.row = uint8_t(row);
@@ -4709,15 +4721,16 @@ void Runner::report_moe_metrics(
             record.exec_k = 8;
             record.flags = uint16_t((is_mla_[size_t(layer)] ? 1u : 0u) |
                                     (kda_archive_ ? 2u : 0u));
-            record.residency = residency[size_t(row)];
+            record.candidate_residency = candidate_residency[size_t(row)];
             for (int slot = 0; slot < moe_topk_; ++slot) {
                 record.expert[size_t(slot)] =
                     uint16_t(selection[size_t(row)][size_t(slot)].first);
                 record.weight[size_t(slot)] =
                     selection[size_t(row)][size_t(slot)].second;
-                record.router_logit[size_t(slot)] = selected_logits[size_t(row)][size_t(slot)];
-                record.router_choice[size_t(slot)] = selected_choice[size_t(row)][size_t(slot)];
             }
+            record.candidate_expert = candidate_experts[size_t(row)];
+            record.candidate_logit = candidate_logits[size_t(row)];
+            record.candidate_choice = candidate_choice[size_t(row)];
             record.router_summary = router_summary[size_t(row)];
 
             const float *hidden = moe_metrics_input_.data() + size_t(row) * hidden_;
@@ -4822,10 +4835,11 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     std::vector<std::vector<std::pair<int, float>>> selection(tokens);
     const bool trace_falsifier = falsifier_trace_ != nullptr;
     const size_t diagnostic_rows = trace_falsifier ? size_t(tokens) : 0;
-    std::vector<std::array<float, 8>> selected_logits(diagnostic_rows);
-    std::vector<std::array<float, 8>> selected_choice(diagnostic_rows);
+    std::vector<std::array<uint16_t, 32>> candidate_experts(diagnostic_rows);
+    std::vector<std::array<float, 32>> candidate_logits(diagnostic_rows);
+    std::vector<std::array<float, 32>> candidate_choice(diagnostic_rows);
     std::vector<std::array<float, 8>> router_summary(diagnostic_rows);
-    std::vector<uint32_t> diagnostics_residency(diagnostic_rows, 0);
+    std::vector<std::array<uint32_t, 4>> candidate_residency(diagnostic_rows);
     for (int token = 0; token < tokens; ++token) {
         const float *row = logits.data() + size_t(token) * experts;
         std::vector<float> scores(experts), choice(experts);
@@ -4857,13 +4871,19 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 }
             }
             float selected_entropy = 0.0f;
-            std::array<int, 8> selected_ids{};
             for (int slot = 0; slot < topk; ++slot) {
-                selected_ids[size_t(slot)] = order[slot];
-                selected_logits[size_t(token)][size_t(slot)] = row[order[slot]];
-                selected_choice[size_t(token)][size_t(slot)] = choice[order[slot]];
                 const float probability = scores[order[slot]] / denominator;
                 selected_entropy -= probability * std::log(std::max(probability, 1.0e-30f));
+            }
+            std::vector<int> candidates(experts);
+            std::iota(candidates.begin(), candidates.end(), 0);
+            std::partial_sort(candidates.begin(), candidates.begin() + 32, candidates.end(),
+                [&](int left, int right) { return choice[left] > choice[right]; });
+            for (int rank = 0; rank < 32; ++rank) {
+                const int expert = candidates[size_t(rank)];
+                candidate_experts[size_t(token)][size_t(rank)] = uint16_t(expert);
+                candidate_logits[size_t(token)][size_t(rank)] = row[expert];
+                candidate_choice[size_t(token)][size_t(rank)] = choice[expert];
             }
             const double raw_mean = raw_sum / experts;
             const double raw_variance =
@@ -4872,8 +4892,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 float(raw_mean), float(std::sqrt(raw_variance)), raw_max, raw_second,
                 float(score_sum), float(denominator / score_sum),
                 choice[order[0]] - choice[order[1]], selected_entropy};
-            diagnostics_residency[size_t(token)] =
-                expert_stager_->residency_mask(layer, selected_ids);
+            candidate_residency[size_t(token)] = expert_stager_->residency_masks(
+                layer, candidate_experts[size_t(token)].data(), 32);
         }
         const int verify_row = capture_offset_ + token;
         const bool logit_guarded = kda_archive_ && df_logit_guard_margin_ > 0.0f &&
@@ -5205,8 +5225,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                     selection[size_t(token)][size_t(pick_slot)].second, hidden_);
             }
         if (ordered_accumulation && (moe_metrics_ || falsifier_trace_))
-            report_moe_metrics(layer, selection, selected_logits, selected_choice,
-                               router_summary, diagnostics_residency, input, tokens);
+            report_moe_metrics(layer, selection, candidate_experts, candidate_logits,
+                               candidate_choice, router_summary, candidate_residency,
+                               input, tokens);
     }
     if (!nvfp4_experts_)
         mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);

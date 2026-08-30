@@ -2774,14 +2774,23 @@ public:
             if (const char *joint =
                     std::getenv("INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS"))
                 df_cache_joint_options_ = std::atoi(joint);
+            if (const char *guard_retain =
+                    std::getenv("INSIGNIA_GLM53_DF_CACHE_GUARD_RETAIN"))
+                df_cache_guard_retain_ = std::atoi(guard_retain);
             require(!df_cache_joint_options_ ||
                         (df_cache_joint_options_ >= 2 && df_cache_joint_options_ <= 8),
                     "joint cache routing options must be 0 or 2..8");
+            require(df_cache_guard_retain_ >= df_cache_route_retain_ &&
+                        df_cache_guard_retain_ <= 8,
+                    "cache guard retain must tighten the base policy and be at most 8");
             std::printf("DFlash2 cache-aware route: top-%d, retain %d, regret %.4f\n",
                         df_cache_route_k_, df_cache_route_retain_, df_cache_route_regret_);
             if (df_cache_joint_options_)
                 std::printf("DFlash2 joint cache route: %d actions/row, exact union search up to k4\n",
                             df_cache_joint_options_);
+            if (df_cache_guard_retain_ != 8)
+                std::printf("DFlash2 cache guard fallback: retain %d\n",
+                            df_cache_guard_retain_);
         }
         if (const char *margin = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN")) {
             df_logit_guard_margin_ = std::strtof(margin, nullptr);
@@ -3365,6 +3374,7 @@ private:
     float df_approx_mass_ = 0.0f;
     int df_approx_min_k_ = 3, df_approx_max_k_ = 8;
     int df_cache_route_k_ = 0, df_cache_route_retain_ = 7;
+    int df_cache_guard_retain_ = 8;
     int df_cache_joint_options_ = 0;
     float df_cache_route_regret_ = 0.0025f;
     uint64_t df_cache_route_rows_ = 0, df_cache_route_changed_ = 0;
@@ -5220,8 +5230,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         const bool logit_guarded = kda_archive_ && df_logit_guard_on() &&
             verify_row >= 0 && verify_row < kMaxVerify &&
             df_logit_guard_exact_[size_t(verify_row)];
+        const int cache_route_retain = logit_guarded
+            ? df_cache_guard_retain_ : df_cache_route_retain_;
         if (kda_archive_ && df_cache_route_k_ && df_cache_route_regret_ > 0.0f &&
-            !logit_guarded && !df_cache_joint_options_) {
+            cache_route_retain < 8 && !df_cache_joint_options_) {
             const auto &candidates = candidate_experts[size_t(token)];
             const auto &residency = candidate_residency[size_t(token)];
             std::array<int, 288> candidate_rank{};
@@ -5255,10 +5267,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             int best_substitutions = 0;
             auto consider = [&](int first_tail, int second_tail) {
                 std::array<int, 8> trial{};
-                for (int slot = 0; slot < df_cache_route_retain_; ++slot)
+                for (int slot = 0; slot < cache_route_retain; ++slot)
                     trial[size_t(slot)] = baseline[size_t(slot)];
-                trial[size_t(df_cache_route_retain_)] = first_tail;
-                if (df_cache_route_retain_ == 6) trial[7] = second_tail;
+                trial[size_t(cache_route_retain)] = first_tail;
+                if (cache_route_retain == 6) trial[7] = second_tail;
                 std::sort(trial.begin(), trial.end(), [&](int left, int right) {
                     return candidate_rank[size_t(left)] < candidate_rank[size_t(right)];
                 });
@@ -5291,11 +5303,11 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             for (int rank = 0; rank < df_cache_route_k_; ++rank) {
                 const int expert = candidates[size_t(rank)];
                 if (std::find(baseline.begin(),
-                              baseline.begin() + df_cache_route_retain_, expert) ==
-                    baseline.begin() + df_cache_route_retain_)
+                              baseline.begin() + cache_route_retain, expert) ==
+                    baseline.begin() + cache_route_retain)
                     pool.push_back(expert);
             }
-            if (df_cache_route_retain_ == 7) {
+            if (cache_route_retain == 7) {
                 for (int expert : pool) consider(expert, -1);
             } else {
                 for (size_t first = 0; first < pool.size(); ++first)
@@ -5392,13 +5404,16 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             const int verify_row = capture_offset_ + token;
             const bool guarded = df_logit_guard_on() && verify_row >= 0 &&
                 verify_row < kMaxVerify && df_logit_guard_exact_[size_t(verify_row)];
+            const int cache_route_retain = guarded
+                ? df_cache_guard_retain_ : df_cache_route_retain_;
             auto append_action = [&](int first_tail, int second_tail) {
                 CacheChoice action;
-                for (int slot = 0; slot < df_cache_route_retain_; ++slot)
+                for (int slot = 0; slot < cache_route_retain; ++slot)
                     action.experts[size_t(slot)] = baseline[size_t(slot)];
-                action.experts[size_t(df_cache_route_retain_)] =
-                    candidates[size_t(first_tail)];
-                if (df_cache_route_retain_ == 6)
+                if (cache_route_retain < 8)
+                    action.experts[size_t(cache_route_retain)] =
+                        candidates[size_t(first_tail)];
+                if (cache_route_retain == 6)
                     action.experts[7] = candidates[size_t(second_tail)];
                 double selected_score = 0.0;
                 for (int expert : action.experts) {
@@ -5410,16 +5425,15 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 action.regret = std::max(0.0, baseline_score - selected_score);
                 action.ratio = score_scale > 0.0 ? action.regret / score_scale : 0.0;
                 if (action.ratio > double(df_cache_route_regret_) + 2.0e-7) return;
-                for (int slot = df_cache_route_retain_; slot < 8; ++slot)
+                for (int slot = cache_route_retain; slot < 8; ++slot)
                     action.substitutions +=
                         std::find(baseline.begin(), baseline.end(),
                                   action.experts[size_t(slot)]) == baseline.end();
                 options[size_t(token)].push_back(action);
             };
-            if (guarded) {
-                append_action(df_cache_route_retain_,
-                              df_cache_route_retain_ == 6 ? 7 : -1);
-            } else if (df_cache_route_retain_ == 7) {
+            if (cache_route_retain == 8) {
+                append_action(-1, -1);
+            } else if (cache_route_retain == 7) {
                 for (int tail = 7; tail < df_cache_route_k_; ++tail)
                     append_action(tail, -1);
             } else {
@@ -6469,7 +6483,9 @@ std::vector<std::pair<int, float>> Runner::step(
                 std::printf(" k%d=%llu", k, (unsigned long long)df_approx_k_hist_[size_t(k)]);
         std::fputc('\n', stdout);
         if (df_logit_guard_rows_)
-            std::printf("  DFlash logit guard exactified %llu/%llu verify rows (%.1f%%)\n",
+            std::printf("  DFlash logit guard %s %llu/%llu verify rows (%.1f%%)\n",
+                        df_cache_route_k_ && df_cache_guard_retain_ < 8
+                            ? "tightened" : "exactified",
                         (unsigned long long)df_logit_guarded_rows_,
                         (unsigned long long)df_logit_guard_rows_,
                         100.0 * df_logit_guarded_rows_ / df_logit_guard_rows_);

@@ -67,6 +67,7 @@ run() {
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
       -u INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS \
+      -u INSIGNIA_GLM53_DF_CACHE_GUARD_RETAIN \
       -u INSIGNIA_GLM53_DF_MOE_METRICS \
       -u INSIGNIA_GLM53_DF_FALSIFIER_TRACE \
       -u INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE \
@@ -84,7 +85,22 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)-joint([2-8])-m([0-9]+)$ ]]; then
+  if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)-joint([2-8])-m([0-9]+)-gr([78])$ ]]; then
+    tag=$policy
+    cache_k=${BASH_REMATCH[1]}
+    retain=${BASH_REMATCH[2]}
+    regret=${BASH_REMATCH[3]}
+    joint=${BASH_REMATCH[4]}
+    margin_raw=${BASH_REMATCH[5]}
+    guard_retain=${BASH_REMATCH[6]}
+    margin=$(awk -v raw="$margin_raw" 'BEGIN { printf "%.6f", raw / 100 }')
+    run "$policy" INSIGNIA_GLM53_DF_CACHE_ROUTE_K="$cache_k" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN="$retain" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.$regret" \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS="$joint" \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN="$margin" \
+        INSIGNIA_GLM53_DF_CACHE_GUARD_RETAIN="$guard_retain"
+  elif [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)-joint([2-8])-m([0-9]+)$ ]]; then
     tag=$policy
     cache_k=${BASH_REMATCH[1]}
     retain=${BASH_REMATCH[2]}

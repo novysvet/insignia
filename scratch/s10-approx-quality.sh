@@ -25,8 +25,9 @@ test -f "$PROMPT"
 test -f "$REFERENCE_LOG"
 test ! -e "$OUT"
 mkdir -p "$OUT"
-sed -n 's/^greedy IDs //p' "$REFERENCE_LOG" | head -n 1 > "$FORCED"
+sed -n 's/^greedy IDs //p' "$REFERENCE_LOG" | head -n 1 | tr ' ' ',' > "$FORCED"
 test -s "$FORCED"
+(( $(awk -F, '{print NF}' "$FORCED") >= 2 ))
 
 COMMON=(
   INSIGNIA_GLM53_Q8_BUDGET_MB=10240

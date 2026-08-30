@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import unittest
+from types import SimpleNamespace
 
 import benchmark_matharena as benchmark
 
@@ -67,6 +68,16 @@ nll delta (B-A) total +2.0  ppl A 1.1587 -> B 1.1893
         self.assertIsNone(benchmark.first_divergence([1, 2], [1, 2]))
         self.assertEqual(benchmark.first_divergence([1, 2], [1, 3]), 2)
         self.assertEqual(benchmark.first_divergence([1], [1, 2]), 2)
+
+    def test_prefill_scheduler_is_an_explicit_ab(self):
+        common = dict(q8_budget_mb=10240, cache_mb=32768, readers=4,
+                      dflash_fp8="/tmp/df", verify_k=4)
+        chunked = benchmark.base_environment(
+            SimpleNamespace(**common, prefill_full_layer_major=False), "exact")
+        layer_major = benchmark.base_environment(
+            SimpleNamespace(**common, prefill_full_layer_major=True), "exact")
+        self.assertEqual(chunked["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"], "0")
+        self.assertEqual(layer_major["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"], "1")
 
 
 if __name__ == "__main__":

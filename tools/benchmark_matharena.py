@@ -201,9 +201,10 @@ def base_environment(args: argparse.Namespace, policy: str) -> dict[str, str]:
         "INSIGNIA_GLM53_DF_BATCH_VERIFY": "1",
         **POLICIES[policy],
     })
-    environment.pop("INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR", None)
-    if args.prefill_full_layer_major:
-        environment["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"] = "1"
+    # Keep the harness switch a true A/B even when the engine automatically
+    # selects full-prompt layer-major scheduling for multi-chunk prompts.
+    environment["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"] = (
+        "1" if args.prefill_full_layer_major else "0")
     return environment
 
 

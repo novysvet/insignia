@@ -7094,7 +7094,8 @@ int main(int argc, char **argv) {
     if (argc < 3 || argc > 7) {
         std::fprintf(stderr,
             "usage: %s MODEL_ROOT MODEL.index [TOKENS=154820] [LAYERS=0(all)] [GENERATE=1] [8BIT_PREFIX]\n"
-            "  INSIGNIA_GLM53_MTP=K enables K-token MTP speculative decode (greedy-exact)\n",
+            "  INSIGNIA_GLM53_MTP=K enables K-token MTP speculative decode (greedy-exact)\n"
+            "  INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR=0|1 overrides automatic multi-chunk prefill\n",
             argv[0]);
         return 64;
     }
@@ -7116,13 +7117,19 @@ int main(int argc, char **argv) {
 
         const auto begin = std::chrono::steady_clock::now();
         std::vector<std::pair<int, float>> top;
-        // Prompt tokens run layer-major in chunks so each weight streams once
-        // per chunk; the final token keeps the per-token path that emits
-        // logits.
+        // A single <=128-row chunk already stays layer-major on device. Longer
+        // prompts default to the full-prompt scheduler: spilling residuals
+        // between layers is vastly cheaper than rereading the sparse experts
+        // for every chunk. The final token keeps the per-token logits path.
         if (tokens.size() > 1) {
             const size_t prefill_count = tokens.size() - 1;
             const char *full_lm = std::getenv("INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR");
-            if (full_lm && std::atoi(full_lm)) {
+            const bool full_lm_on = full_lm ? std::atoi(full_lm) != 0 :
+                prefill_count > size_t(Runner::kMaxChunk());
+            if (full_lm_on) {
+                std::printf("prefill scheduler: full-prompt layer-major (%s)\n",
+                            full_lm ? "forced" : "auto multi-chunk");
+                std::fflush(stdout);
                 std::vector<int> prompt(tokens.begin(), tokens.end() - 1);
                 runner.prefill_prompt_full_layer_major(prompt);
             } else {

@@ -52,8 +52,13 @@ run() {
   local tag=$1
   shift
   local trace=()
+  local seam=()
   if [[ $tag != exact ]]; then
     trace=(INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE="$OUT/$tag-features.bin")
+  fi
+  if [[ -n ${INSIGNIA_GLM53_FALSIFIER_SEAM_ALL:-} ]]; then
+    seam=(INSIGNIA_GLM53_SEAM_DUMP="$OUT/$tag-seam.bin"
+          INSIGNIA_GLM53_SEAM_LAYER=-1)
   fi
   echo "=== $tag ==="
   env -u INSIGNIA_GLM53_DF_APPROX_TOPM \
@@ -78,7 +83,7 @@ run() {
       -u INSIGNIA_GLM53_DF_MOE_METRICS \
       -u INSIGNIA_GLM53_DF_FALSIFIER_TRACE \
       -u INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE \
-      "${COMMON[@]}" "${trace[@]}" "$@" \
+      "${COMMON[@]}" "${trace[@]}" "${seam[@]}" "$@" \
       INSIGNIA_GLM53_FORCE_LOGITS_DUMP="$OUT/$tag-logits.f32" \
       INSIGNIA_GLM53_FORCE_DF_LOGITS_DUMP="$OUT/$tag-draft-logits.f32" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 1 "$FP8" \

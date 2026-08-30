@@ -3424,7 +3424,8 @@ private:
     bool layer_dump_probed_ = false;
     std::vector<float> layer_dump_host_;
     // Sub-operation seam dump for parity bisection: INSIGNIA_GLM53_SEAM_DUMP
-    // names the file, INSIGNIA_GLM53_SEAM_LAYER the layer to trace (default 0).
+    // names the file, INSIGNIA_GLM53_SEAM_LAYER the layer to trace (default 0,
+    // -1 traces every layer).
     // Record: i32[4] {token_index, layer, tag, count} + count f32 values.
     // 1 attn-norm  2 attn-out  3 streams after attn mix  4 ffn-norm
     // 5 ffn-out    6 streams after ffn mix.
@@ -3458,7 +3459,7 @@ private:
                     seam_layer_ = std::atoi(layer_arg);
             }
         }
-        if (!seam_dump_ || layer != seam_layer_) return;
+        if (!seam_dump_ || (seam_layer_ >= 0 && layer != seam_layer_)) return;
         seam_host_.assign(size_t(count), 0.0f);
         check(cudaMemcpy(seam_host_.data(), device, size_t(count) * sizeof(float),
                          cudaMemcpyDeviceToHost), "download seam");
@@ -6448,6 +6449,9 @@ void Runner::prefill_layer_chunk_exact(int layer, float *in_place, float *scratc
     // Two mHC swaps deliberately return the result to the caller's in-place
     // buffer. The full-prompt scheduler depends on this exact ownership rule.
     require(streams == in_place, "prefill layer changed residual-buffer parity");
+    if (kda_archive_)
+        seam(layer, df_retry_replay_ ? 17 : 16, streams,
+             count * kStreams * hidden_);
 
     if (dflash_capture)
         for (int token = 0; token < count; ++token)

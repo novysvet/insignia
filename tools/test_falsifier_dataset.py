@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from analyze_falsifier_candidates import analyze
 from build_falsifier_dataset import EVENT_DTYPE, TRACE_HEADER, build, repair_legacy_zero_epochs
 
 
@@ -100,6 +101,9 @@ def main() -> None:
             assert dataset["row_logit_sketch"].shape == (4, 3, 8)
             assert int(np.sum(dataset["row_labels"][:, 6])) == 1
             assert tuple(dataset["row_top1"][2]) == (1, 2)
+        ceiling = analyze(output, [16], [7], [0.01])
+        assert len(ceiling["points"]) == 1
+        assert ceiling["points"][0]["layer_groups"] == 4
         print("falsifier dataset synthetic test: PASS")
 
 

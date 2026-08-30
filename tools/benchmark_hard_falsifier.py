@@ -72,8 +72,8 @@ POLICY_ENV = (
 def chat_prompt(problem: str) -> str:
     return (
         "[gMASK]<sop><|system|>Reasoning Effort: Max"
-        "<|user|>Solve this problem rigorously. Show the essential reasoning "
-        "and end with \\boxed{answer}.\n\n"
+        "<|user|>Solve this problem rigorously. Do not narrate false starts. "
+        "Give a concise proof in at most 140 words and end with \\boxed{answer}.\n\n"
         + problem.strip()
         + "\n<|assistant|><think>"
     )
@@ -194,7 +194,7 @@ def run_policy(args: argparse.Namespace, prompt_file: pathlib.Path, tokenizer: T
 
 
 def write_report(path: pathlib.Path, case: dict[str, Any], policies: list[str],
-                 results: dict[str, dict[str, Any]]) -> None:
+                 results: dict[str, dict[str, Any]], tokenizer: Tokenizer) -> None:
     exact = results["exact"]
     lines = [
         f"# Hard-prompt falsifier differential: MATH-500 row {case['_row']}", "",
@@ -215,6 +215,22 @@ def write_report(path: pathlib.Path, case: dict[str, Any], policies: list[str],
             f"{1000.0 / result['decode_ms_per_token']:.3f} | "
             f"{result['accepted_per_round']:.2f} |"
         )
+    for name in policies:
+        if name == "exact":
+            continue
+        divergence = first_divergence(exact["ids"], results[name]["ids"])
+        if divergence is None:
+            continue
+        begin = max(0, divergence - 13)
+        stop = min(len(exact["ids"]), divergence + 12)
+        lines += [
+            "", f"## {name} first-divergence context", "",
+            f"Generated token {divergence}; decoded token window {begin + 1}..{stop}.", "",
+            "**Exact:**", "", "```text",
+            tokenizer.decode(exact["ids"][begin:stop], skip_special_tokens=False), "```",
+            "", f"**{name}:**", "", "```text",
+            tokenizer.decode(results[name]["ids"][begin:stop], skip_special_tokens=False), "```",
+        ]
     for name in policies:
         lines += ["", f"## {name} output", "", "```text", results[name]["text"], "```"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -290,7 +306,7 @@ def main() -> None:
             if name != "exact" and first_divergence(results["exact"]["ids"],
                                                       results[name]["ids"]) is not None:
                 any_divergence = True
-        write_report(case_dir / "report.md", case, policies, results)
+        write_report(case_dir / "report.md", case, policies, results, tokenizer)
         all_results.append({
             "row": row_index,
             "difficulty": difficulty(case),

@@ -367,7 +367,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     config = FalsifierMoEConfig()
-    paths = expand_paths(args.data)
+    data_patterns = [value for group in args.data for value in group]
+    paths = expand_paths(data_patterns)
     shards = [PromptShard(path, config.trajectory_horizons) for path in paths]
     summary = summarize(shards, config)
     if not args.smoke and summary.on_policy_rows < args.minimum_rows:
@@ -462,7 +463,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", action="append")
+    parser.add_argument("--data", action="append", nargs="+")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
@@ -485,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     if not args.data:
-        args.data = ["scratch/falsifier-data-20260830/*.npz"]
+        args.data = [["scratch/falsifier-data-20260830/*.npz"]]
     if args.sequence_length < 16 or args.sequence_length % 16:
         parser.error("--sequence-length must be a multiple of 16")
     if not 0.0 < args.validation_fraction < 1.0:

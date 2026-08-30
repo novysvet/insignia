@@ -53,6 +53,17 @@ COMMON=(
   INSIGNIA_GLM53_DF_ADAPTIVE_K=0
   INSIGNIA_GLM53_DF_BATCH_VERIFY=1
 )
+PLAN_ENV=()
+if [[ $PLAN == packedslots ]]; then
+  PLAN_ENV=(
+    INSIGNIA_GLM53_PACKED_EXPERTS=/var/lib/insignia/glm53-experts-nvfp4x-v2.igx
+    INSIGNIA_GLM53_PACKED_V2=1
+    INSIGNIA_GLM53_PACKED_KERNEL=2
+    INSIGNIA_GLM53_F3=1
+    INSIGNIA_GLM53_TIER_O1=1
+    INSIGNIA_GLM53_TIER_SLRU=1
+  )
+fi
 
 run() {
   local tag=$1
@@ -67,7 +78,8 @@ run() {
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
-      "${COMMON[@]}" "$@" \
+      -u INSIGNIA_GLM53_DEVICE_PACKED_SCALES \
+      "${COMMON[@]}" "${PLAN_ENV[@]}" "$@" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 "$GENERATE" "$FP8" \
       > "$OUT/$tag.log" 2>&1
   grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O|^  DFlash (approximate k|expert union|logit guard|cache route)' \
@@ -109,8 +121,11 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
         INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025
     ;;
+  packedslots)
+    run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
+    ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, or cache" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, or packedslots" >&2
     exit 64
     ;;
 esac

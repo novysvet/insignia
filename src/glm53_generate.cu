@@ -6419,12 +6419,17 @@ void Runner::prefill_layer_chunk_exact(int layer, float *in_place, float *scratc
 
     mhc_multi(base + "hc_attn", streams, c_collapsed_, count);
     rms(base + "input_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
+    const int retry_seam_bias = df_retry_replay_ ? 10 : 0;
+    if (kda_archive_)
+        seam(layer, 11 + retry_seam_bias, c_normalized_, count * hidden_);
     if (early_multi_route_on_ && is_sparse_[size_t(layer)])
         early_route_multi(layer, c_normalized_, count);
     if (is_mla_[layer])
         mla_multi(layer, c_normalized_, c_attn_, count, position_base);
     else
         kda_multi(layer, c_normalized_, c_attn_, count, position_base);
+    if (kda_archive_)
+        seam(layer, 12 + retry_seam_bias, c_attn_, count * hidden_);
     for (int token = 0; token < count; ++token)
         check(insignia::glm53::mhc_mix(streams + size_t(token) * kStreams * hidden_,
             c_attn_.get() + size_t(token) * hidden_, c_post_.get() + size_t(token) * 4,
@@ -6432,13 +6437,20 @@ void Runner::prefill_layer_chunk_exact(int layer, float *in_place, float *scratc
             next_streams + size_t(token) * kStreams * hidden_, hidden_),
             "attention mHC mix (prefill)");
     std::swap(streams, next_streams);
+    if (kda_archive_)
+        seam(layer, 13 + retry_seam_bias, streams,
+             count * kStreams * hidden_);
 
     mhc_multi(base + "hc_ffn", streams, c_collapsed_, count);
     rms(base + "post_attention_layernorm.weight", c_collapsed_, c_normalized_, count, hidden_);
+    if (kda_archive_)
+        seam(layer, 14 + retry_seam_bias, c_normalized_, count * hidden_);
     if (is_sparse_[layer])
         moe_multi(layer, c_normalized_, c_ffn_, count);
     else
         mlp_multi(base + "mlp.", c_normalized_, c_ffn_, count, dense_intermediate_);
+    if (kda_archive_)
+        seam(layer, 15 + retry_seam_bias, c_ffn_, count * hidden_);
     for (int token = 0; token < count; ++token)
         check(insignia::glm53::mhc_mix(streams + size_t(token) * kStreams * hidden_,
             c_ffn_.get() + size_t(token) * hidden_, c_post_.get() + size_t(token) * 4,
@@ -6450,7 +6462,7 @@ void Runner::prefill_layer_chunk_exact(int layer, float *in_place, float *scratc
     // buffer. The full-prompt scheduler depends on this exact ownership rule.
     require(streams == in_place, "prefill layer changed residual-buffer parity");
     if (kda_archive_)
-        seam(layer, df_retry_replay_ ? 17 : 16, streams,
+        seam(layer, 16 + retry_seam_bias, streams,
              count * kStreams * hidden_);
 
     if (dflash_capture)

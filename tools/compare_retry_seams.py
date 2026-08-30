@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Locate the first layer where an exact retry diverges from one-pass exact.
+"""Locate the first layer/phase where exact retry diverges from one-pass exact.
 
-Prefill seam tag 16 is an ordinary verifier pass and tag 17 is the exact
-second pass after rollback.  A tag-17 pass is paired with the most recent
-tag-16 logical block, then compared with the same block in the exact run.
+Ordinary prefill seams use tags 11..16; an exact second pass after rollback
+uses 21..26.  A replay pass is paired with the preceding ordinary logical
+block, then compared with the same block in the one-pass exact run.
 """
 
 from __future__ import annotations
@@ -22,12 +22,14 @@ HEADER = struct.Struct("<4i")
 
 @dataclass
 class Pass:
-    tag: int
-    layers: list[np.ndarray]
+    replay: bool
+    records: dict[tuple[int, int], np.ndarray]
 
 
 def load(path: Path) -> list[Pass]:
-    records: list[tuple[int, int, np.ndarray]] = []
+    passes: list[Pass] = []
+    current: Pass | None = None
+    maximum_layer = -1
     with path.open("rb") as source:
         while header := source.read(HEADER.size):
             if len(header) != HEADER.size:
@@ -36,35 +38,56 @@ def load(path: Path) -> list[Pass]:
             payload = source.read(count * 4)
             if len(payload) != count * 4:
                 raise SystemExit(f"{path}: partial seam payload")
-            if tag in (16, 17):
-                records.append((layer, tag, np.frombuffer(payload, dtype="<f4").copy()))
-    passes: list[Pass] = []
-    for layer, tag, payload in records:
-        if layer == 0:
-            passes.append(Pass(tag, []))
-        if not passes or passes[-1].tag != tag or layer != len(passes[-1].layers):
-            raise SystemExit(f"{path}: non-contiguous layer sequence at layer {layer}/tag {tag}")
-        passes[-1].layers.append(payload)
-    if any(len(item.layers) != 45 for item in passes):
-        raise SystemExit(f"{path}: incomplete 45-layer verifier pass")
+            if not (11 <= tag <= 16 or 21 <= tag <= 26):
+                continue
+            replay = tag >= 21
+            phase = tag - 10 if replay else tag
+            new_pass = (current is None or current.replay != replay or
+                        (phase == 11 and layer <= maximum_layer))
+            if new_pass:
+                current = Pass(replay, {})
+                passes.append(current)
+                maximum_layer = -1
+            key = (layer, phase)
+            if key in current.records:
+                raise SystemExit(f"{path}: duplicate seam layer {layer}/phase {phase}")
+            current.records[key] = np.frombuffer(payload, dtype="<f4").copy()
+            maximum_layer = max(maximum_layer, layer)
+    for item in passes:
+        phases = {phase for _, phase in item.records}
+        if phases != set(range(11, 17)):
+            raise SystemExit(f"{path}: incomplete verifier seam phases {sorted(phases)}")
     return passes
 
 
 def compare(reference: Pass, retry: Pass, block: int) -> None:
-    for layer, (exact, replay) in enumerate(zip(reference.layers, retry.layers, strict=True)):
+    names = {
+        11: "attention input norm", 12: "attention output",
+        13: "post-attention streams", 14: "FFN input norm",
+        15: "FFN output", 16: "post-FFN streams",
+    }
+    if reference.records.keys() != retry.records.keys():
+        raise SystemExit(f"block {block}: seam key mismatch")
+    for layer, phase in sorted(reference.records):
+        exact = reference.records[(layer, phase)]
+        replay = retry.records[(layer, phase)]
         if exact.shape != replay.shape:
-            raise SystemExit(f"block {block} layer {layer}: shape mismatch")
+            raise SystemExit(f"block {block} layer {layer} phase {phase}: shape mismatch")
         if np.array_equal(exact, replay):
             continue
-        delta = replay.astype(np.float64) - exact.astype(np.float64)
-        denominator = math.sqrt(float(np.dot(exact, exact)) * float(np.dot(replay, replay)))
-        cosine = float(np.dot(exact, replay) / denominator) if denominator else 1.0
-        print(f"block={block} first_divergent_layer={layer} "
+        exact64 = exact.astype(np.float64)
+        replay64 = replay.astype(np.float64)
+        delta = replay64 - exact64
+        denominator = math.sqrt(float(np.dot(exact64, exact64)) *
+                                float(np.dot(replay64, replay64)))
+        cosine = float(np.dot(exact64, replay64) / denominator) if denominator else 1.0
+        print(f"block={block} first_divergent_layer={layer} phase={phase} "
+              f"({names[phase]}) "
               f"max_abs={float(np.max(np.abs(delta))):.9g} "
               f"rms={math.sqrt(float(np.mean(delta * delta))):.9g} "
               f"cos={cosine:.9f}")
         return
-    print(f"block={block} retry is bit-identical through layer 44")
+    print(f"block={block} retry is bit-identical through every recorded seam")
 
 
 def main() -> None:
@@ -72,22 +95,20 @@ def main() -> None:
     parser.add_argument("exact", type=Path)
     parser.add_argument("retry", type=Path)
     args = parser.parse_args()
-    exact = [item for item in load(args.exact) if item.tag == 16]
+    exact = [item for item in load(args.exact) if not item.replay]
     retry_passes = load(args.retry)
     logical = -1
     compared = 0
     for item in retry_passes:
-        if item.tag == 16:
+        if not item.replay:
             logical += 1
-        elif item.tag == 17:
+        else:
             if logical < 0 or logical >= len(exact):
                 raise SystemExit("retry pass has no matching exact logical block")
             compare(exact[logical], item, logical)
             compared += 1
-        else:
-            raise SystemExit(f"unexpected prefill seam tag {item.tag}")
     if not compared:
-        raise SystemExit("retry trace contains no tag-17 exact replay")
+        raise SystemExit("retry trace contains no exact replay seams")
 
 
 if __name__ == "__main__":

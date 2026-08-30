@@ -18,12 +18,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 constexpr int kWidth = 192;
@@ -46,11 +48,12 @@ struct Matrix {
     std::vector<int8_t> weight;
     std::vector<int32_t> correction;
     std::vector<float> scale;
+    std::vector<float> bias;
 
     Matrix(int output, int input, std::mt19937 &random)
         : rows(output), logical_cols(input), cols((input + 31) & ~31),
           weight(static_cast<size_t>(output) * cols, 0), correction(output),
-          scale(output) {
+          scale(output), bias(output, 0.0f) {
         std::uniform_int_distribution<int> quantized(-127, 127);
         std::uniform_real_distribution<float> scales(0.0015f, 0.0035f);
         for (int row = 0; row < rows; ++row) {
@@ -84,53 +87,6 @@ __attribute__((noinline)) static void vnni_rows(
         return _mm_cvtsi128_si32(sum);
     };
     int row = 0;
-    for (; row + 8 <= rows; row += 8) {
-        __m256i accumulator0 = _mm256_setzero_si256();
-        __m256i accumulator1 = _mm256_setzero_si256();
-        __m256i accumulator2 = _mm256_setzero_si256();
-        __m256i accumulator3 = _mm256_setzero_si256();
-        __m256i accumulator4 = _mm256_setzero_si256();
-        __m256i accumulator5 = _mm256_setzero_si256();
-        __m256i accumulator6 = _mm256_setzero_si256();
-        __m256i accumulator7 = _mm256_setzero_si256();
-        const int8_t *row0 = weight + static_cast<size_t>(row) * cols;
-        const int8_t *row1 = row0 + cols;
-        const int8_t *row2 = row1 + cols;
-        const int8_t *row3 = row2 + cols;
-        const int8_t *row4 = row3 + cols;
-        const int8_t *row5 = row4 + cols;
-        const int8_t *row6 = row5 + cols;
-        const int8_t *row7 = row6 + cols;
-        for (int column = 0; column < cols; column += 32) {
-            const __m256i signed_input = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i *>(input + column));
-            const __m256i unsigned_input = _mm256_xor_si256(signed_input, flip);
-            accumulator0 = _mm256_dpbusd_epi32(accumulator0, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row0 + column)));
-            accumulator1 = _mm256_dpbusd_epi32(accumulator1, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row1 + column)));
-            accumulator2 = _mm256_dpbusd_epi32(accumulator2, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row2 + column)));
-            accumulator3 = _mm256_dpbusd_epi32(accumulator3, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row3 + column)));
-            accumulator4 = _mm256_dpbusd_epi32(accumulator4, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row4 + column)));
-            accumulator5 = _mm256_dpbusd_epi32(accumulator5, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row5 + column)));
-            accumulator6 = _mm256_dpbusd_epi32(accumulator6, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row6 + column)));
-            accumulator7 = _mm256_dpbusd_epi32(accumulator7, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row7 + column)));
-        }
-        output[row] = horizontal_sum(accumulator0) - correction[row];
-        output[row + 1] = horizontal_sum(accumulator1) - correction[row + 1];
-        output[row + 2] = horizontal_sum(accumulator2) - correction[row + 2];
-        output[row + 3] = horizontal_sum(accumulator3) - correction[row + 3];
-        output[row + 4] = horizontal_sum(accumulator4) - correction[row + 4];
-        output[row + 5] = horizontal_sum(accumulator5) - correction[row + 5];
-        output[row + 6] = horizontal_sum(accumulator6) - correction[row + 6];
-        output[row + 7] = horizontal_sum(accumulator7) - correction[row + 7];
-    }
     for (; row + 4 <= rows; row += 4) {
         __m256i accumulator0 = _mm256_setzero_si256();
         __m256i accumulator1 = _mm256_setzero_si256();
@@ -209,7 +165,7 @@ static void linear_quantized(const Matrix &matrix, const int8_t *input,
               matrix.cols, input, accumulator);
     for (int row = 0; row < matrix.rows; ++row)
         output[row] = static_cast<float>(accumulator[row])
-            * input_scale * matrix.scale[row];
+            * input_scale * matrix.scale[row] + matrix.bias[row];
 }
 
 static void expert_linear_quantized(
@@ -221,7 +177,40 @@ static void expert_linear_quantized(
               accumulator);
     for (int output_row = 0; output_row < expert_rows; ++output_row)
         output[output_row] = static_cast<float>(accumulator[output_row])
-            * input_scale * pool.scale[row + output_row];
+            * input_scale * pool.scale[row + output_row]
+            + pool.bias[row + output_row];
+}
+
+#pragma pack(push, 1)
+struct VnniFileHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t matrix_count;
+    uint64_t manifest_checksum;
+    uint8_t reserved[40];
+};
+
+struct VnniMatrixHeader {
+    char name[32];
+    uint32_t rows;
+    uint32_t logical_cols;
+    uint32_t padded_cols;
+    uint32_t reserved;
+    uint64_t payload_bytes;
+    uint64_t payload_checksum;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(VnniFileHeader) == 64);
+static_assert(sizeof(VnniMatrixHeader) == 64);
+
+static uint64_t fnv1a(const uint8_t *data, size_t bytes) {
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < bytes; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 struct Weights {
@@ -258,8 +247,14 @@ struct Weights {
     // dequantization; V stays output-row major for the final projection.
     std::array<float, kHeads * kLatent * kHeadDim> absorbed_k{};
     std::array<float, kHeads * kHeadDim * kLatent> absorbed_v{};
+    bool synthetic = true;
+    uint64_t manifest_checksum = 0;
 
     Weights() {
+        rebuild_absorbed();
+    }
+
+    void rebuild_absorbed() {
         for (int head = 0; head < kHeads; ++head)
             for (int d = 0; d < kHeadDim; ++d)
                 for (int latent = 0; latent < kLatent; ++latent) {
@@ -274,6 +269,86 @@ struct Weights {
                             static_cast<size_t>(value_row) * mla_kv_up.cols + latent])
                           * mla_kv_up.scale[value_row];
                 }
+    }
+
+    void load(const std::string &path) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) throw std::runtime_error("cannot open VNNI weights: " + path);
+        VnniFileHeader header{};
+        file.read(reinterpret_cast<char *>(&header), sizeof(header));
+        if (!file || std::memcmp(header.magic, "IFVNNI1\0", 8) != 0
+            || header.version != 1)
+            throw std::runtime_error("invalid Falsifier VNNI file header");
+        std::array<std::pair<const char *, Matrix *>, 24> matrices{{
+            {"encoder.logit", &logit},
+            {"encoder.hidden", &hidden},
+            {"encoder.cache", &cache},
+            {"encoder.router_tail", &router_tail},
+            {"encoder.candidate_a", &candidate_a},
+            {"encoder.candidate_b", &candidate_b},
+            {"cell.depth_q", &depth_q},
+            {"cell.depth_k", &depth_k},
+            {"cell.depth_v", &depth_v},
+            {"cell.depth_out", &depth_out},
+            {"cell.mhc_dynamic", &mhc_dynamic},
+            {"cell.mla_q", &mla_q},
+            {"cell.mla_kv_down", &mla_kv_down},
+            {"cell.mla_kv_up", &mla_kv_up},
+            {"cell.mla_gate", &mla_gate},
+            {"cell.mla_out", &mla_out},
+            {"cell.moe_router", &moe_router},
+            {"cell.latent_down", &latent_down},
+            {"cell.latent_up", &latent_up},
+            {"cell.shared_gate_up", &shared_gate_up},
+            {"cell.shared_down", &shared_down},
+            {"cell.expert_gate_up", &expert_gate_up},
+            {"cell.expert_down", &expert_down},
+            {"heads", &heads},
+        }};
+        if (header.matrix_count != matrices.size())
+            throw std::runtime_error("VNNI matrix-count mismatch");
+        uint64_t combined = 0;
+        for (auto [expected_name, matrix] : matrices) {
+            VnniMatrixHeader matrix_header{};
+            file.read(reinterpret_cast<char *>(&matrix_header), sizeof(matrix_header));
+            const std::string actual_name(
+                matrix_header.name,
+                std::find(matrix_header.name, matrix_header.name + 32, '\0'));
+            const uint64_t expected_payload = static_cast<uint64_t>(matrix->rows)
+                * matrix->cols + static_cast<uint64_t>(matrix->rows) * 12;
+            if (!file || actual_name != expected_name
+                || matrix_header.rows != static_cast<uint32_t>(matrix->rows)
+                || matrix_header.logical_cols != static_cast<uint32_t>(matrix->logical_cols)
+                || matrix_header.padded_cols != static_cast<uint32_t>(matrix->cols)
+                || matrix_header.payload_bytes != expected_payload)
+                throw std::runtime_error("VNNI matrix metadata mismatch: "
+                                         + std::string(expected_name));
+            std::vector<uint8_t> payload(static_cast<size_t>(expected_payload));
+            file.read(reinterpret_cast<char *>(payload.data()), payload.size());
+            if (!file || fnv1a(payload.data(), payload.size())
+                    != matrix_header.payload_checksum)
+                throw std::runtime_error("VNNI payload checksum mismatch: "
+                                         + std::string(expected_name));
+            size_t offset = 0;
+            const size_t weight_bytes = static_cast<size_t>(matrix->rows) * matrix->cols;
+            std::memcpy(matrix->weight.data(), payload.data(), weight_bytes);
+            offset += weight_bytes;
+            const size_t vector_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
+            std::memcpy(matrix->correction.data(), payload.data() + offset, vector_bytes);
+            offset += vector_bytes;
+            std::memcpy(matrix->scale.data(), payload.data() + offset, vector_bytes);
+            offset += vector_bytes;
+            std::memcpy(matrix->bias.data(), payload.data() + offset, vector_bytes);
+            const uint64_t padding = (64 - (expected_payload & 63)) & 63;
+            file.seekg(static_cast<std::streamoff>(padding), std::ios::cur);
+            combined = (combined << 1) | (combined >> 63);
+            combined ^= matrix_header.payload_checksum;
+        }
+        if (!file || combined != header.manifest_checksum)
+            throw std::runtime_error("VNNI manifest checksum mismatch");
+        synthetic = false;
+        manifest_checksum = combined;
+        rebuild_absorbed();
     }
 
     uint64_t event_macs(bool logical) const {
@@ -728,10 +803,12 @@ int main(int argc, char **argv) {
     const int iterations = argc > 2 ? std::stoi(argv[2]) : 20;
     if (threads < 1 || threads > 8 || iterations < 1)
         throw std::runtime_error(
-            "usage: benchmark_falsifier_vnni_pipeline [verify_rows 1..8] [iterations]");
+            "usage: benchmark_falsifier_vnni_pipeline [verify_rows 1..8] "
+            "[iterations] [weights.ifvnni]");
     if (!__builtin_cpu_supports("avxvnni"))
         throw std::runtime_error("Raptor Lake AVX-VNNI is unavailable");
     Weights weights;
+    if (argc > 3) weights.load(argv[3]);
     verify_kernel(weights);
     (void)measure(weights, threads, 1);
     const Measurement measured = measure(weights, threads, iterations);
@@ -741,7 +818,8 @@ int main(int argc, char **argv) {
     std::cout
         << "{\n"
         << "  \"schema\": \"insignia-falsifier-vnni-pipeline-v1\",\n"
-        << "  \"synthetic_weights\": true,\n"
+        << "  \"synthetic_weights\": " << (weights.synthetic ? "true" : "false") << ",\n"
+        << "  \"weight_manifest_checksum\": " << weights.manifest_checksum << ",\n"
         << "  \"verify_rows\": " << threads << ",\n"
         << "  \"iterations\": " << iterations << ",\n"
         << "  \"logical_matrix_macs_per_event\": " << weights.event_macs(true) << ",\n"

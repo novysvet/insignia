@@ -106,7 +106,8 @@ def raw_features(row_meta: np.ndarray, approximate_path: Path, draft_path: Path,
     draft = draft.reshape((-1, draft_rows, vocab))
     count = len(row_meta)
     pair_prefixes = ("prior_previous", "prior_current_draft",
-                     "draft_adjacent", "draft_from_row0")
+                     "draft_adjacent", "draft_from_row0", "target_previous",
+                     "target_current_draft")
     result = {
         f"{prefix}_{suffix}": np.zeros(count, dtype=np.float64)
         for prefix in pair_prefixes
@@ -114,7 +115,9 @@ def raw_features(row_meta: np.ndarray, approximate_path: Path, draft_path: Path,
     }
     for name in ("prior_entropy_delta", "prior_top1_p_drop", "prior_margin_drop",
                  "draft_entropy_delta", "draft_top1_p_drop", "draft_margin_drop",
-                 "calibration_js_delta"):
+                 "calibration_js_delta", "target_entropy_norm", "target_top1_p",
+                 "target_margin", "target_entropy_delta", "target_top1_p_drop",
+                 "target_margin_drop"):
         result[name] = np.zeros(count, dtype=np.float64)
 
     by_block: dict[int, list[int]] = defaultdict(list)
@@ -138,8 +141,14 @@ def raw_features(row_meta: np.ndarray, approximate_path: Path, draft_path: Path,
         calibration = js(prior_probability, draft_probabilities[0])
         for index in indices:
             row = int(row_meta[index, 2])
+            record = int(row_meta[index, 3])
             current = min(row + 1, draft_rows - 1)
             adjacent = max(0, current - 1)
+            target_raw = approximate[record]
+            target_probability, target_stats = probabilities(target_raw)
+            previous_target_raw = approximate[max(0, record - 1)]
+            previous_target_probability, previous_target_stats = probabilities(
+                previous_target_raw)
             add_pair_features(result, "prior_previous", prior_raw, prior_probability,
                               prior_stats, previous_raw, previous_probability,
                               previous_stats, index)
@@ -152,6 +161,13 @@ def raw_features(row_meta: np.ndarray, approximate_path: Path, draft_path: Path,
                               draft_stats[current], index)
             add_pair_features(result, "draft_from_row0", draft[block, 0],
                               draft_probabilities[0], draft_stats[0],
+                              draft[block, current], draft_probabilities[current],
+                              draft_stats[current], index)
+            add_pair_features(result, "target_previous", previous_target_raw,
+                              previous_target_probability, previous_target_stats,
+                              target_raw, target_probability, target_stats, index)
+            add_pair_features(result, "target_current_draft", target_raw,
+                              target_probability, target_stats,
                               draft[block, current], draft_probabilities[current],
                               draft_stats[current], index)
             result["prior_entropy_delta"][index] = (
@@ -167,6 +183,15 @@ def raw_features(row_meta: np.ndarray, approximate_path: Path, draft_path: Path,
             result["draft_margin_drop"][index] = (
                 draft_stats[adjacent]["margin"] - draft_stats[current]["margin"])
             result["calibration_js_delta"][index] = calibration - previous_calibration
+            result["target_entropy_norm"][index] = target_stats["entropy_norm"]
+            result["target_top1_p"][index] = target_stats["top1_p"]
+            result["target_margin"][index] = target_stats["margin"]
+            result["target_entropy_delta"][index] = (
+                target_stats["entropy_norm"] - previous_target_stats["entropy_norm"])
+            result["target_top1_p_drop"][index] = (
+                previous_target_stats["top1_p"] - target_stats["top1_p"])
+            result["target_margin_drop"][index] = (
+                previous_target_stats["margin"] - target_stats["margin"])
         previous_calibration = calibration
     return result
 

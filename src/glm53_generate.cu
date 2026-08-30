@@ -2580,8 +2580,8 @@ public:
         }
         if (const char *topm = std::getenv("INSIGNIA_GLM53_DF_APPROX_TOPM")) {
             const int requested = std::atoi(topm);
-            require(requested == 0 || (requested >= 2 && requested <= 7),
-                    "INSIGNIA_GLM53_DF_APPROX_TOPM must be 0 or 2..7");
+            require(requested == 0 || (requested >= 1 && requested <= 7),
+                    "INSIGNIA_GLM53_DF_APPROX_TOPM must be 0 or 1..7");
             require(requested == 0 || dflash2_on_,
                     "INSIGNIA_GLM53_DF_APPROX_TOPM requires DFlash2");
             df_approx_topm_ = requested;
@@ -2592,6 +2592,8 @@ public:
         if (df_approx_topm_)
             std::printf("DFlash2 approximate verify: top-%d, retained weights %s\n",
                         df_approx_topm_, df_approx_renorm_ ? "renormalized" : "unchanged");
+        if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
+            moe_metrics_path_ = path;
         forced_sequential_verify_ =
             dflash2_on_ && std::getenv("INSIGNIA_GLM53_DF_SEQ_VERIFY") != nullptr;
         // Dense layer -> KDA archive row (recurrent-state replay indexing).
@@ -2669,6 +2671,17 @@ public:
                     host_cache = uint64_t(std::max(0, std::atoi(budget))) << 20;
                 expert_stager_ = std::make_unique<ExpertStager>(model_, host_cache);
             }
+        }
+        if (!moe_metrics_path_.empty()) {
+            require(dflash2_on_, "INSIGNIA_GLM53_DF_MOE_METRICS requires DFlash2");
+            require(!df_approx_topm_,
+                    "MoE metrics must run on the exact top-8 verification path");
+            require(nvfp4_experts_, "MoE metrics require retained NVFP4 expert outputs");
+            moe_metrics_ = std::fopen(moe_metrics_path_.c_str(), "w");
+            require(moe_metrics_, "cannot open DFlash MoE metrics output");
+            std::fprintf(moe_metrics_,
+                "epoch,layer,row,topm,semantics,mse,rel_l2,cosine,max_abs,"
+                "norm_ratio,retained_mass,exact_cancel,approx_cancel,replay_max_abs\n");
         }
 
         streams_a_.reset(size_t(kStreams) * hidden_);
@@ -2883,6 +2896,7 @@ public:
     // the next layer so the complete 288-record expert layer stays hot.
     void prefill_prompt_full_layer_major(const std::vector<int> &tokens);
     void prefill(const std::vector<int> &tokens, int position_base, bool capture = false);
+    void force_logits(const std::vector<int> &tokens, int position_base, const char *dump_path);
     // MTP speculative decoding surface.
     int mtp_k() const { return mtp_draft_total_; }
     const float *last_avg() const { return last_avg_.get(); }
@@ -2987,6 +3001,9 @@ private:
     void mla_multi(int layer, const float *input, float *output, int tokens, int position_base);
     void mlp_multi(std::string_view stem, const float *input, float *output, int tokens, int intermediate);
     void moe_multi(int layer, const float *input, float *output, int tokens);
+    void report_moe_metrics(
+        int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
+        int tokens);
     void prefill_layer_chunk_exact(int layer, float *in_place, float *scratch,
                                    int count, int position_base, float *dflash_capture);
     const float *device_f32(std::string_view name);
@@ -3068,6 +3085,9 @@ private:
     bool dflash2_on_ = false;
     int df_approx_topm_ = 0;
     bool df_approx_renorm_ = false;
+    std::string moe_metrics_path_;
+    FILE *moe_metrics_ = nullptr;
+    std::vector<float> moe_metrics_expert_, moe_metrics_exact_;
     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
     std::unique_ptr<Q8Index> q8_index_;
     std::unique_ptr<Q8Stager> q8_stager_;
@@ -4189,6 +4209,51 @@ int Runner::verify_token(int token, int position) {
     return arg;
 }
 
+// Teacher-force one fixed token stream through the exact or approximate
+// multi-row verifier and dump full-vocabulary logits for apples-to-apples
+// quality comparisons. Record 0 is the already-computed prompt-final logits;
+// record i predicts forced token i under the same forced prefix in every arm.
+void Runner::force_logits(const std::vector<int> &tokens, int position_base,
+                          const char *dump_path) {
+    require(df_ && !tokens.empty(), "target-forced logits require DFlash2 and tokens");
+    require(dump_path && *dump_path, "target-forced logits require an output path");
+    require(position_base + int(tokens.size()) <= kMaxContext(),
+            "target-forced stream exceeds context");
+    for (int token : tokens)
+        require(token >= 0 && token < int(model_.vocab_size()),
+                "target-forced token is outside vocabulary");
+    std::FILE *dump = std::fopen(dump_path, "wb");
+    require(dump, "cannot open target-forced logits dump");
+    const int vocab = int(model_.vocab_size());
+    std::vector<float> host(size_t(kMaxVerify) * vocab);
+    check(cudaMemcpy(host.data(), logits_.get(), size_t(vocab) * sizeof(float),
+                     cudaMemcpyDeviceToHost), "download prompt-final forced logits");
+    require(std::fwrite(host.data(), sizeof(float), size_t(vocab), dump) == size_t(vocab),
+            "write prompt-final forced logits");
+
+    const int verify_k = [] {
+        const char *value = std::getenv("INSIGNIA_GLM53_DF_VERIFY_K");
+        return std::clamp(value ? std::atoi(value) : 4, 1, kMaxVerify);
+    }();
+    verify_may_rollback_ = false;
+    for (size_t consumed = 0; consumed + 1 < tokens.size(); ) {
+        const int count = int(std::min<size_t>(verify_k, tokens.size() - 1 - consumed));
+        std::vector<int> chunk(tokens.begin() + consumed, tokens.begin() + consumed + count);
+        capture_offset_ = 0;
+        prefill(chunk, position_base + int(consumed), true);
+        const size_t values = size_t(count) * vocab;
+        check(cudaMemcpy(host.data(), verify_logits_.get(), values * sizeof(float),
+                         cudaMemcpyDeviceToHost), "download target-forced logits");
+        require(std::fwrite(host.data(), sizeof(float), values, dump) == values,
+                "write target-forced logits");
+        df_commit(count, position_base + int(consumed));
+        consumed += size_t(count);
+    }
+    verify_may_rollback_ = true;
+    std::fclose(dump);
+    std::printf("target-forced logits: %zu records -> %s\n", tokens.size(), dump_path);
+}
+
 void Runner::mhc_multi(std::string_view stem, const float *streams, float *collapsed, int tokens) {
     const float *base = device_f32(std::string(stem) + "_base");
     const float *scale = device_f32(std::string(stem) + "_scale");
@@ -4405,6 +4470,93 @@ void Runner::mlp_multi(std::string_view stem, const float *input, float *output,
     linear_multi(std::string(stem) + "up_proj.weight", input, c_up_, tokens, intermediate, hidden_);
     launch_clamped_swiglu(c_gateu_, c_up_, c_act_, tokens * intermediate);
     linear_multi(std::string(stem) + "down_proj.weight", c_act_, output, tokens, hidden_, intermediate);
+}
+
+void Runner::report_moe_metrics(
+    int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
+    int tokens) {
+    require(moe_metrics_ && moe_topk_ == 8, "invalid MoE metrics state");
+    const size_t expert_values = size_t(tokens) * moe_topk_ * hidden_;
+    const size_t exact_values = size_t(tokens) * hidden_;
+    moe_metrics_expert_.resize(expert_values);
+    moe_metrics_exact_.resize(exact_values);
+    check(cudaMemcpy(moe_metrics_expert_.data(), c_expert_out_.get(),
+                     expert_values * sizeof(float), cudaMemcpyDeviceToHost),
+          "download MoE expert contributions");
+    check(cudaMemcpy(moe_metrics_exact_.data(), c_routed_.get(),
+                     exact_values * sizeof(float), cudaMemcpyDeviceToHost),
+          "download exact routed output");
+
+    for (int row = 0; row < tokens; ++row) {
+        const float *expert = moe_metrics_expert_.data() +
+            size_t(row) * moe_topk_ * hidden_;
+        const float *exact = moe_metrics_exact_.data() + size_t(row) * hidden_;
+        std::array<double, 8> term_norm{};
+        float original_sum = 0.0f;
+        for (int slot = 0; slot < moe_topk_; ++slot) {
+            const float weight = selection[size_t(row)][size_t(slot)].second;
+            original_sum += weight;
+            double norm2 = 0.0;
+            for (int column = 0; column < hidden_; ++column) {
+                const double value = double(weight) *
+                    expert[size_t(slot) * hidden_ + size_t(column)];
+                norm2 += value * value;
+            }
+            term_norm[size_t(slot)] = std::sqrt(norm2);
+        }
+        double exact_norm2 = 0.0, exact_term_sum = 0.0, replay_max = 0.0;
+        for (double norm : term_norm) exact_term_sum += norm;
+        for (int column = 0; column < hidden_; ++column) {
+            const double value = exact[column];
+            exact_norm2 += value * value;
+            float replay = 0.0f;
+            for (int slot = 0; slot < moe_topk_; ++slot)
+                replay = std::fmaf(selection[size_t(row)][size_t(slot)].second,
+                                   expert[size_t(slot) * hidden_ + size_t(column)], replay);
+            replay_max = std::max(replay_max, std::fabs(double(replay) - value));
+        }
+        const double exact_norm = std::sqrt(exact_norm2);
+        const double exact_cancel = exact_norm > 0.0 ? exact_term_sum / exact_norm : 0.0;
+
+        float retained_sum = 0.0f;
+        double retained_term_sum = 0.0;
+        for (int topm = 1; topm < moe_topk_; ++topm) {
+            retained_sum += selection[size_t(row)][size_t(topm - 1)].second;
+            retained_term_sum += term_norm[size_t(topm - 1)];
+            for (int renorm = 0; renorm <= 1; ++renorm) {
+                const float weight_scale = renorm ? original_sum / retained_sum : 1.0f;
+                double error2 = 0.0, dot = 0.0, approx_norm2 = 0.0, max_abs = 0.0;
+                for (int column = 0; column < hidden_; ++column) {
+                    float approximation = 0.0f;
+                    for (int slot = 0; slot < topm; ++slot) {
+                        float weight = selection[size_t(row)][size_t(slot)].second;
+                        weight *= weight_scale;
+                        approximation = std::fmaf(
+                            weight, expert[size_t(slot) * hidden_ + size_t(column)], approximation);
+                    }
+                    const double approximate = approximation;
+                    const double reference = exact[column];
+                    const double difference = approximate - reference;
+                    error2 += difference * difference;
+                    dot += approximate * reference;
+                    approx_norm2 += approximate * approximate;
+                    max_abs = std::max(max_abs, std::fabs(difference));
+                }
+                const double approx_norm = std::sqrt(approx_norm2);
+                const double cosine = exact_norm > 0.0 && approx_norm > 0.0
+                    ? std::clamp(dot / (exact_norm * approx_norm), -1.0, 1.0) : 0.0;
+                const double approx_cancel = approx_norm > 0.0
+                    ? retained_term_sum * std::fabs(double(weight_scale)) / approx_norm : 0.0;
+                std::fprintf(moe_metrics_,
+                    "%u,%d,%d,%d,%s,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                    verify_epoch_, layer, row, topm, renorm ? "renorm" : "zero",
+                    error2 / hidden_, exact_norm2 > 0.0 ? std::sqrt(error2 / exact_norm2) : 0.0,
+                    cosine, max_abs, exact_norm > 0.0 ? approx_norm / exact_norm : 0.0,
+                    retained_sum / original_sum, exact_cancel, approx_cancel, replay_max);
+            }
+        }
+    }
+    std::fflush(moe_metrics_);
 }
 
 // Router scores for the whole chunk download once; each distinct expert's
@@ -4716,6 +4868,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         (size_t(token) * topk + size_t(pick_slot)) * hidden_,
                                     selection[size_t(token)][size_t(pick_slot)].second, hidden_);
             }
+        if (ordered_accumulation && moe_metrics_)
+            report_moe_metrics(layer, selection, tokens);
     }
     if (!nvfp4_experts_)
         mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);
@@ -5300,6 +5454,31 @@ std::vector<std::pair<int, float>> Runner::step(
     return top;
 }
 
+std::vector<int> parse_token_list(std::string encoded) {
+    if (!encoded.empty() && encoded[0] == '@') {
+        std::FILE *file = std::fopen(encoded.c_str() + 1, "r");
+        require(file, "cannot open token file");
+        std::vector<char> payload;
+        char chunk[65536];
+        size_t read = 0;
+        while ((read = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+            payload.insert(payload.end(), chunk, chunk + read);
+        std::fclose(file);
+        encoded.assign(payload.begin(), payload.end());
+        while (!encoded.empty() && std::isspace(static_cast<unsigned char>(encoded.back())))
+            encoded.pop_back();
+    }
+    std::vector<int> tokens;
+    size_t begin = 0;
+    while (begin < encoded.size()) {
+        const size_t comma = encoded.find(',', begin);
+        tokens.push_back(std::stoi(encoded.substr(begin, comma - begin)));
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    return tokens;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -5317,28 +5496,7 @@ int main(int argc, char **argv) {
                 "GLM-5.3 runner is deliberately compiled only for sm_89");
         // Prompt tokens: a literal CSV, or "@file" to read the CSV from a
         // file (long contexts do not fit any command line).
-        std::string encoded = argc >= 4 ? argv[3] : "154820";
-        if (!encoded.empty() && encoded[0] == '@') {
-            std::FILE *prompt_file = std::fopen(encoded.c_str() + 1, "r");
-            require(prompt_file, "cannot open prompt file");
-            std::vector<char> payload;
-            char chunk[65536];
-            size_t read = 0;
-            while ((read = std::fread(chunk, 1, sizeof(chunk), prompt_file)) > 0)
-                payload.insert(payload.end(), chunk, chunk + read);
-            std::fclose(prompt_file);
-            encoded.assign(payload.begin(), payload.end());
-            while (!encoded.empty() && std::isspace(static_cast<unsigned char>(encoded.back())))
-                encoded.pop_back();
-        }
-        std::vector<int> tokens;
-        size_t begin_token = 0;
-        while (begin_token < encoded.size()) {
-            const size_t comma = encoded.find(',', begin_token);
-            tokens.push_back(std::stoi(encoded.substr(begin_token, comma - begin_token)));
-            if (comma == std::string::npos) break;
-            begin_token = comma + 1;
-        }
+        std::vector<int> tokens = parse_token_list(argc >= 4 ? argv[3] : "154820");
         require(!tokens.empty() && tokens.size() <= kMaxContext(), "token list exceeds the context limit");
         const int layers_argc = argc >= 5 ? std::atoi(argv[4]) : 0;
         const int generate = argc >= 6 ? std::atoi(argv[5]) : 1;
@@ -5372,6 +5530,13 @@ int main(int argc, char **argv) {
         }
         top = runner.step(tokens.back(), int(tokens.size()) - 1, layers, true);
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+        if (const char *forced = std::getenv("INSIGNIA_GLM53_FORCE_TOKENS")) {
+            std::vector<int> forced_tokens = parse_token_list(forced);
+            require(!forced_tokens.empty(), "target-forced token list is empty");
+            runner.force_logits(forced_tokens, int(tokens.size()),
+                                std::getenv("INSIGNIA_GLM53_FORCE_LOGITS_DUMP"));
+            return 0;
+        }
         if (!top.empty()) {
             std::vector<int> generated;
             generated.reserve(generate);

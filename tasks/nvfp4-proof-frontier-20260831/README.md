@@ -71,6 +71,29 @@ the 180 GiB model store, private traces, or access to an SSH host.
 8. [Twelve-token/s feasibility certificate](08-twelve-tps-certificate.md) - give
    a rigorous constructive certificate or impossibility bound for the target.
 
+## Advanced research assignments
+
+These are deliberately harder than the first wave. They couple numerical
+analysis, online control, information theory, and machine scheduling; a useful
+negative theorem is an acceptable result.
+
+9. [Discontinuous router-cascade certificate](09-router-cascade-certificate.md)
+   - turn local approximation error into a non-vacuous 42-router risk bound.
+10. [Certified partial expert execution](10-certified-partial-execution.md) -
+    decide when remaining expert work provably cannot change a route or token.
+11. [Cache/speculation semi-Markov control](11-cache-speculation-control.md) -
+    solve adaptive draft length and two-tier caching under policy feedback.
+12. [On-policy tiny-MoE falsifier](12-on-policy-tiny-moe-falsifier.md) - train a
+    compute-heavy selector with a finite-sample selective-risk guarantee.
+13. [Cross-expert rate-distortion code](13-cross-expert-rate-distortion.md) -
+    exploit structure shared by 288 experts without assuming it exists.
+14. [Dual-SSD deadline scheduler](14-dual-ssd-deadline-scheduler.md) - jointly
+    place, replicate, and dispatch routed records across unequal drives.
+15. [MoE red-blue pebble bound](15-moe-io-pebble-bound.md) - prove the minimum
+    traffic of exact layer-major prefill with finite sidecar memory.
+16. [Floating-point equivalence certificate](16-fp-equivalence-certificate.md)
+    - mechanically certify bit-exact CUDA reduction rewrites.
+
 ## Submission contract for every assignment
 
 A complete response contains:

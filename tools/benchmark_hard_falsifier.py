@@ -31,6 +31,12 @@ PROMPT_RE = re.compile(r"(?P<tokens>\d+)-token prompt (?P<seconds>[0-9.]+) s")
 
 POLICIES: dict[str, dict[str, str]] = {
     "exact": {},
+    "top6": {
+        "INSIGNIA_GLM53_DF_APPROX_TOPM": "6",
+    },
+    "top5": {
+        "INSIGNIA_GLM53_DF_APPROX_TOPM": "5",
+    },
     "top4-cache": {
         "INSIGNIA_GLM53_DF_APPROX_TOPM": "4",
         "INSIGNIA_GLM53_DF_CACHE_ROUTE_K": "32",

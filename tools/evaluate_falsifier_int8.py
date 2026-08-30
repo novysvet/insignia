@@ -39,8 +39,12 @@ def fake_weight_int8(weight: Tensor) -> tuple[Tensor, dict[str, float]]:
     quantized = torch.round(value / scale).clamp(-127.0, 127.0)
     dequantized = quantized * scale
     error = dequantized - value
-    denominator = torch.linalg.vector_norm(value) * torch.linalg.vector_norm(dequantized)
-    cosine = ((value * dequantized).sum() / denominator.clamp_min(1.0e-30)).item()
+    value64 = value.double()
+    dequantized64 = dequantized.double()
+    denominator = (torch.linalg.vector_norm(value64)
+                   * torch.linalg.vector_norm(dequantized64))
+    cosine = ((value64 * dequantized64).sum()
+              / denominator.clamp_min(1.0e-30)).item()
     return dequantized.to(weight.dtype), {
         "cosine": cosine,
         "mse": error.square().mean().item(),
@@ -155,6 +159,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     metrics = {key: Metrics() for key in keys}
     route_count = 0
     route_matches = 0
+    route_events = 0
+    route_set_matches = 0
+    route_overlap = 0
     batches = 0
     with torch.inference_mode():
         for batch in loader:
@@ -175,6 +182,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
             route_valid = valid.unsqueeze(0).unsqueeze(-1).expand_as(reference_routes)
             route_count += route_valid.sum().item()
             route_matches += ((reference_routes == candidate_routes) & route_valid).sum().item()
+            reference_set = reference_routes.sort(dim=-1).values
+            candidate_set = candidate_routes.sort(dim=-1).values
+            event_valid = valid.unsqueeze(0).expand(reference_routes.shape[:-1])
+            route_events += event_valid.sum().item()
+            route_set_matches += (
+                (reference_set == candidate_set).all(dim=-1) & event_valid
+            ).sum().item()
+            per_event_overlap = (
+                reference_routes.unsqueeze(-1) == candidate_routes.unsqueeze(-2)
+            ).any(dim=-1).sum(dim=-1)
+            route_overlap += per_event_overlap[event_valid].sum().item()
             batches += 1
             if args.max_batches and batches >= args.max_batches:
                 break
@@ -188,6 +206,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         "outputs": {key: value.result() for key, value in metrics.items()},
         "selected_expert_slot_agreement": route_matches / max(1, route_count),
         "selected_expert_slots": route_count,
+        "selected_expert_set_agreement": route_set_matches / max(1, route_events),
+        "selected_expert_mean_overlap": route_overlap / max(1, route_events),
+        "selected_expert_events": route_events,
     }
 
 

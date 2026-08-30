@@ -567,3 +567,46 @@ so no p02 speedup is claimed. The fixed-Top-4 mismatch at record 29 had an
 extremely low draft margin (0.0270), whereas p12's miss had margin 0.7406.
 This is direct evidence that a single global threshold leaves substantial
 performance on the table and motivates the learned/contextual falsifier.
+
+### Contextual Top-4 aggressive arm
+
+A deliberately aggressive two-feature rule tests whether previous target
+logits can recover the useful p12 guard without applying the global 0.75 draft
+margin everywhere. It uses Top-4, a causal-prefix draft margin of 0.05, and a
+whole-block target/DFlash calibration-JS threshold of 0.60:
+
+```text
+INSIGNIA_GLM53_DF_APPROX_TOPM=4
+INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.05
+INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS=.60
+```
+
+Forced-token full-vocabulary quality passed the project's aggressive gate on
+both held-out prompts:
+
+| prompt | top-1 | cosine | MSE | KL | JS | approximate/exact PPL |
+|---|---:|---:|---:|---:|---:|---:|
+| p12 MATH | 32/32 | 0.979620 | 0.3282 | 0.005713 | 0.001612 | 1.0786 / 1.0651 |
+| p02 GSM8K | 32/32 | 0.990488 | 0.1937 | 0.02679 | 0.006901 | 1.1495 / 1.1155 |
+
+On p12 free decode, the calibration feature exactified one high-JS round and
+the causal margin exactified 4/20 rows. Mean k was 4.8, union traffic fell
+40.0%, and all 32 greedy IDs matched exact. The contextual arm measured 334.7
+ms/token (2.99 tok/s), versus adjacent exact controls at 607.0 and 511.5
+ms/token. Against the faster exact control this is -34.6% latency / +52.8%
+throughput; against the exact-control median it is -40.2% / +67.1%.
+
+p02 is the essential negative result. The policy exactified one calibration
+round but no margin rows on its free trajectory, ran mean k=4.0, and removed
+48.9% of union records. It measured 318.2 ms/token (3.14 tok/s) versus exact
+controls at 538.7/581.0 ms/token: -43.2% latency / +76.0% throughput against
+their median. However, the autoregressive sequence diverged at generated token
+21 despite 32/32 forced-token top-1 agreement. Forced logits therefore do not
+certify free-trajectory safety once approximate recurrent state compounds.
+Keep this rule as an explicit aggressive arm, not a parity-safe default. The
+0.75 causal-prefix rule remains the validated p12 parity option, and any learned
+controller must include free-generation trajectory failures in its target.
+
+Neither policy can improve prompt prefill by construction: approximation is
+enabled only after the DFlash verification archive becomes active. Prompt-wall
+variation in these brackets is storage noise, not a prefill result.

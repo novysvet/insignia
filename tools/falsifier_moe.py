@@ -92,6 +92,14 @@ def situ_glu(gate: Tensor, up: Tensor, beta_gate: float = 4.0,
     return softcap(gate, beta_gate) * torch.sigmoid(gate) * softcap(up, beta_up)
 
 
+def fake_dynamic_int8(value: Tensor) -> Tensor:
+    """Per-vector symmetric INT8 used by the fixed Raptor Lake runtime."""
+    scale = value.detach().float().abs().amax(dim=-1, keepdim=True) / 127.0
+    scale = torch.where(scale > 1.0e-12, scale, torch.ones_like(scale))
+    quantized = torch.round(value.float() / scale).clamp(-127.0, 127.0)
+    return (quantized * scale).to(value.dtype)
+
+
 def sinkhorn(logits: Tensor, iterations: int = 6) -> Tensor:
     """Project the final two dimensions onto the Birkhoff polytope."""
     matrix = torch.exp(logits.float().clamp(-12.0, 12.0))
@@ -294,6 +302,7 @@ class StableLatentMoE(nn.Module):
         self.register_buffer("routing_bias", torch.zeros(config.routed_experts))
         self._qb_margins: list[Tensor] = []
         self.last_routes: Tensor | None = None
+        self.fake_int8_expert_activations = False
 
     def clear_quantile_batch(self) -> None:
         self._qb_margins.clear()
@@ -330,16 +339,20 @@ class StableLatentMoE(nn.Module):
         selected_weight = selected_raw / selected_raw.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
         latent = self.latent_down(flat)
+        expert_latent = (fake_dynamic_int8(latent)
+                         if self.fake_int8_expert_activations else latent)
         gate_weight = self.expert_gate_up.view(
             self.config.routed_experts, 2 * self.config.expert_hidden, self.config.moe_latent)
         down_weight = self.expert_down.view(
             self.config.routed_experts, self.config.moe_latent, self.config.expert_hidden)
         gathered_gate = gate_weight[selected]
-        gate_up = torch.einsum("nkol,nl->nko", gathered_gate, latent)
+        gate_up = torch.einsum("nkol,nl->nko", gathered_gate, expert_latent)
         gate, up = gate_up.chunk(2, dim=-1)
         activated = situ_glu(gate, up)
+        expert_activated = (fake_dynamic_int8(activated)
+                            if self.fake_int8_expert_activations else activated)
         gathered_down = down_weight[selected]
-        expert_value = torch.einsum("nkdh,nkh->nkd", gathered_down, activated)
+        expert_value = torch.einsum("nkdh,nkh->nkd", gathered_down, expert_activated)
         aggregate = (expert_value * selected_weight.unsqueeze(-1)).sum(dim=1)
         routed = self.latent_up(self.latent_norm(aggregate))
         result = routed + self.shared(flat)

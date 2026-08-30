@@ -10,6 +10,7 @@ import torch
 from falsifier_moe import (
     FalsifierMoE,
     FalsifierMoEConfig,
+    fake_dynamic_int8,
     sinkhorn,
     situ_glu,
 )
@@ -46,6 +47,12 @@ def test_activations() -> None:
     small = torch.tensor([-1e-4, 1e-4])
     reference = F_silu(small) * small
     assert torch.allclose(situ_glu(small, small), reference, atol=1e-10, rtol=1e-4)
+
+    vectors = torch.tensor([[0.0, 0.5, -1.0], [3.0, -2.0, 1.0]])
+    quantized = fake_dynamic_int8(vectors)
+    scales = vectors.abs().amax(dim=-1) / 127.0
+    assert torch.all((quantized - vectors).abs().amax(dim=-1) <= scales * 0.50001)
+    assert torch.equal(fake_dynamic_int8(torch.zeros_like(vectors)), torch.zeros_like(vectors))
 
 
 def F_silu(value: torch.Tensor) -> torch.Tensor:

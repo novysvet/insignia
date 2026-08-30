@@ -54,7 +54,7 @@ COMMON=(
   INSIGNIA_GLM53_DF_BATCH_VERIFY=1
 )
 PLAN_ENV=()
-if [[ $PLAN == packedslots ]]; then
+if [[ $PLAN == packedslots || $PLAN == packedjoint || $PLAN == packedjointreverse ]]; then
   PLAN_ENV=(
     INSIGNIA_GLM53_PACKED_EXPERTS=/var/lib/insignia/glm53-experts-nvfp4x-v2.igx
     INSIGNIA_GLM53_PACKED_V2=1
@@ -170,11 +170,33 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
         INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6
     ;;
+  packedjoint)
+    run joint-expanded INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6
+    run joint-packed INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6 \
+        INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
+    ;;
+  packedjointreverse)
+    run joint-packed INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6 \
+        INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
+    run joint-expanded INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6
+    ;;
   packedslots)
     run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
     ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, or packedslots" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, packedjoint, packedjointreverse, or packedslots" >&2
     exit 64
     ;;
 esac

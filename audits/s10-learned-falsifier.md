@@ -463,8 +463,9 @@ Across the original p02/p10/p12 traces at K=32, retain=7, regret=0.0025:
 | p12 | 3.22% | 9.43% | 9.07% | 11.57% |
 
 The C++ arm is opt-in with
-`INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6`, specialized to retain-7 and k<=4;
-larger chunks retain the locally optimal action. On the live p02 on-policy
+`INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6`, supports retain-7 or retain-6, and
+uses exact Cartesian union search for k<=4; larger chunks retain the locally
+optimal action. On the live p02 on-policy
 trace, independently recomputed observed savings exactly matched the joint
 solver: 15.90% disk, 11.74% H2D, and 9.97% union, versus an independent
 ceiling of 15.85%/8.84%/3.25% on the same state.
@@ -476,10 +477,34 @@ forced-token PPL moved 1.1262->1.1136. This is one prompt, so it is evidence
 for the arm rather than a global quality claim; cold decode timing follows.
 
 The first p02 cold bracket measured independent cache routing at 426.5
-ms/token (2.34 tok/s) and joint routing at 406.2 ms/token (2.46 tok/s): -4.8%
-latency / +5.0% throughput. Prompt prefill was unchanged at 20.371 versus
-20.383 seconds for 74 tokens (~3.63 tok/s). Joint routing reduced verify time
-from 1,134.7 to 1,102.6 ms/verified round and changed the speculative path from
-15 rounds/2.13 accepted to 14 rounds/2.29 accepted. Exact brackets still swung
-569.1->466.4 ms/token, so a reverse-order repeat is required before promoting
-the result beyond opt-in.
+ms/token (2.34 tok/s) and joint routing at 406.2 ms/token (2.46 tok/s). The
+reverse-order repeat measured joint at 410.3 and independent at 426.3 ms/token.
+Across orders the medians are 408.25 versus 426.4 ms/token: -4.26% latency and
++4.45% throughput. Joint routing consistently changed the speculative path
+from 15 rounds/2.13 accepted to 14 rounds/2.29 accepted. Prompt prefill did not
+improve: median 20.453 seconds for joint versus 20.330 for independent over 74
+tokens. The exact brackets swung from 466.4 to 589.4 ms/token, but the joint
+ordering result reproduced while the independent arms agreed within 0.2
+ms/token. Retain-7 joint routing therefore remains the best validated opt-in
+cache policy.
+
+### Retain-6 joint-routing ceiling
+
+Allowing the solver to replace two tail experts raises the offline union and
+H2D ceilings materially. With K=32, regret=0.0025 and six local options per
+row, p02/p10/p12 save 13.06/12.20/12.39% of union records and
+18.93/18.78/18.52% of immediate H2D transfers. The matching live p02 free run
+removed 13.6% of union records and reported 1,329 union H2D saves, versus 10.3%
+and 825 for retain-7. The maximum observed regret stayed below the cap at
+0.002441.
+
+The p02 full-vocabulary quality gate kept 32/32 top-1 agreement, but quality
+was worse than retain-7: cosine 0.995157 versus 0.997045, MSE 0.09482 versus
+0.05930, KL 0.007298 versus 0.003719, JS 0.001888 versus 0.000891, and forced
+PPL 1.1176 versus 1.1136. In free decode it also reduced DFlash acceptance from
+2.29 to 1.88 tokens/round. Decode measurements were 407.9/495.9 ms/token for
+retain-6 and 413.4/418.3 for retain-7 in opposite orders. The retain-6 first
+sample demonstrated a possible bandwidth win (verify 976.2 versus 1,126.8
+ms/round), but its order-paired median was worse and unstable. Keep it as an
+aggressive opt-in research arm; do not replace retain-7 without a predictor or
+acceptance-aware guard.

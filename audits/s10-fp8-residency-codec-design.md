@@ -381,3 +381,31 @@ python3 -m unittest -v \
   test_fp8_residency_codec.py \
   test_analyze_fp8_residency.py
 ```
+
+## Owner-box result (2026-08-30)
+
+The checksum-locked 528,788,854-byte sample was analyzed in full with 2,000
+bootstrap replicates. All 25 codec, analyzer, and collector tests passed under
+Linux. The result bundle is
+`/var/lib/insignia/fp8-residency-analysis-v1.tar.zst`, SHA-256
+`ab2866b6ac9a9fa939bb4882f56ee9b170adfb149ba720464c79f95f4f51cb69`.
+
+| family | held-out weight ratio | ratio incl. raw scales | best high-volume ratio | entropy |
+|---|---:|---:|---:|---:|
+| dense | 0.903314 | 0.906244 | 0.902110 | 6.464 bits/byte |
+| DFlash | 0.904546 | 0.907438 | 0.904551 | - |
+
+Neither family reached the required total-byte ratio of 0.90, and no large
+family approached the 0.85 threshold that would justify a fused execution
+codec. Do **not** build the decompressor hot path.
+
+The exact dense container nevertheless models 818,675,361 logical bytes
+(about 780.7 MiB) reclaimed, equivalent to roughly 57 existing expert slots;
+the allocator-value gate passed. This is only an allocator ceiling. Current
+dense kernels still require expanded E4M3 bytes, so the reclaim is not real
+residency until a cold-matrix/decode-on-load allocation scheme demonstrates
+that another consumer can occupy the saved VRAM with no more than 2% kernel
+regression. DFlash saves only 104,194,871 logical bytes (about seven slots) and
+is closed. The final analyzer decisions were
+`eligible_for_allocator_only_probe` for dense and
+`stop_or_revisit_fixed_block_formats` for DFlash.

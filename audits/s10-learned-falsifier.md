@@ -2,8 +2,10 @@
 
 Date: 2026-08-30
 
-Status: design frozen enough to capture data. Training and runtime integration
-remain open.
+Status: trace/solver design implemented through the seven-prompt wave. The
+trainable 256-expert controller and strict prompt-held-out loader now exist;
+see `audits/s10-falsifier-moe-v1.md`. Real training remains blocked on corpus
+size and missing aligned free-trajectory labels.
 
 ## Decision
 

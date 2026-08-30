@@ -1,5 +1,42 @@
 # progress
 
+### 2026-08-30 (session 10) - learned Falsifier-MoE v1; hard-output gate restored
+
+`audits/s10-falsifier-moe-v1.md` freezes and implements the previously deferred
+tiny learned controller. It is a 10,089,763-parameter, weight-tied causal
+controller with four Sinkhorn-mHC evidence streams, 64-wide MLA history, block
+depth attention, and Stable LatentMoE at 256 routed experts/top-2 plus one
+full-width shared expert. The routed pool is 99.21875% inactive and contains
+9,437,184 parameters; the estimated active resident set is 726,307 parameters.
+SiTU-GLU, exact one-step-late Quantile Balancing, separate per-head Q/K clipping,
+PSD Gram, immediate-risk, forced 8/16/32-horizon, free-trajectory, collapse,
+action-risk, and cost heads are implemented. The novel optimizer arm is named
+honestly: Dion3 matrix updates plus a MuonClip-style post-step Q/K projection,
+with AdamW, official MuonClip, and Dion3-only required as ablations.
+
+The prompt-held-out v2 loader preserves provenance: exact traces supervise only
+the 8x8 contribution Gram, while on-policy traces supervise row/forced-horizon
+damage. Free-trajectory and repetition/entropy-collapse heads remain explicitly
+masked because the corpus has no aligned free-run labels. Current data are only
+seven prompt units, nine on-policy trajectories, 279 rows/11,718 target-layer
+events, 3,906 exact Gram events, and five top-1 failures. Real training refuses
+to start below 10,000 on-policy rows; local E:-drive AdamW CPU smoke and all new
+tests pass. BF16 CUDA, Dion3/MuonClip, native FP8, data collection, and shadow
+runtime remain open.
+
+The need for free-trajectory labels is measured, not theoretical. ArXivLean
+problem 40 approximate layer-major prefill at regret .0005 reached 15.61 tok/s
+and passed forced quality at PPL +3.15%, cosine 0.965076, MSE 0.4668, yet its
+320-token free output eventually looped through repetitive theorem/factorization
+fragments. This point remains experimental despite the numeric pass.
+
+Late handoff triage is recorded in `audits/s10-late-handoff-triage.md`. The DSA
+archive had only `SKIP_NO_NVCC`/`SKIP_NOT_BUILT` logs and no patch. The exact
+FP8 codec handoff passed all 25 Linux checks, but real held-out total ratios were
+0.906244 dense and 0.907438 DFlash, missing the <=0.90 gate. No fused decoder is
+warranted. Dense has a modeled allocator-only ceiling of ~780.7 MiB/~57 expert
+slots; DFlash is closed.
+
 ### 2026-08-30 (session 10) - MathArena ArXivLean frontier; cache-aware Top-6 survives
 
 New hard-prompt default: `MathArena/arxivlean-0326` replaces MATH-500 for new

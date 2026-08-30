@@ -4409,6 +4409,7 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
     }
     if (df_logit_guard_margin_ > 0.0f) {
         const int vocab = int(model_.vocab_size());
+        int highest_margin_guard = -1;
         for (int verify_row = 0; verify_row < kMaxVerify; ++verify_row) {
             // Target output after candidate r predicts candidate r+1. DFlash
             // row r+1 is the same-position risk signal. The final draft row
@@ -4429,9 +4430,17 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
                     second = value;
                 }
             }
-            df_logit_guard_exact_[size_t(verify_row)] |=
-                uint8_t(first - second < df_logit_guard_margin_);
+            if (first - second < df_logit_guard_margin_) {
+                df_logit_guard_exact_[size_t(verify_row)] = 1;
+                highest_margin_guard = verify_row;
+            }
         }
+        // KDA recurrent state and causal attention carry every earlier row's
+        // approximation error into later rows. Exactifying only the flagged
+        // row cannot repair that state, so a risky row makes its whole causal
+        // prefix exact. Do not propagate the final no-lookahead sentinel above.
+        for (int verify_row = 0; verify_row <= highest_margin_guard; ++verify_row)
+            df_logit_guard_exact_[size_t(verify_row)] = 1;
     }
     static const bool df_debug = std::getenv("INSIGNIA_GLM53_DF_DEBUG") != nullptr;
     if (df_debug) {

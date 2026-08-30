@@ -79,8 +79,12 @@ case "$PLAN" in
     run top5 INSIGNIA_GLM53_DF_APPROX_TOPM=5
     run top4-zero INSIGNIA_GLM53_DF_APPROX_TOPM=4
     ;;
+  aggressive)
+    run top3 INSIGNIA_GLM53_DF_APPROX_TOPM=3
+    run top2 INSIGNIA_GLM53_DF_APPROX_TOPM=2
+    ;;
   *)
-    echo "PLAN must be full or frontier" >&2
+    echo "PLAN must be full, frontier, or aggressive" >&2
     exit 64
     ;;
 esac

@@ -651,6 +651,8 @@ public:
             admit_threshold_ = std::atoi(filter) != 0 ? 2 : 1;
         if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_VRAM_MB"))
             vram_budget_mb_ = std::max(0, std::atoi(budget));
+        if (const char *value = std::getenv("INSIGNIA_GLM53_DEVICE_PACKED_SCALES"))
+            device_packed_scales_ = std::atoi(value) != 0;
         // The model has exactly 42 sparse layers (3..44).  The legacy
         // layer-id mapping carved 46 segments and stranded four complete
         // slices.  Keep the corrected dense mapping A/B-gated until the
@@ -684,10 +686,16 @@ public:
             if (const char *kernel = std::getenv("INSIGNIA_GLM53_PACKED_KERNEL"))
                 packed_kernel_v2_ = std::atoi(kernel) == 2;
             open_packed_experts(path);
+            if (device_packed_scales_)
+                require(packed_version_ >= 2 && packed_gpu_scales_ && packed_kernel_v2_,
+                        "packed device slots require XPR1-v2, GPU scales, and PACKED_KERNEL=2");
             if (packed_gpu_scales_)
                 check(cudaMalloc(&packed_scale_device_, kPackedDeviceCapacity),
-                      "cudaMalloc packed scale transport");
+                      "cudaMalloc packed scale transport/execution scratch");
         }
+        if (device_packed_scales_)
+            require(packed_fd_ >= 0,
+                    "packed device slots require INSIGNIA_GLM53_PACKED_EXPERTS");
         for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
         start_pool();
         load_pin_list();
@@ -979,6 +987,7 @@ public:
                 active_device_slot_ = device_slot;
                 active_ = device_slot_layouts_[size_t(device_slot)];
                 active_globals_ = device_slot_globals_[size_t(device_slot)];
+                expand_active_packed_slot_scales();
                 batch_device_[size_t(slot)] = false;
                 return;
             }
@@ -1066,8 +1075,14 @@ public:
             active_device_ = device_;
             active_device_slot_ = -1;
         }
-        active_ = state.layout;
-        active_globals_ = state.globals;
+        if (device_packed_scales_ && active_device_slot_ >= 0) {
+            active_ = device_slot_layouts_[size_t(active_device_slot_)];
+            active_globals_ = device_slot_globals_[size_t(active_device_slot_)];
+            expand_active_packed_slot_scales();
+        } else {
+            active_ = state.layout;
+            active_globals_ = state.globals;
+        }
         if (state.pinned || (batch_populate_[size_t(slot)] && batch_admit_[size_t(slot)])) {            // Admitted: the window stays resident in the host LRU; eviction
             // re-checks copy_done before the slot can be refilled. The pinned
             // window now owns the bytes, so drop the page-cache shadow.
@@ -1088,12 +1103,30 @@ public:
             if (!state.demand) ++prefetch_wasted_;
         }
     }
-    const uint8_t *down_weight() const { return active_device_ + active_.body[0]; }
-    const uint8_t *gate_weight() const { return active_device_ + active_.body[1]; }
-    const uint8_t *up_weight() const { return active_device_ + active_.body[2]; }
-    const uint8_t *down_scale() const { return active_device_ + active_.scales[0]; }
-    const uint8_t *gate_scale() const { return active_device_ + active_.scales[1]; }
-    const uint8_t *up_scale() const { return active_device_ + active_.scales[2]; }
+    bool active_slot_is_packed() const {
+        return device_packed_scales_ && active_device_slot_ >= 0;
+    }
+    const uint8_t *down_weight() const {
+        return active_device_ + (active_slot_is_packed() ? active_.packed_body[0] : active_.body[0]);
+    }
+    const uint8_t *gate_weight() const {
+        return active_device_ + (active_slot_is_packed() ? active_.packed_body[1] : active_.body[1]);
+    }
+    const uint8_t *up_weight() const {
+        return active_device_ + (active_slot_is_packed() ? active_.packed_body[2] : active_.body[2]);
+    }
+    const uint8_t *down_scale() const {
+        return active_slot_is_packed() ? packed_scale_device_
+                                       : active_device_ + active_.scales[0];
+    }
+    const uint8_t *gate_scale() const {
+        return active_slot_is_packed() ? packed_scale_device_ + kProjectionScaleBytes
+                                       : active_device_ + active_.scales[1];
+    }
+    const uint8_t *up_scale() const {
+        return active_slot_is_packed() ? packed_scale_device_ + 2 * kProjectionScaleBytes
+                                       : active_device_ + active_.scales[2];
+    }
     float down_global(int) const { return active_globals_[0]; }
     float gate_global(int) const { return active_globals_[1]; }
     float up_global(int) const { return active_globals_[2]; }
@@ -1210,6 +1243,7 @@ private:
                     packed_entries_.size() * sizeof(PackedExpertIndexEntry),
                     "read packed expert index");
         size_t populated = 0;
+        size_t max_v2_payload = 0;
         for (const PackedExpertIndexEntry &entry : packed_entries_) {
             if (!entry.offset) {
                 require(entry.stored_bytes == 0 && entry.padded_bytes == 0,
@@ -1222,16 +1256,27 @@ private:
                     entry.offset <= header.file_bytes &&
                     entry.padded_bytes <= header.file_bytes - entry.offset,
                     "malformed packed expert index entry");
-            if (packed_version_ == 1)
+            if (packed_version_ == 1) {
                 packed_scratch_bytes_ = std::max(packed_scratch_bytes_, size_t(entry.padded_bytes));
+            } else {
+                require(entry.stored_bytes >= kAlignment + kBodyBytes,
+                        "v2 packed expert record is shorter than header plus bodies");
+                max_v2_payload = std::max(max_v2_payload,
+                                          size_t(entry.stored_bytes) - kAlignment);
+            }
             ++populated;
         }
         require(populated == header.records, "packed expert index record count mismatch");
-        if (packed_version_ >= 2)
+        if (packed_version_ >= 2) {
             // v2 stages straight into the window; the reader scratch only
             // ever holds the 4 KiB header page (GPU path) or one scale
             // region (CPU-expand path). No 12.8 MiB scratch records.
             packed_scratch_bytes_ = kV2ReaderScratchBytes;
+            packed_device_stride_ =
+                (max_v2_payload + kAlignment - 1) & ~(kAlignment - 1);
+            require(packed_device_stride_ >= kBodyBytes,
+                    "v2 packed device stride was not derived from the full index");
+        }
         require(packed_scratch_bytes_, "packed expert index record count mismatch");
 #ifdef O_DIRECT
         packed_direct_fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -1571,6 +1616,17 @@ private:
             stage_packed_cpu(layout, globals, payload, window, layer, expert, scratch);
     }
     void enqueue_record_copy(WindowState &state, uint8_t *destination) {
+        if (device_packed_scales_ && device_arena_) {
+            require(packed_version_ >= 2 && state.layout.packed_scales &&
+                    state.layout.bytes <= device_stride_,
+                    "packed device slot received a non-v2 or oversized payload");
+            check(cudaMemcpyAsync(destination, state.payload, state.layout.bytes,
+                                  cudaMemcpyHostToDevice, copy_stream_),
+                  "packed device-slot H2D");
+            packed_h2d_bytes_.fetch_add(state.layout.bytes, std::memory_order_relaxed);
+            packed_h2d_records_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (!state.layout.packed_scales) {
             check(cudaMemcpyAsync(destination, state.payload, state.layout.bytes,
                                   cudaMemcpyHostToDevice, copy_stream_),
@@ -1663,6 +1719,26 @@ private:
         packed_h2d_bytes_.fetch_add(transported, std::memory_order_relaxed);
         packed_h2d_records_.fetch_add(1, std::memory_order_relaxed);
     }
+    void expand_active_packed_slot_scales() {
+        if (!device_packed_scales_ || active_device_slot_ < 0) return;
+        require(active_device_ && packed_scale_device_ && active_.packed_scales,
+                "packed device slot has no execution-scale scratch");
+        std::array<size_t, 3> packed{}, escapes{}, codebooks{}, prefixes{};
+        for (int projection = 0; projection < 3; ++projection) {
+            packed[projection] = active_.packed_blob[projection];
+            escapes[projection] = active_.packed_blob[projection] +
+                                  active_.packed_escapes[projection];
+            codebooks[projection] = active_.packed_blob[projection] +
+                                    active_.packed_codebook[projection];
+            prefixes[projection] = active_.packed_blob[projection] +
+                                   active_.packed_prefix[projection];
+        }
+        check(insignia::glm53::expand_nvfp4_scale_nibbles3_v2(
+                  active_device_, packed.data(), escapes.data(), codebooks.data(),
+                  prefixes.data(), packed_scale_device_, kProjectionScaleBytes,
+                  0, kProjectionScaleBytes, nullptr),
+              "expand packed device-slot scales into execution scratch");
+    }
     void ensure_device_scratch() {
         if (!device_)
             check(cudaMalloc(&device_, kPayloadCapacity), "cudaMalloc expert record");
@@ -1686,7 +1762,11 @@ private:
             // Leave headroom for context growth and activation spikes.
             budget = free_bytes > (768ull << 20) ? free_bytes - (768ull << 20) : 0;
         }
-        const size_t stride = (kPayloadCapacity + kAlignment - 1) & ~(kAlignment - 1);
+        const size_t expanded_stride =
+            (kPayloadCapacity + kAlignment - 1) & ~(kAlignment - 1);
+        const size_t stride = device_packed_scales_ ? packed_device_stride_ : expanded_stride;
+        require(stride && (!device_packed_scales_ || stride < expanded_stride),
+                "packed device-slot stride is unavailable or not smaller");
         size_t attempt = budget / stride;
         while (attempt > 1) {
             if (cudaMalloc(&device_arena_, attempt * stride) == cudaSuccess) break;
@@ -1707,6 +1787,9 @@ private:
         }
         device_stride_ = stride;
         device_slot_count_ = int(attempt);
+        if (device_packed_scales_)
+            std::printf("expert VRAM packed slots: stride=%zu, slots=%d, scratch=%zu bytes\n",
+                        device_stride_, device_slot_count_, kScaleBytes);
         device_slot_keys_.assign(attempt, kNoKey);
         device_slot_stamps_.assign(attempt, 0);
         device_slot_pinned_.assign(attempt, 0);
@@ -2195,7 +2278,7 @@ private:
     int packed_fd_ = -1, packed_direct_fd_ = -1;
     int packed_version_ = 0;
     std::vector<PackedExpertIndexEntry> packed_entries_;
-    size_t packed_scratch_bytes_ = 0;
+    size_t packed_scratch_bytes_ = 0, packed_device_stride_ = 0;
     std::atomic<uint64_t> packed_expanded_bytes_{0}, packed_expand_nanoseconds_{0};
     std::atomic<uint64_t> packed_h2d_bytes_{0}, packed_h2d_records_{0};
     uint8_t *host_raw_ = nullptr, *host_ = nullptr, *device_ = nullptr;
@@ -2215,6 +2298,7 @@ private:
     cudaStream_t copy_stream_ = nullptr;
     bool stop_ = false, packed_gpu_scales_ = false;
     bool packed_merge_h2d_ = false, packed_kernel_v2_ = false;
+    bool device_packed_scales_ = false;
     std::array<int, 8> batch_experts_{};
     std::array<bool, 8> batch_cached_{};
     std::array<bool, 8> batch_admit_{};

@@ -128,3 +128,20 @@ consumed that benefit at this horizon. Keep the feature: it is exact, increases
 capacity, and reduces transfers. Do not claim a wall-time win or enable it by
 default until either the expansion path is cheaper or a longer warm run makes
 the extra slots dominate.
+
+## Pruned cache-routing interaction
+
+The packed representation was also tested with the compute-heavy Top-4 cache
+router (Top-32 frontier, keep three, regret .0010, eight actions/row). The
+expanded arm reproduced 240.5/237.2 ms/token on p12. Packed measured
+268.2/325.5. Comparing like storage phases gives 268.2 versus 237.2 in the fast
+phase and 325.5 versus 285.6 in the slow phase: packed was 13-14% slower.
+
+This is not a representation-exactness failure. The cache-aware policy observes
+device residency, so the extra 13 packed slots alter which fourth expert is
+chosen. The packed trajectory accepted 3.20 tokens/round versus expanded's
+3.56 and required 10 rather than 9 speculative rounds. The result strengthens,
+rather than reverses, the keep/default-off decision: retain the exact packed
+format and its real capacity/PCIe improvements, but do not compose it with the
+current approximate cache objective until that objective prices expected
+DFlash acceptance.

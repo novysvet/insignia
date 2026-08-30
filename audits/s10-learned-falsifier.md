@@ -610,3 +610,78 @@ controller must include free-generation trajectory failures in its target.
 Neither policy can improve prompt prefill by construction: approximation is
 enabled only after the DFlash verification archive becomes active. Prompt-wall
 variation in these brackets is storage noise, not a prefill result.
+
+## Compute-heavy cache-aware Top-M tail selection
+
+Commit `47597f9` composes fixed Top-M verification with cache-aware routing.
+For Top-4, the three strongest experts remain fixed and the CPU chooses the
+fourth from a widened Top-32 router frontier under a bounded corrected-router
+regret. It preserves the original Top-8 weight denominator. Across up to four
+verify rows, the 14700KF exhaustively evaluates the Cartesian action product
+and minimizes distinct union disk reads, then H2D uploads, then union size and
+regret. Eight retained actions means `8^4 = 4,096` assignments per sparse layer;
+this deliberately spends excess host compute to reduce the storage bottleneck.
+
+The selected aggressive operating point is:
+
+```text
+INSIGNIA_GLM53_DF_APPROX_TOPM=4
+INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32
+INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010
+INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8
+```
+
+### Quality frontier
+
+| prompt/policy | top-1 | cosine | MSE | KL | JS | approximate/exact PPL |
+|---|---:|---:|---:|---:|---:|---:|
+| p02, selected .0010/joint8 | 31/32 | 0.985287 | 0.2915 | 0.03572 | 0.009590 | 1.1718 / 1.1155 |
+| p12, selected .0010/joint8 | 31/32 | 0.974237 | 0.4281 | 0.03129 | 0.008713 | 1.1282 / 1.0651 |
+| p02, .0005/joint8 | 31/32 | 0.986893 | 0.2625 | 0.04486 | 0.01176 | 1.1769 / 1.1155 |
+| p02, .0025/joint8 | 31/32 | 0.984812 | 0.3018 | 0.04636 | 0.01236 | 1.1841 / 1.1155 |
+
+The 0.0010 point is the best balanced cross-prompt choice. The narrower 0.0005
+cap improves p02 cosine/MSE but worsens distributional quality, while 0.0025
+perturbs acceptance too strongly. All remain explicitly aggressive, not exact
+model modes.
+
+### Decode wall results
+
+On p12, plain Top-4 measured 374.0 ms/token and the selected cache-aware arm
+measured 237.0 ms/token (4.22 tok/s): -36.6% latency / +57.8% throughput. The
+exact controls were 563.4/615.3 ms/token, so the selected arm is -59.8% latency
+and +148.7% throughput versus their median. It changed the speculative path
+from 11 rounds/2.91 accepted to 9 rounds/3.56 accepted. Independent expanded-
+slot repeats at 240.5 and 237.2 ms/token reproduced the result. A looser
+0.0025/joint8 arm fell to 3.20 accepted and 305.8 ms/token; more cache freedom
+is not automatically faster when it damages DFlash acceptance.
+
+On p02, the selected arm measured 283.7 ms/token (3.52 tok/s) versus plain
+Top-4 at 297.8 (3.36 tok/s): -4.73% latency / +4.97% throughput. It changed
+452/1,344 layer rows, removed 6.9% of the plain Top-4 union, and saved 274 disk
+plus 306 H2D union records across 336 layer groups. Mean/max normalized router
+regret was only 0.000170/0.001000. Acceptance improved from 15 rounds/2.13 to
+14 rounds/2.29. Notably, its complete 32-token free trajectory matched exact,
+even though the same-token forced gate contained one mismatch; plain Top-4
+diverged at token 21. This is further evidence that forced and autoregressive
+quality must both be measured.
+
+### Guard and packed-scale interactions
+
+Composing the selected arm with margin .05 plus prior-target/DFlash calibration
+JS .60 improved p12 forced quality to cosine 0.978068, MSE 0.3606, KL 0.01326,
+JS 0.003476, and PPL 1.0974, but merely moved the lone mismatch from step 4 to
+step 21. Free decode ran at 323.0 ms/token and diverged at token 22. It is a
+useful quality/speed midpoint, not a parity solution.
+
+Packed persistent scale slots remain implemented and retained. With this
+cache-aware policy, however, their 294-slot residency changes the chosen fourth
+experts and reduces p12 acceptance from 3.56 to 3.20. In matched slow phases,
+packed measured 325.5 versus expanded 285.6 ms/token; in matched fast phases,
+268.2 versus 237.2. Keep packed scales default-off: the exact representation,
+13 extra slots, and PCIe-byte reduction remain real, but an acceptance-aware
+cache objective is required before composing it with this approximate router.
+
+These policies act only during speculative verification. They do not improve
+prompt prefill, and the observed 18.5-25.9 second prompt swings are WSL/storage
+variance. No GPU, clock, token-fault, or thermal instability was observed.

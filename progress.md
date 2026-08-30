@@ -1,5 +1,25 @@
 # progress
 
+### 2026-08-30 (session 10) - compute-heavy cache-aware Top-4 verifier
+
+Full findings: `audits/s10-learned-falsifier.md`. Fixed Top-4 now composes with
+a widened Top-32 cache router: keep the strongest three experts, choose the
+fourth under normalized router-regret .0010, retain eight actions per row, and
+exhaustively search `8^4` layer-union assignments on the i7-14700KF. Original
+Top-8 weights/denominator are preserved. On MATH p12 it measured 237.0 ms/token
+(4.22 tok/s) versus plain Top-4 at 374.0 and exact controls at 563.4/615.3;
+acceptance improved 2.91->3.56. Forced quality was 31/32 top-1, cosine
+0.974237, MSE 0.4281, KL 0.03129, JS 0.008713, and PPL 1.1282 vs exact 1.0651.
+On GSM p02 it measured 283.7 vs plain Top-4 297.8 ms/token, removed 6.9% of the
+Top-4 union, and its 32-token free trajectory unexpectedly matched exact even
+though forced quality was 31/32. This is the selected aggressive speed arm,
+not an exact-model default. A previous-logit JS/margin guard improved quality
+but still diverged autoregressively. Packed persistent scales remain kept and
+default-off: with this residency-sensitive approximate router they changed the
+chosen tail experts, reduced acceptance, and were 13-14% slower in matched
+phases despite the real +13-slot/PCIe benefit. These verifier policies do not
+improve prefill. No overclock instability was observed.
+
 ### 2026-08-30 (session 10) - cross-head FP8 MLA; 314.5 MiB exact reclaim
 
 Full findings: `audits/s10-cross-head-mla.md`. The exact first-256 MLA bridge

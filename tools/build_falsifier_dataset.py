@@ -53,8 +53,10 @@ ROW_SCALAR_NAMES = (
     "prior_entropy_norm", "prior_top1_p", "prior_margin",
     "draft_entropy_norm", "draft_top1_p", "draft_margin",
     "calibration_js", "calibration_centered_cos", "calibration_top1_disagree",
+    "prior_temporal_js", "prior_temporal_centered_cos",
+    "prior_temporal_top1_disagree",
     "prior_draft_top8_overlap", "prior_draft_top32_overlap",
-    "block_fraction", "row_fraction",
+    "round_log_position", "row_fraction",
 )
 
 ROW_LABEL_NAMES = (
@@ -312,6 +314,12 @@ def build(args: argparse.Namespace) -> None:
         start = block * args.verify_k
         prior = approximate[start]
         prior_probability, prior_stats = softmax_stats(prior)
+        previous_start = max(0, start - args.verify_k)
+        previous_prior = approximate[previous_start]
+        previous_prior_probability, _ = softmax_stats(previous_prior)
+        temporal_js = js_divergence(previous_prior_probability, prior_probability)
+        temporal_cos = centered_cosine(previous_prior, prior)
+        temporal_disagree = float(np.argmax(previous_prior) != np.argmax(prior))
         calibration = draft[block, 0]
         calibration_probability, _ = softmax_stats(calibration)
         calibration_js = js_divergence(prior_probability, calibration_probability)
@@ -338,8 +346,10 @@ def build(args: argparse.Namespace) -> None:
             row_meta.append((epoch, block, row, output_record))
             row_scalars.append([
                 *prior_stats, *draft_stats, calibration_js, calibration_cos,
-                calibration_disagree, overlap(prior_ids[:8], current_ids[:8]),
-                overlap(prior_ids, current_ids), block / max(1, len(epochs) - 1),
+                calibration_disagree, temporal_js, temporal_cos,
+                temporal_disagree, overlap(prior_ids[:8], current_ids[:8]),
+                overlap(prior_ids, current_ids),
+                min(1.0, math.log1p(block) / math.log1p(256.0)),
                 row / max(1, args.verify_k - 1),
             ])
             row_sketches.append(np.stack((sketcher(prior), sketcher(current_draft),
@@ -406,7 +416,7 @@ def build(args: argparse.Namespace) -> None:
         event_tail[:, :3] = np.nan
 
     metadata = {
-        "schema": "insignia-falsifier-dataset-v2",
+        "schema": "insignia-falsifier-dataset-v3",
         "trace": str(args.trace),
         "prompt_id": args.prompt_id,
         "family": args.family,

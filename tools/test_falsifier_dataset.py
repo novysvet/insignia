@@ -12,6 +12,7 @@ import numpy as np
 
 from analyze_falsifier_candidates import analyze
 from build_falsifier_dataset import EVENT_DTYPE, TRACE_HEADER, build, repair_legacy_zero_epochs
+from falsifier_online_features import OnlineLogitState
 
 
 def main() -> None:
@@ -96,6 +97,7 @@ def main() -> None:
         ))
         with np.load(output) as dataset:
             metadata = json.loads(str(dataset["metadata"]))
+            assert metadata["schema"] == "insignia-falsifier-dataset-v3"
             assert metadata["gram_present"] is True
             assert dataset["event_meta"].shape == (8, 6)
             assert dataset["router_features"].shape == (8, 16)
@@ -104,7 +106,23 @@ def main() -> None:
             assert dataset["contribution_gram"].shape == (8, 36)
             assert np.all(dataset["event_label_mask"])
             assert dataset["row_meta"].shape == (4, 4)
+            assert dataset["row_scalars"].shape == (4, 16)
             assert dataset["row_logit_sketch"].shape == (4, 3, 8)
+            assert tuple(dataset["row_scalars"][0, 9:12]) == (0.0, 1.0, 0.0)
+            assert float(dataset["row_scalars"][0, 14]) == 0.0
+            assert float(dataset["row_scalars"][2, 14]) > 0.0
+            online = OnlineLogitState(vocab=32, sketch_dimension=8, top_logits=10)
+            online_scalars = []
+            online_sketches = []
+            for block in range(2):
+                scalars, sketches = online.begin_round(
+                    approximate[block * 2], draft[block])
+                online_scalars.append(scalars)
+                online_sketches.append(sketches)
+            assert np.array_equal(
+                np.concatenate(online_scalars), dataset["row_scalars"])
+            assert np.array_equal(
+                np.concatenate(online_sketches), dataset["row_logit_sketch"])
             assert int(np.sum(dataset["row_labels"][:, 6])) == 1
             assert tuple(dataset["row_top1"][2]) == (1, 2)
 

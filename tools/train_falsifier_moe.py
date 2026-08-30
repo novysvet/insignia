@@ -35,7 +35,10 @@ from torch.utils.data import DataLoader, Dataset
 from falsifier_moe import FalsifierMoE, FalsifierMoEConfig
 
 
-EXPECTED_SCHEMA = "insignia-falsifier-dataset-v2"
+SUPPORTED_SCHEMAS = {
+    "insignia-falsifier-dataset-v2",
+    "insignia-falsifier-dataset-v3",
+}
 ROW_LABELS = {
     "mse": 0,
     "cosine": 2,
@@ -105,8 +108,9 @@ class PromptShard:
         self.path = path
         with np.load(path, allow_pickle=False) as archive:
             self.metadata = json.loads(str(archive["metadata"].item()))
-            if self.metadata.get("schema") != EXPECTED_SCHEMA:
-                raise ValueError(f"{path}: expected {EXPECTED_SCHEMA}")
+            if self.metadata.get("schema") not in SUPPORTED_SCHEMAS:
+                raise ValueError(
+                    f"{path}: expected one of {sorted(SUPPORTED_SCHEMAS)}")
             if int(self.metadata["geometry"]["candidate_k"]) != 32:
                 raise ValueError(f"{path}: unsupported candidate geometry")
             event_label_mask = (np.asarray(archive["event_label_mask"], dtype=np.bool_)

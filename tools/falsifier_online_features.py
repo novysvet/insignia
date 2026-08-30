@@ -7,9 +7,75 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from build_falsifier_dataset import (
+    CountSketch,
+    centered_cosine,
+    js_divergence,
+    overlap,
+    softmax_stats,
+    top_values,
+)
+
 
 def expert_overlap(left: np.ndarray, right: np.ndarray) -> float:
     return len(set(map(int, left)) & set(map(int, right))) / 8.0
+
+
+@dataclass
+class OnlineLogitState:
+    """Build the 16 scalars and 3x64 sketches before target verification."""
+
+    vocab: int
+    sketch_dimension: int = 64
+    top_logits: int = 32
+    round_index: int = 0
+    previous_prior: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        self.sketch = CountSketch(self.vocab, self.sketch_dimension)
+
+    def begin_round(self, prior_logits: np.ndarray, draft_logits: np.ndarray
+                    ) -> tuple[np.ndarray, np.ndarray]:
+        prior = np.asarray(prior_logits, dtype=np.float32)
+        draft = np.asarray(draft_logits, dtype=np.float32)
+        if prior.shape != (self.vocab,) or draft.ndim != 2 \
+                or draft.shape[1] != self.vocab or draft.shape[0] < 2:
+            raise ValueError("invalid online logit geometry")
+        previous = prior if self.previous_prior is None else self.previous_prior
+        prior_probability, prior_stats = softmax_stats(prior)
+        previous_probability, _ = softmax_stats(previous)
+        temporal_js = js_divergence(previous_probability, prior_probability)
+        temporal_cos = centered_cosine(previous, prior)
+        temporal_disagree = float(np.argmax(previous) != np.argmax(prior))
+        calibration_probability, _ = softmax_stats(draft[0])
+        calibration_js = js_divergence(prior_probability, calibration_probability)
+        calibration_cos = centered_cosine(prior, draft[0])
+        calibration_disagree = float(np.argmax(prior) != np.argmax(draft[0]))
+        prior_ids, _ = top_values(prior, self.top_logits)
+        scalars: list[list[float]] = []
+        sketches: list[np.ndarray] = []
+        rows = draft.shape[0] - 1
+        round_position = min(
+            1.0, np.log1p(self.round_index) / np.log1p(256.0))
+        for row in range(rows):
+            current = draft[row + 1]
+            _, draft_stats = softmax_stats(current)
+            current_ids, _ = top_values(current, self.top_logits)
+            scalars.append([
+                *prior_stats, *draft_stats, calibration_js, calibration_cos,
+                calibration_disagree, temporal_js, temporal_cos,
+                temporal_disagree, overlap(prior_ids[:8], current_ids[:8]),
+                overlap(prior_ids, current_ids), round_position,
+                row / max(1, rows - 1),
+            ])
+            sketches.append(np.stack((
+                self.sketch(prior), self.sketch(current),
+                self.sketch(current - prior),
+            )))
+        self.previous_prior = prior.copy()
+        self.round_index += 1
+        return (np.asarray(scalars, dtype=np.float32),
+                np.asarray(sketches, dtype=np.float32))
 
 
 @dataclass

@@ -75,6 +75,7 @@ run() {
       -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
       -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN \
+      -u INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX \
       -u INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
@@ -118,6 +119,14 @@ case "$PLAN" in
     run mass80-guard75 INSIGNIA_GLM53_DF_APPROX_MASS=.80 \
         INSIGNIA_GLM53_DF_APPROX_MIN_K=3 \
         INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.75
+    ;;
+  top4guard)
+    run top4 INSIGNIA_GLM53_DF_APPROX_TOPM=4
+    run top4-m75 INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.75
+    run top4-m75-row INSIGNIA_GLM53_DF_APPROX_TOPM=4 \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.75 \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX=0
     ;;
   cache)
     run cache32-r7-e0025 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
@@ -247,7 +256,7 @@ case "$PLAN" in
     run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
     ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, cachejointguard, cachejointguardreverse, cachejointguardretain, cachejointguardretainreverse, packedjoint, packedjointreverse, or packedslots" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, top4guard, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, cachejointguard, cachejointguardreverse, cachejointguardretain, cachejointguardretainreverse, packedjoint, packedjointreverse, or packedslots" >&2
     exit 64
     ;;
 esac

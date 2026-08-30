@@ -2797,7 +2797,10 @@ public:
             require(df_logit_guard_margin_ > 0.0f,
                     "INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN must be positive");
             require(dflash2_on_, "DFlash logit guard requires DFlash2");
-            std::printf("DFlash2 logit guard: disable row approximation when draft margin < %.3f\n",
+            if (const char *prefix = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX"))
+                df_logit_guard_prefix_ = std::atoi(prefix) != 0;
+            std::printf("DFlash2 logit guard: disable %s approximation when draft margin < %.3f\n",
+                        df_logit_guard_prefix_ ? "causal-prefix" : "row-only",
                         df_logit_guard_margin_);
         }
         if (const char *threshold =
@@ -3385,6 +3388,7 @@ private:
     uint64_t df_cache_joint_selected_union_ = 0;
     int64_t df_cache_joint_disk_saved_ = 0, df_cache_joint_h2d_saved_ = 0;
     float df_logit_guard_margin_ = 0.0f;
+    bool df_logit_guard_prefix_ = true;
     float df_calibration_guard_js_ = 0.0f;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
     uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
@@ -4449,8 +4453,9 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
         // approximation error into later rows. Exactifying only the flagged
         // row cannot repair that state, so a risky row makes its whole causal
         // prefix exact. Do not propagate the final no-lookahead sentinel above.
-        for (int verify_row = 0; verify_row <= highest_margin_guard; ++verify_row)
-            df_logit_guard_exact_[size_t(verify_row)] = 1;
+        if (df_logit_guard_prefix_)
+            for (int verify_row = 0; verify_row <= highest_margin_guard; ++verify_row)
+                df_logit_guard_exact_[size_t(verify_row)] = 1;
     }
     static const bool df_debug = std::getenv("INSIGNIA_GLM53_DF_DEBUG") != nullptr;
     if (df_debug) {

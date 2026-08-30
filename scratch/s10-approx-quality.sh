@@ -62,6 +62,7 @@ run() {
       -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
       -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN \
+      -u INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX \
       -u INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
@@ -85,7 +86,17 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)-joint([2-8])-m([0-9]+)-gr([78])$ ]]; then
+  if [[ $policy =~ ^top([1-8])-m([0-9]+)(-row)?$ ]]; then
+    tag=$policy
+    topm=${BASH_REMATCH[1]}
+    margin_raw=${BASH_REMATCH[2]}
+    row_only=${BASH_REMATCH[3]}
+    margin=$(awk -v raw="$margin_raw" 'BEGIN { printf "%.6f", raw / 100 }')
+    guard_env=()
+    [[ -z $row_only ]] || guard_env=(INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX=0)
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="$topm" \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN="$margin" "${guard_env[@]}"
+  elif [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)-joint([2-8])-m([0-9]+)-gr([78])$ ]]; then
     tag=$policy
     cache_k=${BASH_REMATCH[1]}
     retain=${BASH_REMATCH[2]}

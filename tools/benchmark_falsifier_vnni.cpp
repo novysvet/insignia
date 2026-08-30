@@ -104,6 +104,7 @@ struct ControllerWeights {
     Matrix depth_k{128, 192, random};
     Matrix depth_v{128, 192, random};
     Matrix depth_out{192, 128, random};
+    Matrix mhc_dynamic{16, 192, random};
     Matrix mla_q{128, 192, random};
     Matrix mla_kv_down{64, 192, random};
     Matrix mla_kv_up{256, 64, random};
@@ -119,27 +120,33 @@ struct ControllerWeights {
     Matrix expert_gate_up{256 * 256, 96, random};
     Matrix expert_down{256 * 96, 128, random};
 
+    // Runtime consumes every controller head.  Combining them does not change
+    // the MAC ledger: 5 + 6 + 3 + 2 + 32 + 8 + 24 + 18 + 9 = 107 rows.
+    Matrix heads{107, 192, random};
+
     ControllerWeights() = default;
 
     uint64_t event_macs() const {
         const uint64_t encoder = logit.macs() + hidden.macs() + cache.macs()
             + router_tail.macs() + 32 * (candidate_a.macs() + candidate_b.macs());
-        const uint64_t depth = depth_q.macs() + depth_k.macs() + depth_v.macs()
-            + depth_out.macs();
         const uint64_t mla = mla_q.macs() + mla_kv_down.macs() + mla_kv_up.macs()
             + mla_gate.macs() + mla_out.macs();
         const uint64_t moe = moe_router.macs() + latent_down.macs() + latent_up.macs()
             + shared_gate_up.macs() + shared_down.macs()
             + 2 * (static_cast<uint64_t>(256) * 96 + static_cast<uint64_t>(96) * 128);
-        return encoder + 3 * (depth + mla + moe);
+        uint64_t cells = 0;
+        for (uint64_t sources = 1; sources <= 3; ++sources)
+            cells += depth_q.macs() + sources * (depth_k.macs() + depth_v.macs())
+                + depth_out.macs() + 2 * mhc_dynamic.macs() + mla + moe;
+        const uint64_t final_depth = depth_q.macs()
+            + 4 * (depth_k.macs() + depth_v.macs()) + depth_out.macs();
+        return encoder + cells + final_depth + heads.macs();
     }
 
     uint64_t event_logical_macs() const {
         const uint64_t encoder = logit.logical_macs() + hidden.logical_macs()
             + cache.logical_macs() + router_tail.logical_macs()
             + 32 * (candidate_a.logical_macs() + candidate_b.logical_macs());
-        const uint64_t depth = depth_q.logical_macs() + depth_k.logical_macs()
-            + depth_v.logical_macs() + depth_out.logical_macs();
         const uint64_t mla = mla_q.logical_macs() + mla_kv_down.logical_macs()
             + mla_kv_up.logical_macs() + mla_gate.logical_macs()
             + mla_out.logical_macs();
@@ -148,7 +155,16 @@ struct ControllerWeights {
             + shared_down.logical_macs()
             + 2 * (static_cast<uint64_t>(256) * 96
                    + static_cast<uint64_t>(96) * 128);
-        return encoder + 3 * (depth + mla + moe);
+        uint64_t cells = 0;
+        for (uint64_t sources = 1; sources <= 3; ++sources)
+            cells += depth_q.logical_macs()
+                + sources * (depth_k.logical_macs() + depth_v.logical_macs())
+                + depth_out.logical_macs() + 2 * mhc_dynamic.logical_macs()
+                + mla + moe;
+        const uint64_t final_depth = depth_q.logical_macs()
+            + 4 * (depth_k.logical_macs() + depth_v.logical_macs())
+            + depth_out.logical_macs();
+        return encoder + cells + final_depth + heads.logical_macs();
     }
 
 private:
@@ -207,9 +223,12 @@ static uint64_t run_event(const ControllerWeights &w, Scratch &s, int layer, int
     }
     for (int repeat = 0; repeat < 3; ++repeat) {
         gemv(w.depth_q, s.x192, s.output);
-        gemv(w.depth_k, s.x192, s.output);
-        gemv(w.depth_v, s.x192, s.output);
+        for (int source = 0; source <= repeat; ++source) {
+            gemv(w.depth_k, s.x192, s.output);
+            gemv(w.depth_v, s.x192, s.output);
+        }
         gemv(w.depth_out, s.x128, s.output);
+        gemv(w.mhc_dynamic, s.x192, s.output);
         gemv(w.mla_q, s.x192, s.output);
         gemv(w.mla_kv_down, s.x192, s.output);
         gemv(w.mla_kv_up, s.x64, s.output);
@@ -226,9 +245,18 @@ static uint64_t run_event(const ControllerWeights &w, Scratch &s, int layer, int
         expert_gemv(w.expert_down, expert0, 96, s.x128, s.output);
         expert_gemv(w.expert_gate_up, expert1, 256, s.x96, s.output);
         expert_gemv(w.expert_down, expert1, 96, s.x128, s.output);
+        gemv(w.mhc_dynamic, s.x192, s.output);
         checksum = (checksum << 7) | (checksum >> 57);
         checksum += static_cast<uint32_t>(s.output[(layer + repeat) % 96]);
     }
+    gemv(w.depth_q, s.x192, s.output);
+    for (int source = 0; source < 4; ++source) {
+        gemv(w.depth_k, s.x192, s.output);
+        gemv(w.depth_v, s.x192, s.output);
+    }
+    gemv(w.depth_out, s.x128, s.output);
+    gemv(w.heads, s.x192, s.output);
+    checksum += static_cast<uint32_t>(s.output[layer % 107]);
     return checksum;
 }
 

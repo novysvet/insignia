@@ -19,13 +19,20 @@ REPO=/mnt/c/coding/Insignia-glm53-dflash2
 PY=/var/lib/insignia/bench-venv/bin/python
 OUT=/var/lib/insignia/bench-results/s10-approx-quality/$LABEL
 FORCED=$OUT/forced.csv
+FORCE_COUNT=${INSIGNIA_GLM53_FALSIFIER_TOKENS:-32}
 
 test -x "$BIN"
 test -f "$PROMPT"
 test -f "$REFERENCE_LOG"
 test ! -e "$OUT"
 mkdir -p "$OUT"
-sed -n 's/^greedy IDs //p' "$REFERENCE_LOG" | head -n 1 | tr ' ' ',' > "$FORCED"
+(( FORCE_COUNT >= 2 && FORCE_COUNT <= 240 ))
+sed -n 's/^greedy IDs //p' "$REFERENCE_LOG" | head -n 1 | \
+  awk -v limit="$FORCE_COUNT" '{
+    for (field = 1; field <= NF && field <= limit; ++field)
+      printf "%s%s", field == 1 ? "" : ",", $field
+    printf "\n"
+  }' > "$FORCED"
 test -s "$FORCED"
 (( $(awk -F, '{print NF}' "$FORCED") >= 2 ))
 

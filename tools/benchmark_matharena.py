@@ -201,6 +201,9 @@ def base_environment(args: argparse.Namespace, policy: str) -> dict[str, str]:
         "INSIGNIA_GLM53_DF_BATCH_VERIFY": "1",
         **POLICIES[policy],
     })
+    environment.pop("INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR", None)
+    if args.prefill_full_layer_major:
+        environment["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"] = "1"
     return environment
 
 
@@ -398,6 +401,8 @@ def main() -> None:
     parser.add_argument("--q8-budget-mb", type=int, default=10240)
     parser.add_argument("--readers", type=int, default=4)
     parser.add_argument("--max-context", type=int, default=8192)
+    parser.add_argument("--prefill-full-layer-major", action="store_true",
+                        help="use the full-prompt layer-major prefill path")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--list-only", action="store_true")
     parser.add_argument("--show-problems", action="store_true")
@@ -515,6 +520,7 @@ def main() -> None:
         "generate": args.generate,
         "quality_tokens": args.quality_tokens,
         "max_ppl_delta": args.max_ppl_delta,
+        "prefill_full_layer_major": args.prefill_full_layer_major,
         "results": all_results,
     }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(args.output)

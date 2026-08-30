@@ -1,5 +1,33 @@
 # progress
 
+### 2026-08-30 (session 10) - MathArena ArXivLean frontier; cache-aware Top-6 survives
+
+New hard-prompt default: `MathArena/arxivlean-0326` replaces MATH-500 for new
+campaigns. The 41-problem CC BY-SA 4.0 Parquet is staged persistently on
+glm-box. `tools/benchmark_matharena.py` implements an explicitly non-official
+one-shot Lean 4.29 profile (the canonical benchmark supplies iterative Lean and
+search tools), cold prefill/decode measurement, decoded-output reports, and
+same-token full-vocabulary cosine/MSE/KL/JS/PPL gates. On problem 40, the
+hardest by GLM prompt length (938 tokens), exact was 157.6 s prefill / 595.8
+ms-token decode (1.678 tok/s). Plain Top-6 reached 499.9 ms/token (2.000 tok/s,
++19.2% throughput); cache-aware Top-6 reached 401.5 ms/token (2.491 tok/s,
++48.4%). The latter changed 9,518/14,448 rows within 0.001 router regret and
+cut expert read-wait 307.1->241.6 s. Its 64-token forced gate was 60/64 top-1,
+cosine 0.976259, MSE 0.3301, KL 0.01377, JS 0.003417, and PPL
+1.1398->1.1496 (+0.86%), safely inside the user's 3.5% budget. None of the
+320-token one-shot arms reached Lean code; that is expected on this frontier
+and is not treated as a normal-prompt failure. Full findings:
+`audits/s10-matharena-arxivlean.md`.
+
+Two late CPU deliverables were triaged in the same wave. The DFlash2 ring
+archive failed every gate and contained no applicable patch, though its
+2048-slot/window semantics are useful future design material. The two-phase
+body/tail I/O falsifier was rescued after fixing two validator/schema mistakes
+in an isolated review copy and then run against the exact hash-locked 504-scale
+and 608,044-route inputs. Verdict KILL: favorable gain only 20.1 ms/token
+(2.41%), robust minimum -24.6 ms/token (-2.37%), perfect-oracle primary ceiling
+2.40%. No production patch was applied.
+
 ### 2026-08-30 (session 10) - compute-heavy cache-aware Top-4 verifier
 
 Full findings: `audits/s10-learned-falsifier.md`. Fixed Top-4 now composes with

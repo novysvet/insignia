@@ -180,9 +180,14 @@ slower than FP8-TC and rejected.
   bridge the drafter acceptance collapsed to 1.43 tokens/round (516.7
   ms/token) — drafter/verify alignment investigation in progress; see
   `audits/mla-latent-session.md`.
-- Benchmark harness for real prompts staged: GSM8K + MATH-500 canonical data on
-  glm-box, driver `tools/benchmark_math.py` (performance + parity only, no
-  accuracy grading).
+- Hard benchmark frontier: `MathArena/arxivlean-0326` (41 Lean 4.29 theorem
+  problems) is staged on glm-box and replaces MATH-500 for new work. Driver
+  `tools/benchmark_matharena.py` runs an explicitly non-official one-shot
+  profile, records prefill/decode and readable outputs, and teacher-forces the
+  exact continuation for full-vocabulary cosine/MSE/KL/JS/PPL gates. The
+  canonical MathArena agent has Lean/search tools that Insignia does not yet
+  expose, so absolute solve rate is never inferred from this harness. GSM8K
+  remains useful for easy/medium coverage; MATH-500 artifacts are historical.
 - The toy 84M oracle (`/var/lib/insignia/glm53-tiny`) and the independent
   NumPy references (`tools/reference_glm53_numpy.py`, `tools/dflash2_oracle.py`,
   `tools/mtp_oracle.py`) remain the parity ground truth.

@@ -2788,9 +2788,7 @@ public:
             require(df_logit_guard_margin_ > 0.0f,
                     "INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN must be positive");
             require(dflash2_on_, "DFlash logit guard requires DFlash2");
-            require(!df_cache_route_k_,
-                    "DFlash logit guard and cache-aware routing are separate A/B arms");
-            std::printf("DFlash2 logit guard: exact row when draft margin < %.3f\n",
+            std::printf("DFlash2 logit guard: disable row approximation when draft margin < %.3f\n",
                         df_logit_guard_margin_);
         }
         if (const char *threshold =

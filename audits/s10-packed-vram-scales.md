@@ -107,3 +107,24 @@ but its short-run device-hit gain is much smaller than the trace-replay sample
 predicted. Keep the knob for longer warm-horizon experiments and combination
 with cache-aware routing. Do not count a decode or prefill speedup from this
 work until a longer paired run clears run-to-run variance.
+
+## Joint-routing interaction
+
+The packed representation was retained and tested together with the validated
+retain-7 joint cache policy on GSM p02. This is the favorable reuse case: both
+arms used identical XPR1-v2 transport and joint routing, while only persistent
+slot representation changed.
+
+Across expanded->packed and packed->expanded orderings, expanded slots measured
+461.7/472.7 ms/token and packed slots measured 472.3/468.4 ms/token. The medians
+were therefore 467.2 and 470.35 ms/token: packed was 0.67% slower, well inside
+the storage-noise floor. Prompt time and the DFlash acceptance path were matched
+within each bracket (15 rounds, 2.13 accepted/round).
+
+The causal device counter did improve. In the first ordering, the 294-slot
+packed arena reached 447 device hits versus 384 for the 281-slot expanded arena,
+avoiding an additional 0.83 GiB of PCIe traffic. The extra scale-expansion work
+consumed that benefit at this horizon. Keep the feature: it is exact, increases
+capacity, and reduces transfers. Do not claim a wall-time win or enable it by
+default until either the expansion path is cheaper or a longer warm run makes
+the extra slots dominate.

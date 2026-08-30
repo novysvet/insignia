@@ -172,18 +172,20 @@ def draft_logit_guard(path: Path, approx: np.ndarray, blocks: list[dict],
                       f"| {rank}/{len(samples)} |")
 
     print("\nCausal per-row fallback frontier (highest predicted risk exactified):")
-    print("| risk feature | exact rows | remaining MSE | cosine | top1 mismatches |")
-    print("|---|---:|---:|---:|---:|")
+    print("| risk feature | exact rows | guarded-edge raw | remaining MSE | cosine | top1 mismatches |")
+    print("|---|---:|---:|---:|---:|---:|")
     total = len(samples)
     for name, sign in risks:
         order = sorted(range(total), key=lambda i: sign * samples[i][name], reverse=True)
         for guarded_count in sorted({0, math.ceil(total / 4), math.ceil(total / 2)}):
             guarded = set(order[:guarded_count])
+            edge = ("-" if not guarded_count else
+                    f"{samples[order[guarded_count - 1]][name]:.6g}")
             kept = [sample for index, sample in enumerate(samples) if index not in guarded]
             mse = math.fsum(sample["mse"] for sample in kept) / total
             cos_loss = math.fsum(sample["cos_loss"] for sample in kept) / total
             mismatches = sum(sample["mismatch"] for sample in kept)
-            print(f"| {name} | {guarded_count}/{total} | {mse:.4e} "
+            print(f"| {name} | {guarded_count}/{total} | {edge} | {mse:.4e} "
                   f"| {1.0 - cos_loss:.6f} | {mismatches} |")
 
 

@@ -2671,11 +2671,31 @@ public:
         if (df_approx_mass_ > 0.0f)
             std::printf("DFlash2 adaptive verify: mass %.3f, k=%d..%d, retained weights unchanged\n",
                         df_approx_mass_, df_approx_min_k_, df_approx_max_k_);
+        if (const char *candidate_k = std::getenv("INSIGNIA_GLM53_DF_CACHE_ROUTE_K")) {
+            df_cache_route_k_ = std::atoi(candidate_k);
+            require(df_cache_route_k_ >= 8 && df_cache_route_k_ <= 32,
+                    "INSIGNIA_GLM53_DF_CACHE_ROUTE_K must be 8..32");
+            require(dflash2_on_, "cache-aware DFlash routing requires DFlash2");
+            require(!df_approx_topm_ && df_approx_mass_ == 0.0f,
+                    "cache-aware routing and expert pruning are separate A/B arms");
+            if (const char *retain = std::getenv("INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN"))
+                df_cache_route_retain_ = std::atoi(retain);
+            if (const char *regret = std::getenv("INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET"))
+                df_cache_route_regret_ = std::strtof(regret, nullptr);
+            require(df_cache_route_retain_ == 6 || df_cache_route_retain_ == 7,
+                    "cache-aware DFlash routing retain must be 6 or 7");
+            require(df_cache_route_regret_ >= 0.0f && df_cache_route_regret_ <= 0.05f,
+                    "cache-aware DFlash routing regret must be in [0,0.05]");
+            std::printf("DFlash2 cache-aware route: top-%d, retain %d, regret %.4f\n",
+                        df_cache_route_k_, df_cache_route_retain_, df_cache_route_regret_);
+        }
         if (const char *margin = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN")) {
             df_logit_guard_margin_ = std::strtof(margin, nullptr);
             require(df_logit_guard_margin_ > 0.0f,
                     "INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN must be positive");
             require(dflash2_on_, "DFlash logit guard requires DFlash2");
+            require(!df_cache_route_k_,
+                    "DFlash logit guard and cache-aware routing are separate A/B arms");
             std::printf("DFlash2 logit guard: exact row when draft margin < %.3f\n",
                         df_logit_guard_margin_);
         }
@@ -2763,7 +2783,7 @@ public:
         }
         if (!moe_metrics_path_.empty() || !falsifier_trace_path_.empty()) {
             require(dflash2_on_, "DFlash MoE diagnostics require DFlash2");
-            require(!df_approx_topm_ && df_approx_mass_ == 0.0f,
+            require(!df_approx_topm_ && df_approx_mass_ == 0.0f && !df_cache_route_k_,
                     "MoE diagnostics must run on the exact top-8 verification path");
             require(nvfp4_experts_, "MoE diagnostics require retained NVFP4 expert outputs");
         }
@@ -3203,6 +3223,12 @@ private:
     int df_approx_topm_ = 0;
     float df_approx_mass_ = 0.0f;
     int df_approx_min_k_ = 3, df_approx_max_k_ = 8;
+    int df_cache_route_k_ = 0, df_cache_route_retain_ = 7;
+    float df_cache_route_regret_ = 0.0025f;
+    uint64_t df_cache_route_rows_ = 0, df_cache_route_changed_ = 0;
+    uint64_t df_cache_route_substitutions_ = 0;
+    double df_cache_route_regret_sum_ = 0.0, df_cache_route_regret_max_ = 0.0;
+    int64_t df_cache_route_disk_saved_ = 0, df_cache_route_h2d_saved_ = 0;
     float df_logit_guard_margin_ = 0.0f;
     std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
     uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
@@ -4825,7 +4851,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     // prefill and scalar decode retain all eight routed experts, and the
     // unset path keeps the existing arithmetic and traffic exactly intact.
     const bool approximate_verify = kda_archive_ &&
-        (df_approx_topm_ || df_approx_mass_ > 0.0f);
+        (df_approx_topm_ || df_approx_mass_ > 0.0f || df_cache_route_k_);
     std::vector<int> exec_count(size_t(tokens), topk);
     linear_multi(stem + "gate.weight", input, c_router_, tokens, experts, hidden_);
     std::vector<float> logits(size_t(tokens) * experts);
@@ -4835,12 +4861,15 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     require(bias.size() == size_t(experts), "wrong router bias geometry");
     std::vector<std::vector<std::pair<int, float>>> selection(tokens);
     const bool trace_falsifier = falsifier_trace_ != nullptr;
-    const size_t diagnostic_rows = trace_falsifier ? size_t(tokens) : 0;
-    std::vector<std::array<uint16_t, 32>> candidate_experts(diagnostic_rows);
-    std::vector<std::array<float, 32>> candidate_logits(diagnostic_rows);
-    std::vector<std::array<float, 32>> candidate_choice(diagnostic_rows);
-    std::vector<std::array<float, 8>> router_summary(diagnostic_rows);
-    std::vector<std::array<uint32_t, 4>> candidate_residency(diagnostic_rows);
+    const bool widen_router = trace_falsifier || (kda_archive_ && df_cache_route_k_);
+    const size_t widened_rows = widen_router ? size_t(tokens) : 0;
+    std::vector<std::array<uint16_t, 32>> candidate_experts(widened_rows);
+    std::vector<std::array<float, 32>> candidate_logits(widened_rows);
+    std::vector<std::array<float, 32>> candidate_choice(widened_rows);
+    std::vector<std::array<float, 8>> router_summary(widened_rows);
+    std::vector<std::array<uint32_t, 4>> candidate_residency(widened_rows);
+    std::vector<std::array<int, 8>> baseline_experts(
+        kda_archive_ && df_cache_route_k_ ? size_t(tokens) : 0);
     for (int token = 0; token < tokens; ++token) {
         const float *row = logits.data() + size_t(token) * experts;
         std::vector<float> scores(experts), choice(experts);
@@ -4854,9 +4883,12 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             [&](int left, int right) { return choice[left] > choice[right]; });
         float denominator = 0.0f;
         for (int slot = 0; slot < topk; ++slot) denominator += scores[order[slot]];
-        for (int slot = 0; slot < topk; ++slot)
+        for (int slot = 0; slot < topk; ++slot) {
             selection[token].emplace_back(order[slot], 2.5f * scores[order[slot]] / denominator);
-        if (trace_falsifier) {
+            if (!baseline_experts.empty())
+                baseline_experts[size_t(token)][size_t(slot)] = order[slot];
+        }
+        if (widen_router) {
             double raw_sum = 0.0, raw_square_sum = 0.0, score_sum = 0.0;
             float raw_max = -std::numeric_limits<float>::infinity();
             float raw_second = raw_max;
@@ -4895,6 +4927,104 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 choice[order[0]] - choice[order[1]], selected_entropy};
             candidate_residency[size_t(token)] = expert_stager_->residency_masks(
                 layer, candidate_experts[size_t(token)].data(), 32);
+        }
+        if (kda_archive_ && df_cache_route_k_ && df_cache_route_regret_ > 0.0f) {
+            const auto &candidates = candidate_experts[size_t(token)];
+            const auto &residency = candidate_residency[size_t(token)];
+            std::array<int, 288> candidate_rank{};
+            candidate_rank.fill(-1);
+            for (int rank = 0; rank < df_cache_route_k_; ++rank)
+                candidate_rank[size_t(candidates[size_t(rank)])] = rank;
+            const auto &baseline = baseline_experts[size_t(token)];
+            double baseline_score = 0.0, score_scale = 0.0;
+            for (int slot = 0; slot < topk; ++slot) {
+                baseline_score += choice[size_t(baseline[size_t(slot)])];
+                score_scale += std::fabs(choice[size_t(baseline[size_t(slot)])]);
+            }
+            auto transfer = [&](int expert) {
+                const int rank = candidate_rank[size_t(expert)];
+                require(rank >= 0, "cache-aware baseline expert missing from candidate pool");
+                const uint32_t bit = uint32_t(1u) << rank;
+                const bool device = (residency[2] & bit) != 0;
+                const bool host = (residency[0] & bit) != 0;
+                const bool inflight = (residency[1] & bit) != 0;
+                return std::pair<int, int>{device ? 0 : !(host || inflight), device ? 0 : 1};
+            };
+            std::array<int, 8> best = baseline;
+            int best_disk = 0, best_h2d = 0;
+            for (int expert : baseline) {
+                const auto [disk, h2d] = transfer(expert);
+                best_disk += disk;
+                best_h2d += h2d;
+            }
+            const int baseline_disk = best_disk, baseline_h2d = best_h2d;
+            double best_regret = 0.0;
+            int best_substitutions = 0;
+            auto consider = [&](int first_tail, int second_tail) {
+                std::array<int, 8> trial{};
+                for (int slot = 0; slot < df_cache_route_retain_; ++slot)
+                    trial[size_t(slot)] = baseline[size_t(slot)];
+                trial[size_t(df_cache_route_retain_)] = first_tail;
+                if (df_cache_route_retain_ == 6) trial[7] = second_tail;
+                std::sort(trial.begin(), trial.end(), [&](int left, int right) {
+                    return candidate_rank[size_t(left)] < candidate_rank[size_t(right)];
+                });
+                double selected_score = 0.0;
+                int disk = 0, h2d = 0, substitutions = 0;
+                for (int expert : trial) {
+                    selected_score += choice[size_t(expert)];
+                    const auto [d, h] = transfer(expert);
+                    disk += d;
+                    h2d += h;
+                    substitutions += std::find(baseline.begin(), baseline.end(), expert) ==
+                                     baseline.end();
+                }
+                const double regret = std::max(0.0, baseline_score - selected_score);
+                const double ratio = score_scale > 0.0 ? regret / score_scale : 0.0;
+                if (ratio > double(df_cache_route_regret_) + 2.0e-7) return;
+                const bool better = disk < best_disk ||
+                    (disk == best_disk && (h2d < best_h2d ||
+                     (h2d == best_h2d && (regret < best_regret ||
+                      (regret == best_regret && substitutions < best_substitutions)))));
+                if (better) {
+                    best = trial;
+                    best_disk = disk;
+                    best_h2d = h2d;
+                    best_regret = regret;
+                    best_substitutions = substitutions;
+                }
+            };
+            std::vector<int> pool;
+            for (int rank = 0; rank < df_cache_route_k_; ++rank) {
+                const int expert = candidates[size_t(rank)];
+                if (std::find(baseline.begin(),
+                              baseline.begin() + df_cache_route_retain_, expert) ==
+                    baseline.begin() + df_cache_route_retain_)
+                    pool.push_back(expert);
+            }
+            if (df_cache_route_retain_ == 7) {
+                for (int expert : pool) consider(expert, -1);
+            } else {
+                for (size_t first = 0; first < pool.size(); ++first)
+                    for (size_t second = first + 1; second < pool.size(); ++second)
+                        consider(pool[first], pool[second]);
+            }
+            if (best_substitutions) {
+                float selected_denominator = 0.0f;
+                for (int expert : best) selected_denominator += scores[size_t(expert)];
+                selection[size_t(token)].clear();
+                for (int expert : best)
+                    selection[size_t(token)].emplace_back(
+                        expert, 2.5f * scores[size_t(expert)] / selected_denominator);
+            }
+            ++df_cache_route_rows_;
+            df_cache_route_changed_ += best_substitutions != 0;
+            df_cache_route_substitutions_ += uint64_t(best_substitutions);
+            const double regret_ratio = score_scale > 0.0 ? best_regret / score_scale : 0.0;
+            df_cache_route_regret_sum_ += regret_ratio;
+            df_cache_route_regret_max_ = std::max(df_cache_route_regret_max_, regret_ratio);
+            df_cache_route_disk_saved_ += baseline_disk - best_disk;
+            df_cache_route_h2d_saved_ += baseline_h2d - best_h2d;
         }
         const int verify_row = capture_offset_ + token;
         const bool logit_guarded = kda_archive_ && df_logit_guard_margin_ > 0.0f &&
@@ -4943,9 +5073,11 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     if (approximate_verify) {
         std::vector<uint8_t> exact_seen(size_t(experts), 0);
         uint64_t exact_union = 0;
-        for (const auto &picks : selection)
+        for (int token = 0; token < tokens; ++token)
             for (int slot = 0; slot < topk; ++slot) {
-                const int expert = picks[size_t(slot)].first;
+                const int expert = df_cache_route_k_
+                    ? baseline_experts[size_t(token)][size_t(slot)]
+                    : selection[size_t(token)][size_t(slot)].first;
                 if (!exact_seen[size_t(expert)]) {
                     exact_seen[size_t(expert)] = 1;
                     ++exact_union;
@@ -5826,6 +5958,16 @@ std::vector<std::pair<int, float>> Runner::step(
                         (unsigned long long)df_logit_guard_rows_,
                         100.0 * df_logit_guarded_rows_ / df_logit_guard_rows_);
     }
+    if (df_cache_route_rows_)
+        std::printf("  DFlash cache route changed %llu/%llu rows with %llu substitutions "
+                    "(regret mean %.6f max %.6f; immediate disk/H2D records saved %lld/%lld)\n",
+                    (unsigned long long)df_cache_route_changed_,
+                    (unsigned long long)df_cache_route_rows_,
+                    (unsigned long long)df_cache_route_substitutions_,
+                    df_cache_route_regret_sum_ / df_cache_route_rows_,
+                    df_cache_route_regret_max_,
+                    (long long)df_cache_route_disk_saved_,
+                    (long long)df_cache_route_h2d_saved_);
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",
                     q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8",

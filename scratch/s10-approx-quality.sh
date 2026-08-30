@@ -51,6 +51,9 @@ run() {
       -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
       -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN \
+      -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
+      -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
+      -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
       -u INSIGNIA_GLM53_DF_MOE_METRICS \
       "${COMMON[@]}" "$@" \
       INSIGNIA_GLM53_FORCE_LOGITS_DUMP="$OUT/$tag-logits.f32" \
@@ -66,7 +69,11 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^mass([0-9]+)-guard([0-9]+)$ ]]; then
+  if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)$ ]]; then
+    run "$policy" INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN="${BASH_REMATCH[2]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.${BASH_REMATCH[3]}"
+  elif [[ $policy =~ ^mass([0-9]+)-guard([0-9]+)$ ]]; then
     tag=$policy
     threshold=0.${BASH_REMATCH[1]}
     guard=0.${BASH_REMATCH[2]}

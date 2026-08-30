@@ -8,8 +8,8 @@ PROMPT=$1
 REFERENCE_LOG=$2
 LABEL=$3
 shift 3
-TOPMS=("$@")
-(( ${#TOPMS[@]} )) || TOPMS=(6 4 3 2)
+POLICIES=("$@")
+(( ${#POLICIES[@]} )) || POLICIES=(6 4 3 2)
 
 BIN=/var/tmp/insignia-build/glm53-generate
 MODEL=/var/lib/insignia/glm53-flash-text
@@ -47,21 +47,31 @@ run() {
   echo "=== $tag ==="
   env -u INSIGNIA_GLM53_DF_APPROX_TOPM \
       -u INSIGNIA_GLM53_DF_APPROX_RENORM \
+      -u INSIGNIA_GLM53_DF_APPROX_MASS \
+      -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
+      -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       -u INSIGNIA_GLM53_DF_MOE_METRICS \
       "${COMMON[@]}" "$@" \
       INSIGNIA_GLM53_FORCE_LOGITS_DUMP="$OUT/$tag-logits.f32" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 1 "$FP8" \
       > "$OUT/$tag.log" 2>&1
-  grep -E '^target-forced logits|^DFlash2 approximate verify' "$OUT/$tag.log"
+  grep -E '^target-forced logits|^DFlash2 (approximate|adaptive) verify' "$OUT/$tag.log"
 }
 
 run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv"
 "$PY" "$REPO/tools/summarize_moe_metrics.py" "$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
-for topm in "${TOPMS[@]}"; do
-  tag=top$topm
-  run "$tag" INSIGNIA_GLM53_DF_APPROX_TOPM="$topm"
+for policy in "${POLICIES[@]}"; do
+  if [[ $policy == mass* ]]; then
+    tag=$policy
+    threshold=0.${policy#mass}
+    run "$tag" INSIGNIA_GLM53_DF_APPROX_MASS="$threshold" \
+        INSIGNIA_GLM53_DF_APPROX_MIN_K=3
+  else
+    tag=top$policy
+    run "$tag" INSIGNIA_GLM53_DF_APPROX_TOPM="$policy"
+  fi
   if ! "$PY" "$REPO/tools/compare_logits.py" \
       "$OUT/exact-logits.f32" "$OUT/$tag-logits.f32" \
       --tokens "$FORCED" --cos-threshold 0 --quiet > "$OUT/$tag-compare.txt"; then

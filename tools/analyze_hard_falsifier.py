@@ -265,12 +265,21 @@ def main() -> None:
             if row_exec_k[row_index] >= 0 and row_exec_k[row_index] != value:
                 raise SystemExit("exec_k differs by layer for one verifier row")
             row_exec_k[row_index] = value
+    valid_exec = row_exec_k[row_exec_k >= 0]
+    histogram = ", ".join(
+        f"k{k}:{int(np.count_nonzero(valid_exec == k))}"
+        for k in sorted(set(map(int, valid_exec))))
+    print(f"realized verifier k: mean={float(np.mean(valid_exec)):.3f}, "
+          f"exact-k8={int(np.count_nonzero(valid_exec == 8))}/{len(valid_exec)}, "
+          f"histogram {histogram}")
     print("\nResidual top-1 mismatch locations:")
     block_k = {
         block: "/".join(str(row_exec_k[index]) for index in
                         np.flatnonzero(row_meta[:, 1] == block))
         for block in sorted(set(map(int, row_meta[:, 1])))
     }
+    print("block k schedule: " + ";".join(
+        f"b{block}:{block_k[block]}" for block in block_k))
     print("| output record | block | recent block k | row | exec k | draft p | p drop | entropy delta | margin |")
     print("|---:|---:|---|---:|---:|---:|---:|---:|---:|")
     for index in np.flatnonzero(labels):

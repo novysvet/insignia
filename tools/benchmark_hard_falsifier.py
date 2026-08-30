@@ -34,6 +34,12 @@ POLICIES: dict[str, dict[str, str]] = {
     "top6": {
         "INSIGNIA_GLM53_DF_APPROX_TOPM": "6",
     },
+    "top6-cache": {
+        "INSIGNIA_GLM53_DF_APPROX_TOPM": "6",
+        "INSIGNIA_GLM53_DF_CACHE_ROUTE_K": "32",
+        "INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET": ".0010",
+        "INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS": "8",
+    },
     "top5": {
         "INSIGNIA_GLM53_DF_APPROX_TOPM": "5",
     },

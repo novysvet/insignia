@@ -48,6 +48,17 @@ struct Matrix {
     }
 };
 
+static inline __m256i dpbusd(__m256i accumulator, __m256i input,
+                             const __m256i *weight) {
+    // This exact Raptor Lake target wants the destructive VEX dependency.
+    // GCC otherwise materializes each intrinsic result in a fresh register
+    // and copies all four accumulators after every K tile.
+    asm("%{vex%} vpdpbusd %2, %1, %0"
+        : "+x"(accumulator)
+        : "x"(input), "m"(*weight));
+    return accumulator;
+}
+
 __attribute__((noinline)) static void vnni_gemv_rows(
     const int8_t *__restrict weight,
     const int32_t *__restrict correction,
@@ -77,14 +88,14 @@ __attribute__((noinline)) static void vnni_gemv_rows(
             const __m256i signed_input = _mm256_loadu_si256(
                 reinterpret_cast<const __m256i *>(input + column));
             const __m256i unsigned_input = _mm256_xor_si256(signed_input, sign_flip);
-            accumulator0 = _mm256_dpbusd_epi32(accumulator0, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row0 + column)));
-            accumulator1 = _mm256_dpbusd_epi32(accumulator1, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row1 + column)));
-            accumulator2 = _mm256_dpbusd_epi32(accumulator2, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row2 + column)));
-            accumulator3 = _mm256_dpbusd_epi32(accumulator3, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row3 + column)));
+            accumulator0 = dpbusd(accumulator0, unsigned_input,
+                reinterpret_cast<const __m256i *>(row0 + column));
+            accumulator1 = dpbusd(accumulator1, unsigned_input,
+                reinterpret_cast<const __m256i *>(row1 + column));
+            accumulator2 = dpbusd(accumulator2, unsigned_input,
+                reinterpret_cast<const __m256i *>(row2 + column));
+            accumulator3 = dpbusd(accumulator3, unsigned_input,
+                reinterpret_cast<const __m256i *>(row3 + column));
         }
         output[row] = horizontal_sum(accumulator0) - correction[row];
         output[row + 1] = horizontal_sum(accumulator1) - correction[row + 1];
@@ -98,8 +109,8 @@ __attribute__((noinline)) static void vnni_gemv_rows(
             const __m256i signed_input = _mm256_loadu_si256(
                 reinterpret_cast<const __m256i *>(input + column));
             const __m256i unsigned_input = _mm256_xor_si256(signed_input, sign_flip);
-            accumulator = _mm256_dpbusd_epi32(accumulator, unsigned_input,
-                _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row_weight + column)));
+            accumulator = dpbusd(accumulator, unsigned_input,
+                reinterpret_cast<const __m256i *>(row_weight + column));
         }
         output[row] = horizontal_sum(accumulator) - correction[row];
     }

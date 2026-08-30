@@ -76,7 +76,6 @@ struct Matrix {
 
 static inline __m256i dpbusd(__m256i accumulator, __m256i input,
                              const __m256i *weight) {
-#if defined(INSIGNIA_VNNI_INLINE_ASM)
     // GCC 16 otherwise treats the intrinsic as a fresh SSA destination and
     // copies every accumulator after every K tile.  The tied operand states
     // the destructive VEX dependency directly and keeps it register-resident.
@@ -84,9 +83,6 @@ static inline __m256i dpbusd(__m256i accumulator, __m256i input,
         : "+x"(accumulator)
         : "x"(input), "m"(*weight));
     return accumulator;
-#else
-    return _mm256_dpbusd_epi32(accumulator, input, *weight);
-#endif
 }
 
 __attribute__((noinline)) static void vnni_rows(

@@ -141,6 +141,24 @@ for policy in "${POLICIES[@]}"; do
         INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P="$probability" \
         INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP="$drop" \
         INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="${BASH_REMATCH[7]}"
+  elif [[ $policy =~ ^top([2-7])-up([0-9]+)-ud([0-9]+)-uk([5-8])-m([0-9]+)$ ]]; then
+    tag=$policy
+    probability=$(awk -v raw="${BASH_REMATCH[2]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    drop=$(awk -v raw="${BASH_REMATCH[3]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    margin=$(awk -v raw="${BASH_REMATCH[5]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P="$probability" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP="$drop" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="${BASH_REMATCH[4]}" \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN="$margin"
+  elif [[ $policy =~ ^top([2-7])-up([0-9]+)-ud([0-9]+)-uk([5-8])$ ]]; then
+    tag=$policy
+    probability=$(awk -v raw="${BASH_REMATCH[2]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    drop=$(awk -v raw="${BASH_REMATCH[3]}" 'BEGIN { printf "%.6f", raw / 1000 }')
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_P="$probability" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_TOP1_DROP="$drop" \
+        INSIGNIA_GLM53_DF_UNCERTAINTY_GUARD_K="${BASH_REMATCH[4]}"
   elif [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])-m([0-9]+)-cjs([0-9]+)$ ]]; then
     tag=$policy
     margin=$(awk -v raw="${BASH_REMATCH[5]}" 'BEGIN { printf "%.6f", raw / 100 }')

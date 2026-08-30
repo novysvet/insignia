@@ -508,3 +508,62 @@ sample demonstrated a possible bandwidth win (verify 976.2 versus 1,126.8
 ms/round), but its order-paired median was worse and unstable. Keep it as an
 aggressive opt-in research arm; do not replace retain-7 without a predictor or
 acceptance-aware guard.
+
+## Causal draft-margin guard and adaptive retain
+
+The first retain-6 margin experiment exposed a state-causality bug. A p12
+top-1 miss had same-position DFlash margin 0.740591, below the configured 0.75
+threshold, yet exactifying only that row did not repair the output: earlier
+approximate rows had already changed mHC streams, KDA recurrence, attention,
+and later routers. Commit `50d997e` makes the default guard prefix-closed. If
+row r is risky, rows 0..r disable approximation. Commit `fd015f4` retains the
+old row-local behavior only behind
+`INSIGNIA_GLM53_DF_LOGIT_GUARD_PREFIX=0` as an explicitly aggressive arm.
+
+With retain-6 joint routing and exact top-8 guarded prefixes, p12 recovered
+32/32 top-1 and improved to cosine 0.995676, MSE 0.07608, KL 0.003591, JS
+0.000800, and PPL 1.0596. The cost was conservative routing: 8/20 free verify
+rows became exact, union removal fell to 7.8%, and decode was 493.8 ms/token
+versus retain-7 at 410.3 in the matched clean bracket.
+
+`INSIGNIA_GLM53_DF_CACHE_GUARD_RETAIN=7` adds a less conservative controller:
+ordinary rows use retain-6, while guarded causal prefixes tighten only to
+retain-7. On p12 it kept exact IDs and the exact 11-round/2.91 acceptance path,
+tightened 4/20 rows, and removed 12.1% of union records versus retain-7's 9.4%.
+Opposite-order wall measurements were 467.9/465.2 ms/token for adaptive retain
+and 413.9/521.6 for retain-7; medians 466.55 versus 467.75 are effectively tied.
+On p02 it removed 12.1% versus 10.3%, but tightened 14/32 rows, reduced
+acceptance from 2.29 to 2.00, and did not establish a wall win. Keep this
+controller opt-in; its causal counters improve bandwidth, but the scalar
+draft-margin feature is not selective enough across prompts.
+
+During the first adaptive-retain free run, a tied router score exposed another
+joint-solver invariant bug: independent partial sorts did not reconstruct the
+baseline action at candidate ranks 6/7. Commit `80a02fa` now inserts the true
+baseline explicitly and deduplicates actions before truncation. The failure
+was deterministic host logic, not a GPU or overclock fault.
+
+## Causal-prefix Top-4 verification
+
+The same prefix guard has much larger leverage with fixed Top-4 provisional
+verification. `INSIGNIA_GLM53_DF_APPROX_TOPM=4` plus
+`INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.75` executes exact Top-8 on risky
+causal prefixes and Top-4 elsewhere, preserving original weights and order.
+
+On MATH p12, forced quality improved from fixed Top-4's 31/32 top-1, cosine
+0.974096, and MSE 0.4329 to 32/32, 0.989119, and 0.1891. KL was 0.003356, JS
+0.000802, and PPL improved from exact 1.0651 to 1.0521. In free decode it
+exactified 4/20 rows, executed mean k=4.8, removed 40.0% of union records, and
+reproduced every exact greedy ID. Two independent timings were 401.6 and 400.8
+ms/token (median 401.2, 2.493 tok/s). Against the faster adjacent exact control
+at 497.7 ms/token, this is -19.4% latency / +24.1% throughput.
+
+On GSM p02, quality also recovered to 32/32 top-1, cosine 0.995661, MSE
+0.09122, KL 0.008594, JS 0.002092, and PPL 1.1150 versus exact 1.1155. The
+fixed threshold over-guarded the free trajectory, however: 16/28 rows became
+exact by the final report, mean k rose to 6.286, and union removal fell to
+21.4%. It measured 502.8 ms/token versus the faster exact control at 484.5,
+so no p02 speedup is claimed. The fixed-Top-4 mismatch at record 29 had an
+extremely low draft margin (0.0270), whereas p12's miss had margin 0.7406.
+This is direct evidence that a single global threshold leaves substantial
+performance on the table and motivates the learned/contextual falsifier.

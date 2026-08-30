@@ -86,7 +86,17 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^top([1-8])-m([0-9]+)(-row)?$ ]]; then
+  if [[ $policy =~ ^top([1-8])-m([0-9]+)-cjs([0-9]+)$ ]]; then
+    tag=$policy
+    topm=${BASH_REMATCH[1]}
+    margin_raw=${BASH_REMATCH[2]}
+    calibration_raw=${BASH_REMATCH[3]}
+    margin=$(awk -v raw="$margin_raw" 'BEGIN { printf "%.6f", raw / 100 }')
+    calibration=$(awk -v raw="$calibration_raw" 'BEGIN { printf "%.6f", raw / 100 }')
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="$topm" \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN="$margin" \
+        INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS="$calibration"
+  elif [[ $policy =~ ^top([1-8])-m([0-9]+)(-row)?$ ]]; then
     tag=$policy
     topm=${BASH_REMATCH[1]}
     margin_raw=${BASH_REMATCH[2]}

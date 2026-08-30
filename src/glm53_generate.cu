@@ -6659,7 +6659,11 @@ void Runner::prefill(const std::vector<int> &tokens, int position_base, bool cap
         // restored and replayed to the accepted boundary. Row-sequential
         // verify rounds never roll back (their state always stands at the
         // accepted boundary), so they skip these two whole-state copies.
-        if (verify_may_rollback_) {
+        // An exact retry has just restored these arrays from the original
+        // round-start snapshot.  Preserve that snapshot: copying the restored
+        // state back into the same source buffers is redundant, formed a
+        // reciprocal async D2D sequence, and corrupted layer-0 KDA replay.
+        if (verify_may_rollback_ && !df_retry_replay_) {
             require(!forced_sequential_verify_,
                     "batch verify is forbidden after sequential snapshot elision");
             check(cudaMemcpyAsync(kda_snap_.get(), kda_states_.get(),

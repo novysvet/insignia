@@ -144,6 +144,10 @@ def main() -> None:
         ceiling = analyze(output, [16], [7], [0.01])
         assert len(ceiling["points"]) == 1
         assert ceiling["points"][0]["layer_groups"] == 4
+        joint = analyze(output, [16], [7], [0.01], joint_options=4)
+        point = joint["points"][0]
+        assert point["joint_options"] == 4
+        assert point["joint_union_saved_fraction"] >= point["union_saved_fraction"]
         print("falsifier dataset synthetic test: PASS")
 
 

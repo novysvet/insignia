@@ -79,11 +79,12 @@ run() {
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
+      -u INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS \
       -u INSIGNIA_GLM53_DEVICE_PACKED_SCALES \
       "${COMMON[@]}" "${PLAN_ENV[@]}" "$@" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 "$GENERATE" "$FP8" \
       > "$OUT/$tag.log" 2>&1
-  grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O|^  DFlash (approximate k|expert union|logit guard|cache route|calibration guard)' \
+  grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O|^  DFlash (approximate k|expert union|logit guard|cache route|joint cache union|calibration guard)' \
       "$OUT/$tag.log" | tee "$OUT/$tag.summary"
 }
 
@@ -131,11 +132,20 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
         INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS=.6000
     ;;
+  cachejoint)
+    run cache32-r7-e0025 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025
+    run cache32-r7-e0025-joint6 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6
+    ;;
   packedslots)
     run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
     ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, or packedslots" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, cachejoint, or packedslots" >&2
     exit 64
     ;;
 esac

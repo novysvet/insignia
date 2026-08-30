@@ -21,8 +21,24 @@ masked because the corpus has no aligned free-run labels. Current data are only
 seven prompt units, nine on-policy trajectories, 279 rows/11,718 target-layer
 events, 3,906 exact Gram events, and five top-1 failures. Real training refuses
 to start below 10,000 on-policy rows; local E:-drive AdamW CPU smoke and all new
-tests pass. BF16 CUDA, Dion3/MuonClip, native FP8, data collection, and shadow
-runtime remain open.
+tests pass. Real BF16 CUDA Dion3 smoke now also succeeds after increasing the
+TorchDynamo recompile limit: 28.092 s cold and 5.584 s warm. Matched optimizer
+quality ablations, native FP8 training, and the >=10k-row collection gate remain
+open.
+
+Eager GPU controller inference was rejected at 507.509 ms per four-row verify
+round. A purpose-built i7-14700KF AVX-VNNI runtime is now the selected path:
+the complete synthetic pipeline with checksum-validated real matrix weights
+measures 3.1618 ms median over seven 500-iteration runs (3.1396--3.1926 ms),
+while its pure matrix ceiling is 1.2106 ms / 378.6 GMAC/s. Tied-register VEX
+`VPDPBUSD` removes GCC's accumulator-copy chain and cut a strict paired median
+3.26218->3.18245 ms (2.44%); it is now the default. Full-controller dynamic
+INT8 fake quantization over 13,104 real events retained 0.999707--0.999975
+cosine across heads, with 97.00% Top-2 expert-membership retention. This passes
+the standalone <5 ms runtime/numerical gate, not the learned-quality or engine
+integration gate: auxiliary tensors and online features are not yet in the C++
+runtime, and the checkpoint has only one smoke update. See
+`audits/s10-falsifier-vnni.md`.
 
 The need for free-trajectory labels is measured, not theoretical. ArXivLean
 problem 40 approximate layer-major prefill at regret .0005 reached 15.61 tok/s

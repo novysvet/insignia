@@ -3,9 +3,11 @@
 Date: 2026-08-30
 
 Status: architecture and prompt-held-out training plumbing implemented. CPU
-smoke passes. Real training is deliberately blocked on the still-underfilled
-on-policy corpus; CUDA BF16, Dion3/MuonClip ablations, native FP8, and runtime
-shadow integration remain open.
+and CUDA BF16/Dion3 smoke pass, and a standalone Raptor Lake AVX-VNNI runtime
+ceiling is below 5 ms per four-row round. Real training remains deliberately
+blocked on the underfilled on-policy corpus; optimizer ablations, native FP8
+training, exact native parity, and engine shadow integration remain open. See
+`audits/s10-falsifier-vnni.md` for the runtime and INT8 numerical results.
 
 ## Why this exists
 
@@ -188,7 +190,10 @@ The E:-drive environment installed the exact current Microsoft package at git
 commit `e64832041d8e01989abf609c9550f6307efbff2a`. AdamW CPU smoke passes.
 Dion3 is intentionally reserved for CUDA: its official package uses
 `torch.compile` for orthogonalization, while the recovered Windows install has
-no `cl.exe`. This is an environment limitation, not evidence about Dion3.
+no `cl.exe`. On glm-box, raising TorchDynamo's recompile limit to 128 and
+accumulating 1,024 samples per optimizer step made the real BF16 CUDA smoke
+succeed: 28.092 seconds cold and 5.584 seconds warm. This validates plumbing,
+not optimizer quality.
 
 ## FP8 contract
 
@@ -233,7 +238,13 @@ normal run correctly stopped with:
 refusing underfilled training corpus: 279 on-policy rows < --minimum-rows 10000
 ```
 
-These are plumbing results, not a quality or speed claim.
+The standalone eager CUDA incremental runtime was rejected at 507.509 ms per
+four-row round. The purpose-built i7-14700KF AVX-VNNI ceiling instead reached a
+3.1618 ms seven-run median with real exported matrix weights. Complete
+full-controller INT8 fake quantization over 13,104 events retained
+0.999707--0.999975 cosine across output heads and 97.00% mean Top-2 expert
+membership. Those are arithmetic/runtime results, not learned predictor quality
+or integrated engine speed; the checkpoint contains only one smoke update.
 
 ## Promotion gates
 
@@ -273,4 +284,3 @@ python tools/train_falsifier_moe.py \
   --optimizer dion3-qkclip --precision bf16 \
   --output /var/lib/insignia/falsifier-runs/v1-dion3-qkclip.json
 ```
-

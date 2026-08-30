@@ -28,6 +28,18 @@ and 608,044-route inputs. Verdict KILL: favorable gain only 20.1 ms/token
 (2.41%), robust minimum -24.6 ms/token (-2.37%), perfect-oracle primary ceiling
 2.40%. No production patch was applied.
 
+Exact full-prompt layer-major prefill is now automatic for prompts exceeding
+one configured chunk (normally >128 rows), with `...PREFILL_FULL_LAYER_MAJOR=0`
+as an opt-out. On the 938-token ArXivLean problem 40, two-pair medians were
+157.845->69.187 s, 5.94->13.56 tok/s: 2.28x throughput and 56.2% lower
+latency. A matched run cut expert O_DIRECT 706.852->157.083 GiB and read-wait
+144.063->31.659 s while host hits rose 15.9%->81.8%; ~5.56 GB of bidirectional
+host spill/restore displaced 549.8 GiB of NVMe traffic. On the shortest
+272-token ArXivLean prompt it improved prefill by 1.50-1.73x across two pairs.
+A 40-token pair reproduced every ID and DFlash decision; decode was neutral
+within 1.1% (509.7 vs 515.2 ms/token). Rebuilt auto-selection also reproduced
+digit-identical top-10 logits. Commit `7ec54f4`.
+
 ### 2026-08-30 (session 10) - compute-heavy cache-aware Top-4 verifier
 
 Full findings: `audits/s10-learned-falsifier.md`. Fixed Top-4 now composes with

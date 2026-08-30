@@ -3,6 +3,7 @@
 Date: 2026-08-30
 Branch: `glm53-dflash2-4070ti-super`
 Harness commit: `e9d2ee9`
+Layer-major promotion: `7ec54f4`
 
 ## Benchmark contract
 
@@ -84,6 +85,43 @@ expert-union records by 23.8% and read-wait to 270.746 s. Cache-aware Top-6:
 This is direct evidence that spending spare i7/GPU compute on resident-expert
 selection manufactures effective storage bandwidth on high-entropy prompts.
 
+## Full-prompt layer-major prefill
+
+The existing exact full-prompt scheduler was screened on problem 40 in two
+paired cold processes. It keeps the proven <=128-row GPU kernels and their
+arithmetic order, but visits every prompt chunk of a layer before advancing to
+the next layer. Residual streams spill to host RAM between layers. This extra
+PCIe traffic buys enough temporal locality to reuse a layer's expert records
+instead of rereading them once per prompt chunk.
+
+| scheduler | run 1 | run 2 | median | median tok/s |
+|---|---:|---:|---:|---:|
+| chunked | 157.587 s | 158.102 s | 157.845 s | 5.94 |
+| full-prompt layer-major | 68.585 s | 69.789 s | 69.187 s | 13.56 |
+
+This is a 2.28x throughput gain and 56.2% lower prefill latency. In the second
+matched pair, expert O_DIRECT traffic fell from 706.852 to 157.083 GiB
+(-77.8%), host-cache hits rose from 15.9% to 81.8%, and expert read-wait fell
+from 144.063 to 31.659 seconds. The layer-major path moved 2.779 GB in each
+direction for residual/capture spill and restore; that cheap traffic displaced
+549.8 GiB of NVMe reads. First-token top-10 logits were digit-identical and the
+first IDs were `1654 1184` in every arm.
+
+The shortest ArXivLean prompt (problem 16, 272 tokens) also won in two focused
+pairs: 59.725->34.464 seconds (1.73x) and 56.099->37.387 seconds (1.50x). The
+second pair generated 40 tokens. All 40 IDs, all 13 DFlash rounds, and
+acceptance 3.08/round were identical. Decode was 509.7 versus 515.2 ms/token,
+a 1.1% difference inside normal WSL variance, so no sustained-decode penalty
+is claimed.
+
+Commit `7ec54f4` therefore makes full-prompt layer-major scheduling automatic
+when the initial prompt requires more than one configured prefill chunk
+(normally >128 rows). A single chunk retains the device-resident path.
+`INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR=0|1` is an explicit override, and the
+MathArena harness always writes 0 or 1 so its scheduler A/B remains honest.
+The rebuilt automatic path reproduced problem-16 top-10 digits and IDs and
+finished the 272-token prompt in 34.945 seconds.
+
 ## Full-vocabulary quality
 
 All arms were teacher-forced through the same first 64 exact continuation
@@ -145,6 +183,5 @@ aggregate NVMe. No production code was changed.
 - Do not implement two-phase body/tail staging.
 - Treat DFlash ring-window work as a separate future long-context project, not
   as a landed deliverable.
-- Next prefill experiment: screen the existing full-prompt layer-major path on
-  the 938-token ArXivLean prompt, because verifier pruning cannot improve the
-  measured 157.6-second prefill.
+- Keep exact full-prompt layer-major prefill automatic for multi-chunk prompts;
+  it is parity-green and turns the 938-token prefill from 157.8 to 69.2 seconds.

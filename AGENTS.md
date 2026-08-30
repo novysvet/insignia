@@ -168,6 +168,11 @@ slower than FP8-TC and rejected.
 - Batched FP8 prefill GEMV (8-row tiles, ~4.6× vs scalar at 2048×8192) and an
   order-preserving FA2-style tiled MLA prefill (bit-exact vs scalar attention,
   ~5.2× at 16 tokens).
+- Exact full-prompt layer-major prefill is automatic when the prompt exceeds
+  one configured chunk (normally >128 rows). It trades host residual spill for
+  expert locality: on 938-token ArXivLean it reduced prefill 157.845->69.187 s
+  (2.28×), O_DIRECT expert bytes by 77.8%, and kept logits/IDs exact. Override
+  with `INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR=0|1`.
 - MLA strategy (hybrid shadow bridge, current coherent path): **exact expanded
   K/V for the first 256 positions** (kLegacyMlaContext, 352 MiB) while the
   **512-wide group-scaled FP8 latent cache + absorbed attention** is populated

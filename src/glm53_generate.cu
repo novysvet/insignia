@@ -2578,6 +2578,20 @@ public:
             require(kMaxChunk() <= insignia::glm53::DFlash2Drafter::kMaxTokens,
                     "prefill chunk exceeds the DFlash2 capture batch");
         }
+        if (const char *topm = std::getenv("INSIGNIA_GLM53_DF_APPROX_TOPM")) {
+            const int requested = std::atoi(topm);
+            require(requested == 0 || (requested >= 2 && requested <= 7),
+                    "INSIGNIA_GLM53_DF_APPROX_TOPM must be 0 or 2..7");
+            require(requested == 0 || dflash2_on_,
+                    "INSIGNIA_GLM53_DF_APPROX_TOPM requires DFlash2");
+            df_approx_topm_ = requested;
+        }
+        df_approx_renorm_ = df_approx_topm_ &&
+            std::getenv("INSIGNIA_GLM53_DF_APPROX_RENORM") &&
+            std::atoi(std::getenv("INSIGNIA_GLM53_DF_APPROX_RENORM")) != 0;
+        if (df_approx_topm_)
+            std::printf("DFlash2 approximate verify: top-%d, retained weights %s\n",
+                        df_approx_topm_, df_approx_renorm_ ? "renormalized" : "unchanged");
         forced_sequential_verify_ =
             dflash2_on_ && std::getenv("INSIGNIA_GLM53_DF_SEQ_VERIFY") != nullptr;
         // Dense layer -> KDA archive row (recurrent-state replay indexing).
@@ -3052,6 +3066,8 @@ private:
     }
     std::unique_ptr<insignia::glm53::DFlash2Drafter> df_;
     bool dflash2_on_ = false;
+    int df_approx_topm_ = 0;
+    bool df_approx_renorm_ = false;
     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
     std::unique_ptr<Q8Index> q8_index_;
     std::unique_ptr<Q8Stager> q8_stager_;
@@ -4398,6 +4414,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     const std::string stem = layer_stem(layer) + "mlp.";
     const int experts = moe_experts_;
     const int topk = moe_topk_;
+    // Approximation is restricted to provisional DFlash verify rows. Prompt
+    // prefill and scalar decode retain all eight routed experts, and the
+    // unset path keeps the existing arithmetic and traffic exactly intact.
+    const int exec_topk = kda_archive_ && df_approx_topm_ ? df_approx_topm_ : topk;
     linear_multi(stem + "gate.weight", input, c_router_, tokens, experts, hidden_);
     std::vector<float> logits(size_t(tokens) * experts);
     check(cudaMemcpy(logits.data(), c_router_.get(), logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
@@ -4420,12 +4440,24 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (int slot = 0; slot < topk; ++slot) denominator += scores[order[slot]];
         for (int slot = 0; slot < topk; ++slot)
             selection[token].emplace_back(order[slot], 2.5f * scores[order[slot]] / denominator);
+        if (exec_topk != topk && df_approx_renorm_) {
+            float original_sum = 0.0f, retained_sum = 0.0f;
+            for (int slot = 0; slot < topk; ++slot)
+                original_sum += selection[token][size_t(slot)].second;
+            for (int slot = 0; slot < exec_topk; ++slot)
+                retained_sum += selection[token][size_t(slot)].second;
+            const float scale = original_sum / retained_sum;
+            for (int slot = 0; slot < exec_topk; ++slot)
+                selection[token][size_t(slot)].second *= scale;
+        }
     }
     std::vector<int> distinct;
     for (const auto &picks : selection)
-        for (const auto &[expert, weight] : picks)
+        for (int slot = 0; slot < exec_topk; ++slot) {
+            const int expert = picks[size_t(slot)].first;
             if (std::find(distinct.begin(), distinct.end(), expert) == distinct.end())
                 distinct.push_back(expert);
+        }
     if (early_multi_route_on_) {
         const auto &predicted_rows = early_multi_rows_[size_t(layer)];
         require(predicted_rows.size() == size_t(tokens), "missing early multi-route rows");
@@ -4491,8 +4523,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (int expert : distinct) {
             std::vector<int> users;
             for (int token = 0; token < tokens; ++token)
-                for (const auto &[picked, weight] : selection[token])
-                    if (picked == expert) users.push_back(token);
+                for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                    if (selection[size_t(token)][size_t(pick_slot)].first == expert)
+                        users.push_back(token);
             const std::string estem = stem + "experts." + std::to_string(expert) + ".";
             const TensorLocation &gate_w = model_.tensor(estem + "gate_proj.weight");
             const uint32_t *device = reinterpret_cast<const uint32_t *>(stager_.load(gate_w));
@@ -4516,8 +4549,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 insignia::bf16_gemv_v2(device, c_act_.get() + size_t(token) * moe_intermediate_,
                                        c_proj_.get() + size_t(token) * hidden_, hidden_, moe_intermediate_);
                 float weight = 0.0f;
-                for (const auto &[picked, pick_weight] : selection[token])
-                    if (picked == expert) weight = pick_weight;
+                for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
+                    if (selection[size_t(token)][size_t(pick_slot)].first == expert)
+                        weight = selection[size_t(token)][size_t(pick_slot)].second;
                 scale_add_kernel<<<16, 256>>>(c_routed_.get() + size_t(token) * hidden_,
                                               c_proj_.get() + size_t(token) * hidden_, weight, hidden_);
             }
@@ -4572,7 +4606,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 retained.reserve(size_t(quota));
                 for (int offset = 0; offset < tokens && int(retained.size()) < quota; ++offset) {
                     const int token = (chosen_token + offset) % tokens;
-                    for (const auto &[expert, weight] : selection[size_t(token)]) {
+                    for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot) {
+                        const int expert =
+                            selection[size_t(token)][size_t(pick_slot)].first;
                         if (std::find(retained.begin(), retained.end(), expert) == retained.end())
                             retained.push_back(expert);
                         if (int(retained.size()) == quota) break;
@@ -4609,7 +4645,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 std::array<float, kMaxChunkCap> combine{};
                 int total = 0;
                 for (int token = 0; token < tokens; ++token)
-                    for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
+                    for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
                         if (selection[size_t(token)][size_t(pick_slot)].first == expert &&
                             selection[size_t(token)][size_t(pick_slot)].second != 0.0f) {
                             users[size_t(total)] = token;
@@ -4651,7 +4687,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         }
         if (ordered_accumulation)
             for (int token = 0; token < tokens; ++token)
-                for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
+                for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
                     scale_add_kernel<<<16, 256>>>(
                         c_routed_.get() + size_t(token) * hidden_,
                         c_expert_out_.get() +
@@ -4663,13 +4699,16 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 std::vector<int> chunk_distinct;
                 chunk_distinct.reserve(distinct.size());
                 for (int token = chunk_base; token < chunk_end; ++token)
-                    for (const auto &[expert, weight] : selection[size_t(token)])
+                    for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot) {
+                        const int expert =
+                            selection[size_t(token)][size_t(pick_slot)].first;
                         if (std::find(chunk_distinct.begin(), chunk_distinct.end(), expert) ==
                             chunk_distinct.end())
                             chunk_distinct.push_back(expert);
+                    }
                 for (int expert : chunk_distinct)
                     for (int token = chunk_base; token < chunk_end; ++token)
-                        for (int pick_slot = 0; pick_slot < topk; ++pick_slot)
+                        for (int pick_slot = 0; pick_slot < exec_topk; ++pick_slot)
                             if (selection[size_t(token)][size_t(pick_slot)].first == expert)
                                 scale_add_kernel<<<16, 256>>>(
                                     c_routed_.get() + size_t(token) * hidden_,

@@ -5758,8 +5758,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             }
         }
 
-        std::array<int, 8> chosen{};
-        chosen.fill(0);
+        // DFlash verify has <=8 rows, but the same policy can serve a 128-row
+        // prefill chunk. Keep one action per actual row; a fixed-eight array
+        // here corrupted the stack as soon as prefill widened the caller.
+        std::vector<int> chosen(size_t(tokens), 0);
         if (df_cache_joint_options_ && tokens <= 4) {
             std::array<int, 8> trial{};
             int best_disk = std::numeric_limits<int>::max();
@@ -5809,7 +5811,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     best_h2d = h2d;
                     best_union = union_count;
                     best_regret = regret;
-                    chosen = trial;
+                    std::copy_n(trial.begin(), tokens, chosen.begin());
                 }
             };
             search(search, 0);
@@ -5998,7 +6000,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             }
         }
 
-        std::array<int, 8> chosen{};
+        std::vector<int> chosen(size_t(tokens), 0);
         if (tokens <= 4) {
             std::array<int, 8> trial{};
             int best_disk = std::numeric_limits<int>::max();
@@ -6041,14 +6043,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     best_union = union_count;
                     best_regret = regret;
                     best_substitutions = substitutions;
-                    chosen = trial;
+                    std::copy_n(trial.begin(), tokens, chosen.begin());
                 }
             };
             search(search, 0);
-        } else {
-            // k>4 is outside the deliberately tiny Cartesian surface; retain
-            // the same locally optimal action instead of exploding N^k.
-            chosen.fill(0);
         }
 
         auto group_cost = [&](bool baseline) {

@@ -40,6 +40,17 @@ integration gate: auxiliary tensors and online features are not yet in the C++
 runtime, and the checkpoint has only one smoke update. See
 `audits/s10-falsifier-vnni.md`.
 
+The runtime export is now complete rather than matrix-only: format v2 carries
+24 checksum-protected INT8 matrices and 18 exact FP32 auxiliary tensors. The
+real complete-state path measures 3.1849 ms median versus 3.1618 ms before the
+auxiliaries (+0.73%). A deterministic 42-event native/PyTorch hidden/head/route
+fixture is implemented and compiles; its glm-box execution is pending because
+the host dropped off Tailscale. Causal online event state reproduces every
+stored residency/overlap/union/multiplicity value bit-for-bit across the local
+on-policy corpus. Dataset v3 also spends the encoder's three previously padded
+inputs on previous-round target-logit JS/cosine/Top-1 disagreement and replaces
+noncausal campaign fraction with log-round position, with no matrix/MAC growth.
+
 The need for free-trajectory labels is measured, not theoretical. ArXivLean
 problem 40 approximate layer-major prefill at regret .0005 reached 15.61 tok/s
 and passed forced quality at PPL +3.15%, cosine 0.965076, MSE 0.4668, yet its

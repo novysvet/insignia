@@ -3,9 +3,11 @@
 Date: 2026-08-30
 
 Status: the standalone i7-14700KF runtime ceiling passes the initial 5 ms per
-four-row verify-round gate. It is not yet wired into `glm53-generate`, and the
-available checkpoint is a one-step smoke checkpoint rather than a trained
-policy.
+four-row verify-round gate. The complete v2 export now includes every learned
+auxiliary tensor, and causal online feature state matches the stored corpus.
+It is not yet wired into `glm53-generate`, native/PyTorch fixture execution on
+glm-box remains pending, and the available checkpoint is a one-step smoke
+checkpoint rather than a trained policy.
 
 ## Verdict
 
@@ -18,7 +20,9 @@ The correct deployment target is the otherwise underused i7-14700KF. A
 Raptor-Lake-only INT8 runtime now executes the complete synthetic controller
 pipeline with real exported matrix weights in a seven-run median of **3.1618
 ms per four-row verify round**, or 0.07528 ms per synchronized target-layer
-group. The matrix-only ceiling is **1.2106 ms**, 378.6 physical GMAC/s. The gap
+group. Loading and applying all 18 exact auxiliary tensors moves that median
+only to **3.1849 ms** (+0.73%). The matrix-only ceiling is **1.2106 ms**, 378.6
+physical GMAC/s. The gap
 is normalization, activation, routing, attention, quantization, and barriers;
 it is not missing matrix work.
 
@@ -37,9 +41,10 @@ matrix ledger:
 | physical padded MAC/event | 2,728,000 |
 | physical matrix MAC/round | 458,304,000 |
 | matrix-only seven-run median | 1.2106 ms |
-| full-pipeline seven-run median | 3.1618 ms |
-| full-pipeline range | 3.1396--3.1926 ms |
-| layer-group median | 0.07528 ms |
+| matrix-weights-only pipeline median | 3.1618 ms |
+| complete-state pipeline median | 3.1849 ms |
+| complete-state range | 3.1562--3.3057 ms |
+| complete-state layer-group median | 0.07583 ms |
 
 The full pipeline includes dynamic activation INT8 quantization/dequantization,
 SiLU and SiTU-GLU, Top-2/Top-3 routing machinery, six Sinkhorn iterations,
@@ -50,11 +55,12 @@ INT8 dot product. All seven measured runs produced checksum
 `3657744675213494808`.
 
 The benchmark does **not** yet prove native/PyTorch output parity. Its feature
-inputs are deterministic synthetic values. The exported file supplies the 24
-large linear matrices and biases, while positional matrices, embeddings, RMS
-weights, mHC base logits/scales, and the routing-bias buffer are still modeled
-by the C++ ceiling. Those small auxiliary tensors must be added before a native
-parity fixture or engine shadow run can be called exact.
+inputs are deterministic synthetic values. Export format v2 and the C++ loader
+now consume the 24 large linears plus all 18 exact FP32 auxiliary tensors:
+positional matrices, embeddings, RMS weights, mHC base logits/scales, stream
+scales, and routing bias. A deterministic 42-event fixture generator and C++
+head/route comparator are implemented and structurally tested, but the real
+i7 fixture run could not be completed after glm-box went offline.
 
 ## Optimization progression
 
@@ -65,6 +71,7 @@ parity fixture or engine shadow run can be called exact.
 | streaming absorbed MLA + predequantized/transposed K/V | 3.2677 ms | kept |
 | checksum-validated real matrix weights | 3.2224 ms | kept |
 | tied-register VEX `VPDPBUSD` | 3.1618 ms | kept/default |
+| all 18 exact FP32 auxiliary tensors | 3.1849 ms | kept; +0.73% |
 | eight-output row tile | ~3.276 ms | rejected; register spill/copy carousel |
 
 In a strict alternating 500-iteration A/B, the intrinsic and tied-assembly
@@ -94,20 +101,38 @@ not affect the exact INT8 dot-product check.
 INT8 format with padded K dimensions, signed-to-unsigned correction terms,
 scales, biases, a per-payload FNV-1a checksum, and a manifest checksum.
 
-The current artifact is:
+The complete-state artifact is:
 
 ```text
-/var/lib/insignia/falsifier-runs/v1-dion3-smoke.ifvnni
-size                 11,206,144 bytes (10.6875 MiB)
-SHA-256              5b1bdb695215886b5e8a8cc7e1c8205d11a0d724a5b1eded69760d08ece8ce07
-manifest checksum    17883645522496776365
-matrix count         24
+/var/lib/insignia/falsifier-runs/v1-dion3-smoke-v2.ifvnni
+size                 11,286,720 bytes (10.764 MiB)
+SHA-256              e7c624d9602197505778074e323a3b1e596dec38dc231693d0065e5452019104
+manifest checksum    7542981408582747553
+entries              24 INT8 matrices + 18 FP32 tensors
 worst weight cosine  0.9999755345
 worst weight MSE     1.463347e-7
 worst max abs error  6.947368e-4
 ```
 
-The loader verifies every payload and the aggregate manifest before execution.
+The loader verifies every payload and the aggregate manifest before execution;
+it remains backward-compatible with the original 24-entry v1 artifact.
+
+## Online feature state
+
+`tools/falsifier_online_features.py` now defines the causal state machine for
+the nine per-event residency/reuse features. Replaying every local on-policy
+shard reproduces `event_derived` and `expert_multiplicity` bit-for-bit,
+including previous-layer, previous-row, previous-round, layer-union, and
+uniqueness signals.
+
+The 208-wide logit encoder also had three unused padded inputs. Dataset v3 uses
+them for previous-round target-logit JS divergence, centered cosine, and Top-1
+disagreement. The old noncausal `block_fraction` (which depended on knowing the
+campaign's eventual length) is replaced by causal log-round position. The
+online and offline builders produce bit-identical 16-scalar plus 3x64-sketch
+features in the synthetic alignment test. Matrix geometry and runtime MACs do
+not change. Dataset v2 remains loadable for old artifacts; new collection
+should use v3 before real training.
 
 ## Full-controller INT8 numerical gate
 
@@ -162,7 +187,7 @@ bash build/falsifier-vnni.sh
 /var/tmp/insignia-build-raptor/benchmark-falsifier-vnni 4 500
 
 /var/tmp/insignia-build-raptor/benchmark-falsifier-vnni-pipeline \
-  4 500 /var/lib/insignia/falsifier-runs/v1-dion3-smoke.ifvnni
+  4 500 /var/lib/insignia/falsifier-runs/v1-dion3-smoke-v2.ifvnni
 
 python tools/evaluate_falsifier_int8.py \
   --data '/var/lib/insignia/falsifier-corpus-v3/*.npz' \
@@ -172,8 +197,8 @@ python tools/evaluate_falsifier_int8.py \
 
 ## Next gate
 
-1. Export and consume every small auxiliary tensor, then compare a fixed native
-   event fixture with the full PyTorch controller head by head.
+1. Run the implemented fixed native fixture on glm-box and compare hidden,
+   concatenated heads, and all three Top-2 routes against PyTorch.
 2. Extract the monolithic benchmark into a reusable runtime with explicit
    feature/state structs.
 3. Build online previous-target/current-draft CountSketches without a new

@@ -86,7 +86,17 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
     > "$OUT/moe-summary.md"
 
 for policy in "${POLICIES[@]}"; do
-  if [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])$ ]]; then
+  if [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])-m([0-9]+)-cjs([0-9]+)$ ]]; then
+    tag=$policy
+    margin=$(awk -v raw="${BASH_REMATCH[5]}" 'BEGIN { printf "%.6f", raw / 100 }')
+    calibration=$(awk -v raw="${BASH_REMATCH[6]}" 'BEGIN { printf "%.6f", raw / 100 }')
+    run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="${BASH_REMATCH[1]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[2]}" \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.${BASH_REMATCH[3]}" \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS="${BASH_REMATCH[4]}" \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN="$margin" \
+        INSIGNIA_GLM53_DF_CALIBRATION_GUARD_JS="$calibration"
+  elif [[ $policy =~ ^top([2-7])-cache([0-9]+)-e([0-9]+)-joint([2-8])$ ]]; then
     tag=$policy
     run "$policy" INSIGNIA_GLM53_DF_APPROX_TOPM="${BASH_REMATCH[1]}" \
         INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[2]}" \

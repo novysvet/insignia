@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import pathlib
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -88,6 +90,22 @@ nll delta (B-A) total +2.0  ppl A 1.1587 -> B 1.1893
         candidate = benchmark.base_environment(SimpleNamespace(**common), "top6-cache")
         self.assertEqual(exact["INSIGNIA_GLM53_PREFILL_APPROX_MOE"], "0")
         self.assertEqual(candidate["INSIGNIA_GLM53_PREFILL_APPROX_MOE"], "1")
+
+    def test_candidate_only_report_does_not_require_exact(self):
+        result = {
+            "ids": [1, 2], "text": "candidate text",
+            "prefill_tokens_per_second": 10.0,
+            "decode_ms_per_token": 200.0,
+            "decode_tokens_per_second": 5.0,
+            "accepted_per_round": 2.0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            report = pathlib.Path(directory) / "report.md"
+            benchmark.write_report(report, self.row, ["top6-cache"],
+                                   {"top6-cache": result}, {}, FakeTokenizer())
+            rendered = report.read_text(encoding="utf-8")
+        self.assertIn("candidate text", rendered)
+        self.assertIn("| top6-cache | - |", rendered)
 
 
 if __name__ == "__main__":

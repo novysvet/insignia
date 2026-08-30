@@ -304,7 +304,7 @@ def compare_quality(args: argparse.Namespace, forced_file: pathlib.Path,
 def write_report(path: pathlib.Path, row: dict[str, Any], policies: list[str],
                  results: dict[str, dict[str, Any]], quality: dict[str, dict[str, Any]],
                  tokenizer: Tokenizer) -> None:
-    exact = results["exact"]
+    exact = results.get("exact")
     lines = [
         f"# MathArena ArXivLean one-shot: problem {row['problem_idx']}", "",
         "This is an Insignia one-shot performance/quality workload, not an official "
@@ -319,7 +319,7 @@ def write_report(path: pathlib.Path, row: dict[str, Any], policies: list[str],
     ]
     for policy in policies:
         result = results[policy]
-        divergence = first_divergence(exact["ids"], result["ids"])
+        divergence = first_divergence(exact["ids"], result["ids"]) if exact else None
         lines.append(
             f"| {policy} | {divergence if divergence is not None else '-'} | "
             f"{result['prefill_tokens_per_second']:.2f} | "
@@ -356,7 +356,7 @@ def write_report(path: pathlib.Path, row: dict[str, Any], policies: list[str],
             "(not compile verification).", "", "```text",
             results[policy]["text"], "```",
         ]
-        if policy == "exact":
+        if policy == "exact" or exact is None:
             continue
         divergence = first_divergence(exact["ids"], results[policy]["ids"])
         if divergence is None:

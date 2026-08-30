@@ -5408,13 +5408,16 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 ? df_cache_guard_retain_ : df_cache_route_retain_;
             auto append_action = [&](int first_tail, int second_tail) {
                 CacheChoice action;
-                for (int slot = 0; slot < cache_route_retain; ++slot)
-                    action.experts[size_t(slot)] = baseline[size_t(slot)];
-                if (cache_route_retain < 8)
+                if (first_tail < 0) {
+                    action.experts = baseline;
+                } else {
+                    for (int slot = 0; slot < cache_route_retain; ++slot)
+                        action.experts[size_t(slot)] = baseline[size_t(slot)];
                     action.experts[size_t(cache_route_retain)] =
                         candidates[size_t(first_tail)];
-                if (cache_route_retain == 6)
-                    action.experts[7] = candidates[size_t(second_tail)];
+                    if (cache_route_retain == 6)
+                        action.experts[7] = candidates[size_t(second_tail)];
+                }
                 double selected_score = 0.0;
                 for (int expert : action.experts) {
                     const int candidate = rank[size_t(expert)];
@@ -5431,12 +5434,14 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                   action.experts[size_t(slot)]) == baseline.end();
                 options[size_t(token)].push_back(action);
             };
-            if (cache_route_retain == 8) {
-                append_action(-1, -1);
-            } else if (cache_route_retain == 7) {
+            // Tied router scores can make the independent top-8 and top-32
+            // partial sorts disagree in order. Insert the true baseline
+            // explicitly instead of assuming candidate ranks 6/7 recreate it.
+            append_action(-1, -1);
+            if (cache_route_retain == 7) {
                 for (int tail = 7; tail < df_cache_route_k_; ++tail)
                     append_action(tail, -1);
-            } else {
+            } else if (cache_route_retain == 6) {
                 for (int first = 6; first < df_cache_route_k_; ++first)
                     for (int second = first + 1; second < df_cache_route_k_; ++second)
                         append_action(first, second);
@@ -5451,6 +5456,12 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 return left.experts < right.experts;
             };
             std::sort(options[size_t(token)].begin(), options[size_t(token)].end(), local_less);
+            options[size_t(token)].erase(
+                std::unique(options[size_t(token)].begin(), options[size_t(token)].end(),
+                            [](const CacheChoice &left, const CacheChoice &right) {
+                                return left.experts == right.experts;
+                            }),
+                options[size_t(token)].end());
             if (int(options[size_t(token)].size()) > df_cache_joint_options_) {
                 const auto baseline_action = std::find_if(
                     options[size_t(token)].begin(), options[size_t(token)].end(),

@@ -64,10 +64,13 @@ run() {
       -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
       -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       -u INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN \
+      -u INSIGNIA_GLM53_DF_CACHE_ROUTE_K \
+      -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
+      -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
       "${COMMON[@]}" "$@" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 "$GENERATE" "$FP8" \
       > "$OUT/$tag.log" 2>&1
-  grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O|^  DFlash (approximate k|expert union|logit guard)' \
+  grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O|^  DFlash (approximate k|expert union|logit guard|cache route)' \
       "$OUT/$tag.log" | tee "$OUT/$tag.summary"
 }
 
@@ -101,8 +104,13 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_APPROX_MIN_K=3 \
         INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.75
     ;;
+  cache)
+    run cache32-r7-e0025 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025
+    ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, or guard" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, or cache" >&2
     exit 64
     ;;
 esac

@@ -60,10 +60,13 @@ run() {
   echo "=== $tag ==="
   env -u INSIGNIA_GLM53_DF_APPROX_TOPM \
       -u INSIGNIA_GLM53_DF_APPROX_RENORM \
+      -u INSIGNIA_GLM53_DF_APPROX_MASS \
+      -u INSIGNIA_GLM53_DF_APPROX_MIN_K \
+      -u INSIGNIA_GLM53_DF_APPROX_MAX_K \
       "${COMMON[@]}" "$@" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 "$GENERATE" "$FP8" \
       > "$OUT/$tag.log" 2>&1
-  grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O' \
+  grep -E '^greedy IDs|greedy tokens in|^  accepted histogram|^  expert I/O|^  DFlash (approximate k|expert union)' \
       "$OUT/$tag.log" | tee "$OUT/$tag.summary"
 }
 
@@ -86,8 +89,14 @@ case "$PLAN" in
   ceiling)
     run top1 INSIGNIA_GLM53_DF_APPROX_TOPM=1
     ;;
+  adaptive)
+    run mass80 INSIGNIA_GLM53_DF_APPROX_MASS=.80 \
+        INSIGNIA_GLM53_DF_APPROX_MIN_K=3
+    run mass70 INSIGNIA_GLM53_DF_APPROX_MASS=.70 \
+        INSIGNIA_GLM53_DF_APPROX_MIN_K=3
+    ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, or ceiling" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, or adaptive" >&2
     exit 64
     ;;
 esac

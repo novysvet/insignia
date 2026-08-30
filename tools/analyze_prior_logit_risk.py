@@ -69,6 +69,22 @@ def choose(choices: dict[int, dict[str, float]], threshold: float, min_k: int) -
     return 8
 
 
+def vector_logit_features(raw: np.ndarray) -> dict[str, float]:
+    logits = raw.astype(np.float64)
+    top = np.partition(logits, -2)[-2:]
+    maximum, second = float(max(top)), float(min(top))
+    shifted = np.exp(logits - maximum)
+    normalizer = float(np.sum(shifted))
+    probabilities = shifted / normalizer
+    entropy = math.log(normalizer) + maximum - float(np.dot(probabilities, logits))
+    return {
+        "entropy": entropy,
+        "entropy_norm": entropy / math.log(len(logits)),
+        "top1_p": 1.0 / normalizer,
+        "margin": maximum - second,
+    }
+
+
 def logit_features(path: Path, vocab: int, records: list[int]) -> dict[int, dict[str, float]]:
     raw = np.memmap(path, dtype="<f4", mode="r")
     if raw.size % vocab:
@@ -78,24 +94,88 @@ def logit_features(path: Path, vocab: int, records: list[int]) -> dict[int, dict
     for record in records:
         if record >= len(matrix):
             raise SystemExit(f"{path}: needs record {record}, has {len(matrix)}")
-        logits = matrix[record].astype(np.float64)
-        top = np.partition(logits, -2)[-2:]
-        maximum, second = float(max(top)), float(min(top))
-        shifted = np.exp(logits - maximum)
-        normalizer = float(np.sum(shifted))
-        probabilities = shifted / normalizer
-        entropy = math.log(normalizer) + maximum - float(np.dot(probabilities, logits))
-        result[record] = {
-            "entropy": entropy,
-            "entropy_norm": entropy / math.log(vocab),
-            "top1_p": 1.0 / normalizer,
-            "margin": maximum - second,
-        }
+        result[record] = vector_logit_features(matrix[record])
     return result
 
 
-def final_logit_guard(exact_path: Path, approx_path: Path, vocab: int,
-                      verify_k: int) -> None:
+def draft_logit_guard(path: Path, approx: np.ndarray, blocks: list[dict],
+                      vocab: int) -> None:
+    raw = np.memmap(path, dtype="<f4", mode="r")
+    rows_per_block = 7
+    if raw.size % (rows_per_block * vocab):
+        raise SystemExit(f"{path}: partial DFlash logit block")
+    draft = raw.reshape((-1, rows_per_block, vocab))
+    if len(draft) != len(blocks):
+        raise SystemExit(f"{path}: has {len(draft)} blocks, expected {len(blocks)}")
+
+    samples = []
+    for index, block in enumerate(blocks):
+        target = approx[block["start"]].astype(np.float64)
+        first = draft[index, 0].astype(np.float64)
+        target_shift = np.exp(target - float(np.max(target)))
+        draft_shift = np.exp(first - float(np.max(first)))
+        target_prob = target_shift / float(np.sum(target_shift))
+        draft_prob = draft_shift / float(np.sum(draft_shift))
+        mixture = 0.5 * (target_prob + draft_prob)
+        positive_target = target_prob > 0
+        positive_draft = draft_prob > 0
+        js = 0.5 * (
+            float(np.dot(target_prob[positive_target],
+                         np.log(target_prob[positive_target] / mixture[positive_target]))) +
+            float(np.dot(draft_prob[positive_draft],
+                         np.log(draft_prob[positive_draft] / mixture[positive_draft]))))
+        target -= float(np.mean(target))
+        first -= float(np.mean(first))
+        calibration_cos = float(np.dot(target, first) / math.sqrt(
+            float(np.dot(target, target)) * float(np.dot(first, first))))
+        calibration_disagree = float(np.argmax(target) != np.argmax(first))
+
+        # Target output after candidate r predicts candidate r+1, so DFlash
+        # row r+1 is the causal same-position uncertainty signal.
+        for offset, error in enumerate(block["rows"], start=1):
+            if offset >= rows_per_block:
+                continue
+            samples.append({
+                **error,
+                **{f"draft_{key}": value for key, value in
+                   vector_logit_features(draft[index, offset]).items()},
+                "calibration_js": js,
+                "calibration_cos": calibration_cos,
+                "calibration_disagree": calibration_disagree,
+                "row": float(offset),
+            })
+
+    risks = (("draft_entropy_norm", 1.0), ("draft_top1_p", -1.0),
+             ("draft_margin", -1.0), ("calibration_js", 1.0),
+             ("calibration_cos", -1.0), ("calibration_disagree", 1.0),
+             ("row", 1.0))
+    print("\nCausal current-block DFlash risk (same-position draft logits):")
+    print("| risk feature | MSE | cosine loss | top1 mismatch |")
+    print("|---|---:|---:|---:|")
+    for name, sign in risks:
+        values = [sign * sample[name] for sample in samples]
+        print(f"| {name} | {pearson(values, [s['mse'] for s in samples]):+.4f} "
+              f"| {pearson(values, [s['cos_loss'] for s in samples]):+.4f} "
+              f"| {pearson(values, [float(s['mismatch']) for s in samples]):+.4f} |")
+
+    print("\nCausal per-row fallback frontier (highest predicted risk exactified):")
+    print("| risk feature | exact rows | remaining MSE | cosine | top1 mismatches |")
+    print("|---|---:|---:|---:|---:|")
+    total = len(samples)
+    for name, sign in risks:
+        order = sorted(range(total), key=lambda i: sign * samples[i][name], reverse=True)
+        for guarded_count in sorted({0, math.ceil(total / 4), math.ceil(total / 2)}):
+            guarded = set(order[:guarded_count])
+            kept = [sample for index, sample in enumerate(samples) if index not in guarded]
+            mse = math.fsum(sample["mse"] for sample in kept) / total
+            cos_loss = math.fsum(sample["cos_loss"] for sample in kept) / total
+            mismatches = sum(sample["mismatch"] for sample in kept)
+            print(f"| {name} | {guarded_count}/{total} | {mse:.4e} "
+                  f"| {1.0 - cos_loss:.6f} | {mismatches} |")
+
+
+def final_logit_guard(exact_path: Path, approx_path: Path, draft_path: Path | None,
+                      vocab: int, verify_k: int) -> None:
     exact_raw = np.memmap(exact_path, dtype="<f4", mode="r")
     approx_raw = np.memmap(approx_path, dtype="<f4", mode="r")
     if exact_raw.size != approx_raw.size or exact_raw.size % vocab:
@@ -120,6 +200,7 @@ def final_logit_guard(exact_path: Path, approx_path: Path, vocab: int,
             cosine = (float(np.dot(left, right)) / math.sqrt(left_norm * right_norm)
                       if left_norm and right_norm else 1.0)
             rows.append({
+                "record": record,
                 "mse": float(np.dot(delta, delta) / vocab),
                 "cos_loss": 1.0 - cosine,
                 "mismatch": int(np.argmax(left) != np.argmax(right)),
@@ -168,6 +249,8 @@ def final_logit_guard(exact_path: Path, approx_path: Path, vocab: int,
             mismatches = sum(row["mismatch"] for row in rows)
             print(f"| {name} | {guarded_count}/{len(blocks)} | {exact_rows}/{total_rows} "
                   f"| {mse:.4e} | {1.0 - cos_loss:.6f} | {mismatches} |")
+    if draft_path:
+        draft_logit_guard(draft_path, approx, blocks, vocab)
 
 
 def residuals(x: list[float], y: list[float]) -> list[float]:
@@ -189,6 +272,8 @@ def main() -> None:
     parser.add_argument("--min-k", type=int, default=3)
     parser.add_argument("--approx-logits", type=Path,
                         help="approximate final-logit dump for causal block fallback analysis")
+    parser.add_argument("--draft-logits", type=Path,
+                        help="matching DFlash draft-logit dump from the approximate arm")
     args = parser.parse_args()
 
     groups = read_metrics(args.metrics)
@@ -253,7 +338,8 @@ def main() -> None:
               f"| {pearson(uncertainty, targets['cos_resid']):+.4f} |")
 
     if args.approx_logits:
-        final_logit_guard(args.logits, args.approx_logits, args.vocab, args.verify_k)
+        final_logit_guard(args.logits, args.approx_logits, args.draft_logits,
+                          args.vocab, args.verify_k)
 
 
 if __name__ == "__main__":

@@ -209,6 +209,18 @@ case "$PLAN" in
         INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
         INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6
     ;;
+  cachejointguardretainreverse)
+    run cache32-r7-e0025-joint6 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6
+    run cache32-r6-e0025-joint6-m75-gr7 INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=6 \
+        INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0025 \
+        INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6 \
+        INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN=.75 \
+        INSIGNIA_GLM53_DF_CACHE_GUARD_RETAIN=7
+    ;;
   packedjoint)
     run joint-expanded INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32 \
         INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN=7 \
@@ -235,7 +247,7 @@ case "$PLAN" in
     run device-packed INSIGNIA_GLM53_DEVICE_PACKED_SCALES=1
     ;;
   *)
-    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, cachejointguard, cachejointguardreverse, cachejointguardretain, packedjoint, packedjointreverse, or packedslots" >&2
+    echo "PLAN must be full, frontier, aggressive, ceiling, adaptive, guard, cache, cacheguard, cachejoint, cachejointreverse, cachejointretain, cachejointretainreverse, cachejointguard, cachejointguardreverse, cachejointguardretain, cachejointguardretainreverse, packedjoint, packedjointreverse, or packedslots" >&2
     exit 64
     ;;
 esac

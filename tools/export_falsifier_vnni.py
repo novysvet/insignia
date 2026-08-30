@@ -23,6 +23,17 @@ MASK64 = (1 << 64) - 1
 FORMAT_VERSION = 2
 ENTRY_QUANTIZED_MATRIX = 0
 ENTRY_FLOAT_TENSOR = 1
+HEAD_PREFIXES = (
+    "immediate_head",
+    "trajectory_head",
+    "free_trajectory_head",
+    "collapse_head",
+    "gram_factor",
+    "gram_diagonal",
+    "action_risk",
+    "action_cost",
+    "acceptance_head",
+)
 
 
 def fnv1a(payload: bytes) -> int:
@@ -93,21 +104,10 @@ def matrix_sources(state: dict[str, torch.Tensor]
         weight = tensor(state, state_name)
         yield export_name, weight, np.zeros(weight.shape[0], dtype="<f4")
 
-    head_prefixes = (
-        "immediate_head",
-        "trajectory_head",
-        "free_trajectory_head",
-        "collapse_head",
-        "gram_factor",
-        "gram_diagonal",
-        "action_risk",
-        "action_cost",
-        "acceptance_head",
-    )
     head_weight = np.concatenate(
-        [tensor(state, name + ".weight") for name in head_prefixes], axis=0)
+        [tensor(state, name + ".weight") for name in HEAD_PREFIXES], axis=0)
     head_bias = np.concatenate(
-        [tensor(state, name + ".bias") for name in head_prefixes], axis=0)
+        [tensor(state, name + ".bias") for name in HEAD_PREFIXES], axis=0)
     yield "heads", head_weight, head_bias
 
 

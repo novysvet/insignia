@@ -213,10 +213,19 @@ struct VnniMatrixHeader {
     uint64_t payload_bytes;
     uint64_t payload_checksum;
 };
+
+struct VnniFixtureHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t events;
+    uint64_t payload_checksum;
+    uint8_t reserved[40];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(VnniFileHeader) == 64);
 static_assert(sizeof(VnniMatrixHeader) == 64);
+static_assert(sizeof(VnniFixtureHeader) == 64);
 
 static uint64_t fnv1a(const uint8_t *data, size_t bytes) {
     uint64_t hash = 14695981039346656037ull;
@@ -510,6 +519,7 @@ struct Scratch {
     std::array<std::array<float, 256>, 2> expert_gate{};
     std::array<std::array<float, 128>, 2> expert_activation{};
     std::array<std::array<float, 96>, 2> expert_output{};
+    std::array<std::array<int32_t, 2>, 3> selected_routes{};
 
     explicit Scratch(int seed) {
         std::mt19937 random(seed);
@@ -713,7 +723,8 @@ INSIGNIA_PROFILE_NOINLINE static void causal_mla(
 }
 
 INSIGNIA_PROFILE_NOINLINE static void stable_moe(
-    const Weights &weights, Scratch &scratch, const float *input, float *output) {
+    const Weights &weights, Scratch &scratch, const float *input, float *output,
+    int32_t *selected_output = nullptr) {
     std::copy_n(input, kWidth, scratch.temp4.data());
     rms_norm(scratch.temp4.data(), kWidth, weights.moe_norm.data());
     const float input_scale = quantize_vector(
@@ -747,6 +758,10 @@ INSIGNIA_PROFILE_NOINLINE static void stable_moe(
         / std::max(scratch.temp0[selected[0]] + scratch.temp0[selected[1]],
                    1.0e-12f);
     const float expert_weight1 = 1.0f - expert_weight0;
+    if (selected_output) {
+        selected_output[0] = selected[0];
+        selected_output[1] = selected[1];
+    }
 
     const float latent_scale = quantize_vector(
         scratch.temp1.data(), 96, weights.expert_gate_up.cols,
@@ -868,12 +883,10 @@ INSIGNIA_PROFILE_NOINLINE static void encode(
     rms_norm(scratch.streams[3].data(), kWidth, weights.cache_norm.data());
 }
 
-INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
-    const Weights &weights, Scratch &scratch, int layer, int row,
-    int verify_rows) {
-    encode(weights, scratch, layer, row, verify_rows);
+INSIGNIA_PROFILE_NOINLINE static uint64_t run_core_event(
+    const Weights &weights, Scratch &scratch, int layer, int history_count,
+    float *hidden_output = nullptr, float *head_output = nullptr) {
     collapse_streams(scratch, scratch.block_history[0].data());
-    const int history_count = std::min(kMaxHistory, layer * verify_rows + row + 1);
     for (int repeat = 0; repeat < 3; ++repeat) {
         depth_attention(weights, scratch, repeat + 1, scratch.temp0.data());
         mix_streams(weights, scratch, scratch.temp0.data());
@@ -884,7 +897,8 @@ INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
             scratch.streams[stream][d] += weights.attention_stream_scale[stream]
                 * scratch.temp1[d];
         collapse_streams(scratch, scratch.temp2.data());
-        stable_moe(weights, scratch, scratch.temp2.data(), scratch.temp3.data());
+        stable_moe(weights, scratch, scratch.temp2.data(), scratch.temp3.data(),
+                   scratch.selected_routes[repeat].data());
         for (int stream = 0; stream < 4; ++stream)
             for (int d = 0; d < kWidth; ++d)
             scratch.streams[stream][d] += weights.moe_stream_scale[stream]
@@ -895,7 +909,9 @@ INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
     }
     depth_attention(weights, scratch, 4, scratch.temp0.data());
     rms_norm(scratch.temp0.data(), kWidth, weights.final_norm.data());
+    if (hidden_output) std::copy_n(scratch.temp0.data(), kWidth, hidden_output);
     linear(weights.heads, scratch.temp0.data(), scratch.temp1.data(), scratch);
+    if (head_output) std::copy_n(scratch.temp1.data(), 107, head_output);
     uint64_t checksum = 0;
     for (int i = 0; i < 107; i += 7) {
         uint32_t bits;
@@ -906,6 +922,14 @@ INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
     if (!std::isfinite(scratch.temp1[layer % 107]))
         throw std::runtime_error("pipeline produced non-finite output");
     return checksum;
+}
+
+INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
+    const Weights &weights, Scratch &scratch, int layer, int row,
+    int verify_rows) {
+    encode(weights, scratch, layer, row, verify_rows);
+    const int history_count = std::min(kMaxHistory, layer * verify_rows + row + 1);
+    return run_core_event(weights, scratch, layer, history_count);
 }
 
 static int32_t scalar_dot(const int8_t *weight, const int8_t *input, int width) {
@@ -929,6 +953,149 @@ static void verify_kernel(const Weights &weights) {
         if (scratch.accumulator[row] != expected)
             throw std::runtime_error("VPDPBUSD exactness failure");
     }
+}
+
+struct ErrorMetric {
+    uint64_t count = 0;
+    long double squared_error = 0.0;
+    long double dot = 0.0;
+    long double reference_square = 0.0;
+    long double candidate_square = 0.0;
+    float maximum_absolute_error = 0.0f;
+
+    void add(const float *reference, const float *candidate, size_t elements) {
+        count += elements;
+        for (size_t i = 0; i < elements; ++i) {
+            const long double ref = reference[i];
+            const long double value = candidate[i];
+            const long double difference = value - ref;
+            squared_error += difference * difference;
+            dot += ref * value;
+            reference_square += ref * ref;
+            candidate_square += value * value;
+            maximum_absolute_error = std::max(
+                maximum_absolute_error,
+                std::abs(candidate[i] - reference[i]));
+        }
+    }
+
+    double mse() const {
+        return static_cast<double>(squared_error / std::max<uint64_t>(1, count));
+    }
+
+    double cosine() const {
+        const long double denominator
+            = std::sqrt(reference_square * candidate_square);
+        return static_cast<double>(dot / std::max(denominator, 1.0e-30L));
+    }
+};
+
+static int run_fixture(const Weights &weights, const std::string &path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open VNNI fixture: " + path);
+    VnniFixtureHeader header{};
+    file.read(reinterpret_cast<char *>(&header), sizeof(header));
+    if (!file || std::memcmp(header.magic, "IFVFIX1\0", 8) != 0
+        || header.version != 1 || header.events < 1
+        || header.events > kMaxHistory)
+        throw std::runtime_error("invalid VNNI fixture header");
+    constexpr size_t stream_values = 4 * kWidth;
+    constexpr size_t hidden_values = kWidth;
+    constexpr size_t head_values = 107;
+    constexpr size_t route_values = 3 * 2;
+    const size_t float_values = static_cast<size_t>(header.events)
+        * (stream_values + hidden_values + head_values);
+    const size_t route_count = static_cast<size_t>(header.events) * route_values;
+    const size_t payload_bytes = float_values * sizeof(float)
+        + route_count * sizeof(int32_t);
+    std::vector<uint8_t> payload(payload_bytes);
+    file.read(reinterpret_cast<char *>(payload.data()), payload.size());
+    if (!file || fnv1a(payload.data(), payload.size()) != header.payload_checksum)
+        throw std::runtime_error("VNNI fixture checksum mismatch");
+    size_t offset = 0;
+    std::vector<float> streams(static_cast<size_t>(header.events) * stream_values);
+    std::vector<float> expected_hidden(
+        static_cast<size_t>(header.events) * hidden_values);
+    std::vector<float> expected_heads(
+        static_cast<size_t>(header.events) * head_values);
+    std::vector<int32_t> expected_routes(route_count);
+    for (auto *target : {&streams, &expected_hidden, &expected_heads}) {
+        const size_t bytes = target->size() * sizeof(float);
+        std::memcpy(target->data(), payload.data() + offset, bytes);
+        offset += bytes;
+    }
+    std::memcpy(expected_routes.data(), payload.data() + offset,
+                expected_routes.size() * sizeof(int32_t));
+
+    Scratch scratch(19);
+    ErrorMetric hidden_metric;
+    ErrorMetric head_metric;
+    uint64_t route_slots = 0;
+    uint64_t matching_slots = 0;
+    uint64_t matching_sets = 0;
+    uint64_t route_overlap = 0;
+    int first_route_mismatch = -1;
+    std::array<float, kWidth> native_hidden{};
+    std::array<float, 107> native_heads{};
+    for (uint32_t event = 0; event < header.events; ++event) {
+        const float *event_streams = streams.data()
+            + static_cast<size_t>(event) * stream_values;
+        for (int stream = 0; stream < 4; ++stream)
+            std::copy_n(event_streams + stream * kWidth, kWidth,
+                        scratch.streams[stream].data());
+        run_core_event(weights, scratch, static_cast<int>(event), event + 1,
+                       native_hidden.data(), native_heads.data());
+        hidden_metric.add(
+            expected_hidden.data() + static_cast<size_t>(event) * hidden_values,
+            native_hidden.data(), hidden_values);
+        head_metric.add(
+            expected_heads.data() + static_cast<size_t>(event) * head_values,
+            native_heads.data(), head_values);
+        bool event_set_match = true;
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            const int32_t *reference = expected_routes.data()
+                + (static_cast<size_t>(event) * 3 + repeat) * 2;
+            const int32_t *candidate = scratch.selected_routes[repeat].data();
+            matching_slots += (reference[0] == candidate[0]);
+            matching_slots += (reference[1] == candidate[1]);
+            route_slots += 2;
+            const bool direct = reference[0] == candidate[0]
+                && reference[1] == candidate[1];
+            const bool swapped = reference[0] == candidate[1]
+                && reference[1] == candidate[0];
+            event_set_match &= direct || swapped;
+            route_overlap += (reference[0] == candidate[0]
+                              || reference[0] == candidate[1]);
+            route_overlap += (reference[1] == candidate[0]
+                              || reference[1] == candidate[1]);
+            if (!direct && first_route_mismatch < 0)
+                first_route_mismatch = static_cast<int>(event);
+        }
+        matching_sets += event_set_match;
+    }
+    const double route_events = static_cast<double>(header.events) * 3.0;
+    std::cout
+        << "{\n"
+        << "  \"schema\": \"insignia-falsifier-vnni-core-parity-v1\",\n"
+        << "  \"events\": " << header.events << ",\n"
+        << "  \"weight_manifest_checksum\": " << weights.manifest_checksum << ",\n"
+        << "  \"hidden_mse\": " << hidden_metric.mse() << ",\n"
+        << "  \"hidden_cosine\": " << hidden_metric.cosine() << ",\n"
+        << "  \"hidden_max_abs_error\": "
+        << hidden_metric.maximum_absolute_error << ",\n"
+        << "  \"heads_mse\": " << head_metric.mse() << ",\n"
+        << "  \"heads_cosine\": " << head_metric.cosine() << ",\n"
+        << "  \"heads_max_abs_error\": "
+        << head_metric.maximum_absolute_error << ",\n"
+        << "  \"route_slot_agreement\": "
+        << static_cast<double>(matching_slots) / route_slots << ",\n"
+        << "  \"route_set_agreement\": "
+        << matching_sets / static_cast<double>(header.events) << ",\n"
+        << "  \"route_mean_overlap\": " << route_overlap / route_events << ",\n"
+        << "  \"first_route_mismatch_event\": " << first_route_mismatch << ",\n"
+        << "  \"kernel_exact\": true\n"
+        << "}\n";
+    return 0;
 }
 
 static void pin_thread(int worker) {
@@ -977,12 +1144,13 @@ int main(int argc, char **argv) {
     if (threads < 1 || threads > 8 || iterations < 1)
         throw std::runtime_error(
             "usage: benchmark_falsifier_vnni_pipeline [verify_rows 1..8] "
-            "[iterations] [weights.ifvnni]");
+            "[iterations] [weights.ifvnni] [core-fixture.ifvfix]");
     if (!__builtin_cpu_supports("avxvnni"))
         throw std::runtime_error("Raptor Lake AVX-VNNI is unavailable");
     Weights weights;
     if (argc > 3) weights.load(argv[3]);
     verify_kernel(weights);
+    if (argc > 4) return run_fixture(weights, argv[4]);
     (void)measure(weights, threads, 1);
     const Measurement measured = measure(weights, threads, iterations);
     const double round_ms = measured.milliseconds / iterations;

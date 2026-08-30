@@ -3,8 +3,8 @@
 
 import numpy as np
 
-from train_falsifier_baseline import (ridge_fit, ridge_predict, route_sketch,
-                                      spearman)
+from train_falsifier_baseline import (logistic_fit, logistic_predict, ridge_fit,
+                                      ridge_predict, route_sketch, spearman)
 
 
 def main() -> None:
@@ -15,6 +15,11 @@ def main() -> None:
     assert float(np.max(np.abs(prediction - target))) < 1e-5
     assert abs(spearman(target, target) - 1.0) < 1e-12
     assert abs(spearman(target, -target) + 1.0) < 1e-12
+
+    binary = (features[:, 0] + 0.5 * features[:, 1] > 0.0).astype(np.float64)
+    probability = logistic_predict(
+        logistic_fit(features, binary, regularization=0.001, steps=800), features)
+    assert float(np.mean((probability > 0.5) == binary)) > 0.95
 
     layers = np.arange(4)
     experts = np.arange(32).reshape((4, 8))

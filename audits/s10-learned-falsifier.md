@@ -431,3 +431,55 @@ overfits the flip. This is evidence for the previous-logit hypothesis and
 against deploying the 1.8M-parameter Falsifier-MoE from three prompts. The
 pipeline is ready; prompt diversity and on-policy interventions are now the
 binding constraint.
+
+### Seven-prompt wave and flip head
+
+The targeted corpus wave added p01/p03 GSM8K and p09/p11 MATH without an ABCD
+sweep: one exact pass and one cache-policy pass, 32 forced rows each. All four
+traces joined at 1,302 events. It added four top-1 failures (p01 row 10, p03
+rows 4/30, p09 row 11); p11 stayed 32/32. The corpus now has 217 rows over
+seven prompt split units and five positive top-1 failures.
+
+The class-balanced L2 logistic head confirms that five failures are still not
+enough for deployment. Logit-only held-out flip ranks were p01 26/31, p03
+3/14 of 31, p09 27/31, and p12 5/31; the wider runtime view was worse on the
+rare-class target. It generalizes across p03/p12 but reverses risk on p01/p09.
+This rules out threshold/model tuning on the current corpus. The next data wave
+needs explicit single-row interventions and more prompt families, especially
+low-margin/calibration-shift cases.
+
+## Joint layer-union cache routing
+
+Independent cache routing minimizes each row's immediate transfers, but the
+engine stages the union of all verify rows. An offline exact solver now keeps
+the six strongest feasible actions per row and exhaustively evaluates at most
+`6^4 = 1,296` assignments per sparse layer under the same per-row regret cap.
+Across the original p02/p10/p12 traces at K=32, retain=7, regret=0.0025:
+
+| prompt | independent union saved | joint union saved | independent H2D saved | joint H2D saved |
+|---|---:|---:|---:|---:|
+| p02 | 2.86% | 9.71% | 8.61% | 11.24% |
+| p10 | 2.53% | 9.02% | 8.81% | 11.00% |
+| p12 | 3.22% | 9.43% | 9.07% | 11.57% |
+
+The C++ arm is opt-in with
+`INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=6`, specialized to retain-7 and k<=4;
+larger chunks retain the locally optimal action. On the live p02 on-policy
+trace, independently recomputed observed savings exactly matched the joint
+solver: 15.90% disk, 11.74% H2D, and 9.97% union, versus an independent
+ceiling of 15.85%/8.84%/3.25% on the same state.
+
+Quality also moved in the favorable direction on p02: 32/32 top-1 remained,
+cosine improved 0.996381->0.997045, MSE fell 0.07376->0.05930 (-19.6%), KL
+fell 0.005793->0.003719 (-35.8%), JS fell 0.001392->0.000891 (-36.0%), and
+forced-token PPL moved 1.1262->1.1136. This is one prompt, so it is evidence
+for the arm rather than a global quality claim; cold decode timing follows.
+
+The first p02 cold bracket measured independent cache routing at 426.5
+ms/token (2.34 tok/s) and joint routing at 406.2 ms/token (2.46 tok/s): -4.8%
+latency / +5.0% throughput. Prompt prefill was unchanged at 20.371 versus
+20.383 seconds for 74 tokens (~3.63 tok/s). Joint routing reduced verify time
+from 1,134.7 to 1,102.6 ms/verified round and changed the speculative path from
+15 rounds/2.13 accepted to 14 rounds/2.29 accepted. Exact brackets still swung
+569.1->466.4 ms/token, so a reverse-order repeat is required before promoting
+the result beyond opt-in.

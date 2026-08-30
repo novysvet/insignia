@@ -141,6 +141,9 @@ def main() -> None:
             assert np.all(np.isnan(dataset["contribution_gram"]))
             assert np.all(np.isnan(dataset["event_tail"][:, :3]))
             assert np.all(np.isfinite(dataset["event_tail"][:, 3]))
+        observed = analyze(feature_output, [16], [7], [0.01])
+        assert observed["observed_policy"] is not None
+        assert observed["observed_policy"]["records"]["union"] > 0
         ceiling = analyze(output, [16], [7], [0.01])
         assert len(ceiling["points"]) == 1
         assert ceiling["points"][0]["layer_groups"] == 4

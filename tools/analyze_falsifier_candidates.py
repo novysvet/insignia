@@ -162,6 +162,20 @@ def union_cost(indices: list[int], selections: dict[int, Choice],
     return len(union), disk, h2d
 
 
+def union_ids(indices: list[int], selected_ids: np.ndarray,
+              candidate_ids: np.ndarray, residency: np.ndarray) -> tuple[int, int, int]:
+    union = {int(expert) for index in indices for expert in selected_ids[index]}
+    disk = h2d = 0
+    for expert in union:
+        source = next(index for index in indices
+                      if expert in set(map(int, candidate_ids[index])))
+        rank = int(np.flatnonzero(candidate_ids[source] == expert)[0])
+        d, h = transfer(residency[source], rank)
+        disk += d
+        h2d += h
+    return len(union), disk, h2d
+
+
 def baseline_choices(expert_ids: np.ndarray, candidate_ids: np.ndarray,
                      residency: np.ndarray) -> dict[int, Choice]:
     result = {}
@@ -185,8 +199,9 @@ def analyze(path: Path, candidate_ks: list[int], retains: list[int],
         # Exact traces store the baseline in expert_ids. Feature-only traces
         # store the executed action, while their untouched baseline is the
         # first eight corrected-score candidates.
-        expert_ids = (data["expert_ids"] if metadata.get("gram_present", True)
-                      else data["candidate_ids"][:, :8])
+        executed_ids = data["expert_ids"]
+        feature_only = not metadata.get("gram_present", True)
+        expert_ids = data["candidate_ids"][:, :8] if feature_only else executed_ids
         candidate_ids = data["candidate_ids"]
         candidate_choice = data["candidate_choice"]
         residency = data["candidate_residency"]
@@ -203,6 +218,27 @@ def analyze(path: Path, candidate_ks: list[int], retains: list[int],
         "disk": sum(row[1] for row in baseline_union),
         "h2d": sum(row[2] for row in baseline_union),
     }
+    observed_policy = None
+    if feature_only:
+        observed_union = [union_ids(indices, executed_ids, candidate_ids, residency)
+                          for indices in groups.values()]
+        observed_records = {
+            "union": sum(row[0] for row in observed_union),
+            "disk": sum(row[1] for row in observed_union),
+            "h2d": sum(row[2] for row in observed_union),
+        }
+        observed_policy = {
+            "records": observed_records,
+            "union_saved_fraction":
+                ((baseline_records["union"] - observed_records["union"]) /
+                 baseline_records["union"]),
+            "disk_saved_fraction":
+                ((baseline_records["disk"] - observed_records["disk"]) /
+                 baseline_records["disk"] if baseline_records["disk"] else 0.0),
+            "h2d_saved_fraction":
+                ((baseline_records["h2d"] - observed_records["h2d"]) /
+                 baseline_records["h2d"] if baseline_records["h2d"] else 0.0),
+        }
     points = []
     for candidate_k, retain, epsilon in itertools.product(candidate_ks, retains, epsilons):
         choices = {
@@ -274,7 +310,8 @@ def analyze(path: Path, candidate_ks: list[int], retains: list[int],
             })
         points.append(point)
     return {"dataset": str(path), "metadata": metadata,
-            "baseline_records": baseline_records, "points": points}
+            "baseline_records": baseline_records, "observed_policy": observed_policy,
+            "points": points}
 
 
 def main() -> None:
@@ -296,6 +333,12 @@ def main() -> None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n",
                                  encoding="utf-8")
+    if result["observed_policy"] is not None:
+        observed = result["observed_policy"]
+        print("observed policy: "
+              f"disk {observed['disk_saved_fraction']:.2%}, "
+              f"H2D {observed['h2d_saved_fraction']:.2%}, "
+              f"union {observed['union_saved_fraction']:.2%} saved")
     print("| K | retain | regret budget | substitutions/layer | disk saved | H2D saved | union saved | joint disk | joint H2D | joint union | max regret |")
     print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for point in result["points"]:

@@ -19,6 +19,7 @@ import numpy as np
 
 
 LAMBDAS = np.asarray((0.01, 0.1, 1.0, 10.0, 100.0, 1_000.0, 10_000.0))
+LOGISTIC_L2 = 0.1
 
 
 def route_sketch(layers: np.ndarray, ids: np.ndarray, width: int = 64) -> np.ndarray:
@@ -130,6 +131,43 @@ def ridge_predict(model: tuple, x: np.ndarray) -> np.ndarray:
     return (x - mean) / scale @ weights + y_mean
 
 
+def logistic_fit(x: np.ndarray, y: np.ndarray, regularization: float = LOGISTIC_L2,
+                 steps: int = 500) -> tuple:
+    mean = np.mean(x, axis=0)
+    scale = np.std(x, axis=0)
+    scale[scale < 1e-8] = 1.0
+    standardized = (x - mean) / scale
+    positives = int(np.sum(y > 0.5))
+    negatives = len(y) - positives
+    if not positives or not negatives:
+        probability = (positives + 0.5) / (len(y) + 1.0)
+        return mean, scale, np.zeros(x.shape[1]), math.log(probability / (1.0 - probability))
+    sample_weight = np.where(y > 0.5, 0.5 / positives, 0.5 / negatives)
+    design = np.concatenate((standardized, np.ones((len(x), 1))), axis=1)
+    weighted_design = design * np.sqrt(sample_weight)[:, None]
+    spectral = float(np.linalg.norm(weighted_design, ord=2))
+    learning_rate = 1.0 / (0.25 * spectral * spectral + regularization + 1e-9)
+    parameters = np.zeros(design.shape[1], dtype=np.float64)
+    accelerated = parameters.copy()
+    momentum = 1.0
+    for _ in range(steps):
+        probability = 1.0 / (1.0 + np.exp(-np.clip(design @ accelerated, -40.0, 40.0)))
+        gradient = design.T @ (sample_weight * (probability - y))
+        gradient[:-1] += regularization * accelerated[:-1]
+        updated = accelerated - learning_rate * gradient
+        next_momentum = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * momentum * momentum))
+        accelerated = updated + ((momentum - 1.0) / next_momentum) * (updated - parameters)
+        parameters = updated
+        momentum = next_momentum
+    return mean, scale, parameters[:-1], float(parameters[-1])
+
+
+def logistic_predict(model: tuple, x: np.ndarray) -> np.ndarray:
+    mean, scale, weights, bias = model
+    score = (x - mean) / scale @ weights + bias
+    return 1.0 / (1.0 + np.exp(-np.clip(score, -40.0, 40.0)))
+
+
 def choose_lambda(features: dict[str, np.ndarray], targets: dict[str, np.ndarray],
                   train_prompts: list[str]) -> float:
     losses = np.zeros(len(LAMBDAS), dtype=np.float64)
@@ -214,6 +252,54 @@ def evaluate(features: dict[str, np.ndarray], labels: dict[str, np.ndarray]) -> 
     return rows
 
 
+def binary_auc(probability: np.ndarray, target: np.ndarray) -> float | None:
+    positive = probability[target > 0.5]
+    negative = probability[target <= 0.5]
+    if not len(positive) or not len(negative):
+        return None
+    comparisons = positive[:, None] - negative[None, :]
+    return float((np.sum(comparisons > 0.0) + 0.5 * np.sum(comparisons == 0.0)) /
+                 comparisons.size)
+
+
+def average_precision(probability: np.ndarray, target: np.ndarray) -> float | None:
+    positives = int(np.sum(target > 0.5))
+    if not positives:
+        return None
+    order = np.argsort(probability)[::-1]
+    hits = np.cumsum(target[order] > 0.5)
+    positive_ranks = np.flatnonzero(target[order] > 0.5)
+    return float(np.mean(hits[positive_ranks] / (positive_ranks + 1)))
+
+
+def evaluate_flips(features: dict[str, np.ndarray], labels: dict[str, np.ndarray]) -> list[dict]:
+    prompts = sorted(labels)
+    rows = []
+    for held_out in prompts:
+        train = [prompt for prompt in prompts if prompt != held_out]
+        train_x = np.concatenate([features[prompt] for prompt in train])
+        train_y = np.concatenate([labels[prompt][:, 6] for prompt in train])
+        target = labels[held_out][:, 6]
+        probability = logistic_predict(logistic_fit(train_x, train_y), features[held_out])
+        count = max(1, math.ceil(0.25 * len(target)))
+        selected = np.argsort(probability)[-count:]
+        positives = int(np.sum(target > 0.5))
+        captured = int(np.sum(target[selected] > 0.5))
+        descending = np.argsort(probability)[::-1]
+        flip_ranks = [int(np.flatnonzero(descending == index)[0]) + 1
+                      for index in np.flatnonzero(target > 0.5)]
+        rows.append({
+            "held_out": held_out,
+            "auc": binary_auc(probability, target),
+            "average_precision": average_precision(probability, target),
+            "top25_flip_recall": (captured / positives if positives else None),
+            "best_flip_rank": min(flip_ranks) if flip_ranks else None,
+            "worst_flip_rank": max(flip_ranks) if flip_ranks else None,
+            "rows": len(target),
+        })
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("datasets", type=Path, nargs="+")
@@ -225,6 +311,8 @@ def main() -> None:
         "prompts": sorted(labels),
         "logit_features": evaluate(logit_features, labels),
         "full_runtime_features": evaluate(full_features, labels),
+        "logit_flip_classifier": evaluate_flips(logit_features, labels),
+        "full_runtime_flip_classifier": evaluate_flips(full_features, labels),
     }
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +326,19 @@ def main() -> None:
             print(f"| {feature_name} | {row['held_out']} | {row['lambda']:.2g} | "
                   f"{row['nrmse_vs_constant']:.3f} | {row['spearman']:.3f} | "
                   f"{row['top25_risk_capture']:.1%} | {flip_rank}/{row['rows']} |")
+    print()
+    print("| flip classifier | held out | AUROC | AP | top-25% flip recall | flip rank(s) |")
+    print("|---|---|---:|---:|---:|---:|")
+    for feature_name in ("logit_flip_classifier", "full_runtime_flip_classifier"):
+        for row in result[feature_name]:
+            auc = "-" if row["auc"] is None else f"{row['auc']:.3f}"
+            ap = "-" if row["average_precision"] is None else f"{row['average_precision']:.3f}"
+            recall = ("-" if row["top25_flip_recall"] is None
+                      else f"{row['top25_flip_recall']:.1%}")
+            ranks_text = ("-" if row["best_flip_rank"] is None else
+                          f"{row['best_flip_rank']}-{row['worst_flip_rank']}/{row['rows']}")
+            print(f"| {feature_name} | {row['held_out']} | {auc} | {ap} | "
+                  f"{recall} | {ranks_text} |")
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ def load_case(specification: tuple[str, Path, Path, Path]) -> Case:
     return Case(name, row_meta, labels, features)
 
 
-def guarded_rows(case: Case, clauses: tuple[Clause, ...]) -> np.ndarray:
+def guarded_rows(case: Case, clauses: tuple[Clause, ...], whole_block: bool) -> np.ndarray:
     risky = np.zeros(len(case.labels), dtype=bool)
     for clause in clauses:
         values = case.features[clause.feature]
@@ -68,16 +68,19 @@ def guarded_rows(case: Case, clauses: tuple[Clause, ...]) -> np.ndarray:
         flagged = indices[risky[indices]]
         if not len(flagged):
             continue
+        if whole_block:
+            guarded[indices] = True
+            continue
         highest_row = max(int(case.row_meta[index, 2]) for index in flagged)
         guarded[indices[case.row_meta[indices, 2] <= highest_row]] = True
     return guarded
 
 
-def evaluate(cases: list[Case], clauses: tuple[Clause, ...]) -> dict:
+def evaluate(cases: list[Case], clauses: tuple[Clause, ...], whole_block: bool) -> dict:
     per_case = {}
     guarded_total = rows_total = captured_total = flips_total = 0
     for case in cases:
-        guarded = guarded_rows(case, clauses)
+        guarded = guarded_rows(case, clauses, whole_block)
         captured = int(np.count_nonzero(case.labels & guarded))
         flips = int(np.count_nonzero(case.labels))
         per_case[case.name] = {
@@ -115,6 +118,8 @@ def main() -> None:
     parser.add_argument("--case", type=parse_case, action="append", required=True)
     parser.add_argument("--hard-case", default="hard")
     parser.add_argument("--top", type=int, default=24)
+    parser.add_argument("--whole-block", action="store_true",
+                        help="retry/guard every row when any post-verify row is risky")
     args = parser.parse_args()
     cases = [load_case(specification) for specification in args.case]
     if args.hard_case not in {case.name for case in cases}:
@@ -128,6 +133,13 @@ def main() -> None:
         "draft_top1_p_drop": "high",
         "draft_margin_drop": "high",
         "draft_adjacent_top8_churn": "high",
+        "target_entropy_norm": "high",
+        "target_top1_p": "low",
+        "target_margin": "low",
+        "target_entropy_delta": "high",
+        "target_top1_p_drop": "high",
+        "target_margin_drop": "high",
+        "target_current_draft_top1_disagree": "high",
     }
     grids = {feature: thresholds(cases, feature, direction)
              for feature, direction in orientations.items()}
@@ -140,6 +152,15 @@ def main() -> None:
         ("draft_entropy_delta", "draft_entropy_norm"),
         ("draft_top1_p_drop", "draft_top1_p"),
         ("draft_entropy_delta", "draft_top1_p", "draft_margin"),
+        ("target_entropy_norm",), ("target_top1_p",), ("target_margin",),
+        ("target_entropy_delta",), ("target_top1_p_drop",),
+        ("target_current_draft_top1_disagree",),
+        ("target_top1_p", "target_margin"),
+        ("target_entropy_norm", "target_margin"),
+        ("target_top1_p_drop", "target_top1_p"),
+        ("target_entropy_delta", "target_top1_p"),
+        ("target_top1_p", "draft_top1_p"),
+        ("target_top1_p", "draft_entropy_delta"),
     ]
     results = []
     seen = set()
@@ -152,7 +173,7 @@ def main() -> None:
             if signature in seen:
                 continue
             seen.add(signature)
-            result = evaluate(cases, clauses)
+            result = evaluate(cases, clauses, args.whole_block)
             hard = result["cases"][args.hard_case]
             result["sort"] = (
                 hard["flips"] - hard["captured"],

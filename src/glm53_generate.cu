@@ -2777,8 +2777,6 @@ public:
             require(!df_cache_joint_options_ ||
                         (df_cache_joint_options_ >= 2 && df_cache_joint_options_ <= 8),
                     "joint cache routing options must be 0 or 2..8");
-            require(!df_cache_joint_options_ || df_cache_route_retain_ == 7,
-                    "joint cache routing currently requires retain 7");
             std::printf("DFlash2 cache-aware route: top-%d, retain %d, regret %.4f\n",
                         df_cache_route_k_, df_cache_route_retain_, df_cache_route_regret_);
             if (df_cache_joint_options_)
@@ -5387,13 +5385,14 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             const int verify_row = capture_offset_ + token;
             const bool guarded = df_logit_guard_on() && verify_row >= 0 &&
                 verify_row < kMaxVerify && df_logit_guard_exact_[size_t(verify_row)];
-            const int first_tail = guarded ? 7 : 7;
-            const int last_tail = guarded ? 8 : df_cache_route_k_;
-            for (int tail_rank = first_tail; tail_rank < last_tail; ++tail_rank) {
+            auto append_action = [&](int first_tail, int second_tail) {
                 CacheChoice action;
-                for (int slot = 0; slot < 7; ++slot)
+                for (int slot = 0; slot < df_cache_route_retain_; ++slot)
                     action.experts[size_t(slot)] = baseline[size_t(slot)];
-                action.experts[7] = candidates[size_t(tail_rank)];
+                action.experts[size_t(df_cache_route_retain_)] =
+                    candidates[size_t(first_tail)];
+                if (df_cache_route_retain_ == 6)
+                    action.experts[7] = candidates[size_t(second_tail)];
                 double selected_score = 0.0;
                 for (int expert : action.experts) {
                     const int candidate = rank[size_t(expert)];
@@ -5403,9 +5402,23 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 }
                 action.regret = std::max(0.0, baseline_score - selected_score);
                 action.ratio = score_scale > 0.0 ? action.regret / score_scale : 0.0;
-                if (action.ratio > double(df_cache_route_regret_) + 2.0e-7) continue;
-                action.substitutions = action.experts[7] != baseline[7];
+                if (action.ratio > double(df_cache_route_regret_) + 2.0e-7) return;
+                for (int slot = df_cache_route_retain_; slot < 8; ++slot)
+                    action.substitutions +=
+                        std::find(baseline.begin(), baseline.end(),
+                                  action.experts[size_t(slot)]) == baseline.end();
                 options[size_t(token)].push_back(action);
+            };
+            if (guarded) {
+                append_action(df_cache_route_retain_,
+                              df_cache_route_retain_ == 6 ? 7 : -1);
+            } else if (df_cache_route_retain_ == 7) {
+                for (int tail = 7; tail < df_cache_route_k_; ++tail)
+                    append_action(tail, -1);
+            } else {
+                for (int first = 6; first < df_cache_route_k_; ++first)
+                    for (int second = first + 1; second < df_cache_route_k_; ++second)
+                        append_action(first, second);
             }
             require(!options[size_t(token)].empty(), "joint cache route has no feasible action");
             auto local_less = [](const CacheChoice &left, const CacheChoice &right) {

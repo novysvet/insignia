@@ -70,6 +70,7 @@ run exact INSIGNIA_GLM53_DF_MOE_METRICS="$OUT/moe-metrics.csv" \
 
 for policy in "${POLICIES[@]}"; do
   if [[ $policy =~ ^cache([0-9]+)-r([67])-e([0-9]+)$ ]]; then
+    tag=$policy
     run "$policy" INSIGNIA_GLM53_DF_CACHE_ROUTE_K="${BASH_REMATCH[1]}" \
         INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN="${BASH_REMATCH[2]}" \
         INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET="0.${BASH_REMATCH[3]}"

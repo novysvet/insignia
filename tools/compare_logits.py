@@ -111,6 +111,21 @@ def logsumexp(x: np.ndarray) -> float:
     return m + math.log(float(np.sum(np.exp(x - m))))
 
 
+def distribution_divergences(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float, float]:
+    """Return KL(A||B), JS(A,B), logsumexp(A), and logsumexp(B)."""
+    lse_a = logsumexp(a)
+    lse_b = logsumexp(b)
+    log_pa = a - lse_a
+    log_pb = b - lse_b
+    pa = np.exp(log_pa)
+    pb = np.exp(log_pb)
+    log_mix = np.logaddexp(log_pa, log_pb) - math.log(2.0)
+    kl = float(np.sum(pa * (log_pa - log_pb)))
+    js = 0.5 * float(np.sum(pa * (log_pa - log_mix)) +
+                     np.sum(pb * (log_pb - log_mix)))
+    return max(0.0, kl), max(0.0, js), lse_a, lse_b
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare two GLM-5.3 logits dumps (INSIGNIA_GLM53_LOGITS_DUMP "
@@ -174,7 +189,7 @@ def main() -> int:
                 f"(pre-aligned)")
 
     columns = (f"{'step':>5}  {'top1':>12}  {'ovlp':>7}  {'dmax':>10}  "
-               f"{'dmean':>10}  {'cos':>9}  {'mse':>10}")
+               f"{'dmean':>10}  {'cos':>9}  {'mse':>10}  {'kl':>10}  {'js':>10}")
     if targets is not None:
         columns += f"  {'nllA':>9}  {'nllB':>9}"
     if not args.quiet:
@@ -183,6 +198,7 @@ def main() -> int:
 
     # Per-step metric series for the summary.
     cos_series, mse_series, dmax_series, dmean_series = [], [], [], []
+    kl_series, js_series = [], []
     ovlp_series, top1_mismatches, cos_violations = [], [], []
     nll_a_sum = nll_b_sum = 0.0
 
@@ -203,16 +219,19 @@ def main() -> int:
         cos = 1.0 if na == 0.0 and nb == 0.0 else (
             0.0 if na == 0.0 or nb == 0.0 else float(np.dot(ra, rb)) / (na * nb))
         mse = float(np.mean((ra - rb) ** 2))
+        kl, js, lse_a, lse_b = distribution_divergences(ra, rb)
 
         nll_a = nll_b = float("nan")
         if targets is not None:
-            nll_a = logsumexp(ra) - ra[targets[step]]
-            nll_b = logsumexp(rb) - rb[targets[step]]
+            nll_a = lse_a - ra[targets[step]]
+            nll_b = lse_b - rb[targets[step]]
             nll_a_sum += nll_a
             nll_b_sum += nll_b
 
         cos_series.append(cos)
         mse_series.append(mse)
+        kl_series.append(kl)
+        js_series.append(js)
         dmax_series.append(dmax)
         dmean_series.append(dmean)
         ovlp_series.append(ovlp)
@@ -224,7 +243,8 @@ def main() -> int:
         if not args.quiet:
             top1 = f"{top1_a}/{top1_b}" if agree else f"{top1_a}!{top1_b}"
             row = (f"{step:>5}  {top1:>12}  {ovlp:>3}/{k:<3}  {dmax:>10.3e}  "
-                   f"{dmean:>10.3e}  {cos:>9.6f}  {mse:>10.3e}")
+                   f"{dmean:>10.3e}  {cos:>9.6f}  {mse:>10.3e}  "
+                   f"{kl:>10.3e}  {js:>10.3e}")
             if targets is not None:
                 row += f"  {nll_a:>9.4f}  {nll_b:>9.4f}"
             print(row)
@@ -237,6 +257,8 @@ def main() -> int:
     print("-" * len(columns))
     print(summary("cos", cos_series, lambda v: f"{v:.6f}"))
     print(summary("mse", mse_series, lambda v: f"{v:.3e}"))
+    print(summary("kl", kl_series, lambda v: f"{v:.3e}"))
+    print(summary("js", js_series, lambda v: f"{v:.3e}"))
     print(summary("dmax", dmax_series, lambda v: f"{v:.3e}"))
     print(summary("dmean", dmean_series, lambda v: f"{v:.3e}"))
     print(f"ovlp   mean {statistics.fmean(ovlp_series):.2f}/{k}  "

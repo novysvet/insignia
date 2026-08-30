@@ -54,7 +54,8 @@ COMMON=(
   INSIGNIA_GLM53_DF_BATCH_VERIFY=1
 )
 PLAN_ENV=()
-if [[ $PLAN == packedslots || $PLAN == packedjoint || $PLAN == packedjointreverse ]]; then
+if [[ $PLAN == packedslots || $PLAN == packedjoint ||
+      $PLAN == packedjointreverse || $PLAN == top4cachebalancedpacked ]]; then
   PLAN_ENV=(
     INSIGNIA_GLM53_PACKED_EXPERTS=/var/lib/insignia/glm53-experts-nvfp4x-v2.igx
     INSIGNIA_GLM53_PACKED_V2=1

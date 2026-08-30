@@ -266,10 +266,18 @@ def main() -> None:
                 raise SystemExit("exec_k differs by layer for one verifier row")
             row_exec_k[row_index] = value
     print("\nResidual top-1 mismatch locations:")
-    print("| output record | block | row | exec k | draft p | p drop | entropy delta | margin |")
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|")
+    block_k = {
+        block: "/".join(str(row_exec_k[index]) for index in
+                        np.flatnonzero(row_meta[:, 1] == block))
+        for block in sorted(set(map(int, row_meta[:, 1])))
+    }
+    print("| output record | block | recent block k | row | exec k | draft p | p drop | entropy delta | margin |")
+    print("|---:|---:|---|---:|---:|---:|---:|---:|---:|")
     for index in np.flatnonzero(labels):
-        print(f"| {int(row_meta[index, 3])} | {int(row_meta[index, 1])} "
+        block = int(row_meta[index, 1])
+        recent = ";".join(f"b{prior}:{block_k[prior]}"
+                          for prior in range(max(0, block - 2), block + 1))
+        print(f"| {int(row_meta[index, 3])} | {block} | {recent} "
               f"| {int(row_meta[index, 2])} | {row_exec_k[index]} "
               f"| {features['draft_top1_p'][index]:.6f} "
               f"| {features['draft_top1_p_drop'][index]:+.6f} "

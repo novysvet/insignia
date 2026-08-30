@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Join exact-teacher falsifier events with target and DFlash logit dumps.
+"""Join falsifier runtime events with target and DFlash logit dumps.
 
-The binary event trace contains only causal runtime observations and the local
-8x8 expert-contribution Gram label. This tool adds compact vocabulary features
-and downstream full-logit labels without copying 154,880 floats into every
-training sample.
+An exact-teacher trace contains causal observations plus the local 8x8
+expert-contribution Gram label. An on-policy feature trace contains the causal
+state and executed approximate action but intentionally omits that expensive
+label. This tool adds compact vocabulary features and downstream full-logit
+labels without copying 154,880 floats into every training sample.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ import numpy as np
 TRACE_HEADER = struct.Struct("<8sHHIHHHHHHII28s")
 TRACE_MAGIC = b"INSFAL1\0"
 TRACE_VERSION = 2
+TRACE_FLAG_NORMALIZED_GRAM = 1 << 0
+TRACE_FLAG_SCALED_HIDDEN_SKETCH = 1 << 1
+EVENT_FLAG_FEATURE_ONLY = 1 << 2
 
 EVENT_DTYPE = np.dtype([
     ("epoch", "<u4"),
@@ -79,6 +83,8 @@ def read_trace(path: Path) -> tuple[dict[str, int], np.memmap]:
     if (record_bytes != EVENT_DTYPE.itemsize or topk != 8 or candidate_k != 32 or
             hidden_sketch != 64):
         raise SystemExit(f"{path}: unsupported falsifier record geometry")
+    if not flags & TRACE_FLAG_SCALED_HIDDEN_SKETCH:
+        raise SystemExit(f"{path}: unscaled hidden sketches are unsupported")
     payload = path.stat().st_size - header_bytes
     if payload < 0 or payload % record_bytes:
         raise SystemExit(f"{path}: partial falsifier event")
@@ -367,21 +373,37 @@ def build(args: argparse.Namespace) -> None:
         raise SystemExit("an event has no matching final-logit row")
 
     derived, multiplicity = event_derived(events, epoch_rank)
-    gram_sum = np.zeros(len(events), dtype=np.float64)
-    for index, upper in enumerate(events["contribution_gram"]):
-        cursor = 0
-        total = 0.0
-        for left in range(8):
-            for right in range(left, 8):
-                value = float(upper[cursor])
-                total += value if left == right else 2.0 * value
-                cursor += 1
-        gram_sum[index] = total
-    exact_norm = events["tail"][:, 0].astype(np.float64)
-    relative = np.abs(gram_sum - exact_norm) / np.maximum(np.abs(exact_norm), 1e-12)
-    if float(np.quantile(relative, 0.99)) > args.gram_rel_tolerance:
-        raise SystemExit(f"Gram/exact norm validation failed: p99 relative error "
-                         f"{float(np.quantile(relative, 0.99)):.3g}")
+    gram_present = bool(geometry["flags"] & TRACE_FLAG_NORMALIZED_GRAM)
+    feature_flags = (events["flags"].astype(np.uint16) & EVENT_FLAG_FEATURE_ONLY) != 0
+    if gram_present and np.any(feature_flags):
+        raise SystemExit("exact Gram trace contains feature-only records")
+    if not gram_present and not np.all(feature_flags):
+        raise SystemExit("feature-only trace contains unlabeled record flags")
+    contribution_gram = events["contribution_gram"].astype(np.float32, copy=True)
+    event_tail = events["tail"].astype(np.float32, copy=True)
+    gram_p99: float | None = None
+    if gram_present:
+        gram_sum = np.zeros(len(events), dtype=np.float64)
+        for index, upper in enumerate(contribution_gram):
+            cursor = 0
+            total = 0.0
+            for left in range(8):
+                for right in range(left, 8):
+                    value = float(upper[cursor])
+                    total += value if left == right else 2.0 * value
+                    cursor += 1
+            gram_sum[index] = total
+        exact_norm = event_tail[:, 0].astype(np.float64)
+        relative = np.abs(gram_sum - exact_norm) / np.maximum(np.abs(exact_norm), 1e-12)
+        gram_p99 = float(np.quantile(relative, 0.99))
+        if gram_p99 > args.gram_rel_tolerance:
+            raise SystemExit(f"Gram/exact norm validation failed: p99 relative error "
+                             f"{gram_p99:.3g}")
+    else:
+        # NaN makes accidental use as a supervised label fail loudly while
+        # preserving one fixed dataset schema for concatenation.
+        contribution_gram.fill(np.nan)
+        event_tail[:, :3] = np.nan
 
     metadata = {
         "schema": "insignia-falsifier-dataset-v2",
@@ -390,6 +412,7 @@ def build(args: argparse.Namespace) -> None:
         "family": args.family,
         "policy": args.policy,
         "geometry": geometry,
+        "gram_present": gram_present,
         "verify_k": args.verify_k,
         "draft_rows": args.draft_rows,
         "vocab": args.vocab,
@@ -399,7 +422,15 @@ def build(args: argparse.Namespace) -> None:
         "event_derived_names": EVENT_DERIVED_NAMES,
         "row_scalar_names": ROW_SCALAR_NAMES,
         "row_label_names": ROW_LABEL_NAMES,
-        "causality": "event features precede expert execution; Gram and row labels are targets",
+        "expert_id_semantics": (
+            "executed approximate action; baseline route is candidate_ids[:, :8]"
+            if not gram_present else "exact baseline and executed route"
+        ),
+        "causality": (
+            "on-policy event features and action precede expert execution; row labels are targets"
+            if not gram_present else
+            "event features precede expert execution; Gram and row labels are targets"
+        ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -419,8 +450,9 @@ def build(args: argparse.Namespace) -> None:
                                        axis=1).astype(np.float32),
         hidden_countsketch=events["hidden_countsketch"].astype(np.float32),
         event_derived=derived,
-        contribution_gram=events["contribution_gram"].astype(np.float32),
-        event_tail=events["tail"].astype(np.float32),
+        contribution_gram=contribution_gram,
+        event_tail=event_tail,
+        event_label_mask=np.full(len(events), gram_present, dtype=np.bool_),
         row_meta=np.asarray(row_meta, dtype=np.int32),
         row_scalars=np.asarray(row_scalars, dtype=np.float32),
         row_logit_sketch=np.asarray(row_sketches, dtype=np.float32),
@@ -431,8 +463,9 @@ def build(args: argparse.Namespace) -> None:
         row_labels=np.asarray(row_labels, dtype=np.float32),
         row_top1=np.asarray(row_top1, dtype=np.int32),
     )
-    print(f"wrote {args.output}: {len(events)} events, {len(row_meta)} rows, "
-          f"Gram p99 relative check {float(np.quantile(relative, 0.99)):.3g}")
+    gram_status = (f"Gram p99 relative check {gram_p99:.3g}" if gram_present
+                   else "feature-only trace (Gram labels unavailable)")
+    print(f"wrote {args.output}: {len(events)} events, {len(row_meta)} rows, {gram_status}")
 
 
 def parse_args() -> argparse.Namespace:

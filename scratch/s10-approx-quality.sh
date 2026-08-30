@@ -44,6 +44,10 @@ COMMON=(
 run() {
   local tag=$1
   shift
+  local trace=()
+  if [[ $tag != exact ]]; then
+    trace=(INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE="$OUT/$tag-features.bin")
+  fi
   echo "=== $tag ==="
   env -u INSIGNIA_GLM53_DF_APPROX_TOPM \
       -u INSIGNIA_GLM53_DF_APPROX_RENORM \
@@ -55,7 +59,9 @@ run() {
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_RETAIN \
       -u INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET \
       -u INSIGNIA_GLM53_DF_MOE_METRICS \
-      "${COMMON[@]}" "$@" \
+      -u INSIGNIA_GLM53_DF_FALSIFIER_TRACE \
+      -u INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE \
+      "${COMMON[@]}" "${trace[@]}" "$@" \
       INSIGNIA_GLM53_FORCE_LOGITS_DUMP="$OUT/$tag-logits.f32" \
       INSIGNIA_GLM53_FORCE_DF_LOGITS_DUMP="$OUT/$tag-draft-logits.f32" \
       "$BIN" "$MODEL" "$INDEX" "@$PROMPT" 0 1 "$FP8" \

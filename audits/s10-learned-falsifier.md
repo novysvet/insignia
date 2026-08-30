@@ -326,3 +326,32 @@ strictly better, not merely its average validation loss.
 5. Integrate shadow inference and measure overhead.
 6. Add the joint union-aware solver, first for prefix k and then for arbitrary
    subsets if the held-out frontier justifies it.
+
+## 2026-08-30 on-policy trace correction
+
+The first three prompt datasets combined an exact-teacher event trace with
+logits from the approximate arm. That is useful for a one-step counterfactual
+but is not an on-policy corpus: once an approximate action changes the hidden
+trajectory, later exact-trace sketches/router/cache observations describe the
+wrong state.
+
+`INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE=<path>` now emits the same 896-byte
+record on the actual approximate/cache-aware trajectory, immediately before
+expert staging and execution. It records:
+
+- the actual selected expert IDs/weights and executed `k`;
+- the untouched top-32 router candidate ranking, from which baseline top eight
+  is recoverable;
+- pre-staging host/in-flight/device/pinned residency masks;
+- router summary and the current hidden-state CountSketch/input norm.
+
+It deliberately performs no expert-output download. Header Gram-present bit 0
+is clear and event flag bit 2 is set. The dataset builder replaces unavailable
+Gram/tail labels with NaN and emits `event_label_mask=false`; row-level MSE,
+cosine, KL, JS, top-1, top-10, and max-error labels remain available from the
+paired exact/approximate full-logit dumps. Exact traces retain their original
+bit-identical v2 layout and Gram validation.
+
+The quality harness now captures a separate feature trace for every
+approximate policy arm. This closes the trajectory mismatch before fitting any
+learned baseline or Falsifier-MoE.

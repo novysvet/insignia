@@ -536,10 +536,11 @@ struct PackedExpertRecordHeader {
 };
 static_assert(sizeof(PackedExpertRecordHeader) == 128);
 
-// Exact-teacher trace for the learned DFlash falsifier. The fixed record is
-// fourteen cache lines and deliberately contains only causal runtime features
-// plus the exact expert-contribution Gram label. Full target/DFlash logits remain
-// in their existing raw dumps and are joined offline by (epoch,row).
+// Trace for the learned DFlash falsifier. The fixed record is fourteen cache
+// lines. Exact-teacher traces include the expert-contribution Gram label;
+// feature-only traces run on the approximate trajectory and stop before expert
+// execution. Full target/DFlash logits remain in their existing raw dumps and
+// are joined offline by (epoch,row).
 struct alignas(64) DfFalsifierTraceHeader {
     char magic[8];
     uint16_t version, header_bytes;
@@ -555,7 +556,7 @@ struct alignas(64) DfFalsifierEventV2 {
     uint16_t layer;
     uint8_t row, tokens;
     uint8_t verify_row, exec_k;
-    uint16_t flags;  // bit 0: MLA layer, bit 1: KDA archive active
+    uint16_t flags;  // bit 0: MLA, bit 1: KDA archive, bit 2: feature-only
     // Four 32-bit candidate masks: host-ready, host-in-flight,
     // device-resident, pinned.
     std::array<uint32_t, 4> candidate_residency;
@@ -2785,8 +2786,18 @@ public:
         }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
-        if (const char *path = std::getenv("INSIGNIA_GLM53_DF_FALSIFIER_TRACE"))
-            falsifier_trace_path_ = path;
+        const char *exact_falsifier_trace =
+            std::getenv("INSIGNIA_GLM53_DF_FALSIFIER_TRACE");
+        const char *feature_falsifier_trace =
+            std::getenv("INSIGNIA_GLM53_DF_FALSIFIER_FEATURE_TRACE");
+        require(!exact_falsifier_trace || !feature_falsifier_trace,
+                "choose exact or feature-only DFlash falsifier trace, not both");
+        if (exact_falsifier_trace) {
+            falsifier_trace_path_ = exact_falsifier_trace;
+        } else if (feature_falsifier_trace) {
+            falsifier_trace_path_ = feature_falsifier_trace;
+            falsifier_feature_only_ = true;
+        }
         forced_sequential_verify_ =
             dflash2_on_ && std::getenv("INSIGNIA_GLM53_DF_SEQ_VERIFY") != nullptr;
         // Dense layer -> KDA archive row (recurrent-state replay indexing).
@@ -2865,11 +2876,16 @@ public:
                 expert_stager_ = std::make_unique<ExpertStager>(model_, host_cache);
             }
         }
-        if (!moe_metrics_path_.empty() || !falsifier_trace_path_.empty()) {
+        if (!moe_metrics_path_.empty() ||
+            (!falsifier_trace_path_.empty() && !falsifier_feature_only_)) {
             require(dflash2_on_, "DFlash MoE diagnostics require DFlash2");
             require(!df_approx_topm_ && df_approx_mass_ == 0.0f && !df_cache_route_k_,
                     "MoE diagnostics must run on the exact top-8 verification path");
             require(nvfp4_experts_, "MoE diagnostics require retained NVFP4 expert outputs");
+        }
+        if (!falsifier_trace_path_.empty()) {
+            require(dflash2_on_, "DFlash falsifier traces require DFlash2");
+            require(nvfp4_experts_, "DFlash falsifier traces require NVFP4 expert residency");
         }
         if (!moe_metrics_path_.empty()) {
             moe_metrics_ = std::fopen(moe_metrics_path_.c_str(), "w");
@@ -2892,10 +2908,13 @@ public:
             header.candidate_k = 32;
             header.hidden_sketch = 64;
             header.hidden = uint32_t(hidden_);
-            header.flags = 3;  // Gram divided by hidden; signed CountSketch scaled.
+            // bit 0: normalized Gram labels are present; bit 1: signed
+            // CountSketch is scaled by sqrt(64/hidden).
+            header.flags = falsifier_feature_only_ ? 2u : 3u;
             require(std::fwrite(&header, sizeof(header), 1, falsifier_trace_) == 1,
                     "write DFlash falsifier trace header");
-            std::printf("DFlash falsifier exact-teacher trace: %s (%zu-byte records)\n",
+            std::printf("DFlash falsifier %s trace: %s (%zu-byte records)\n",
+                        falsifier_feature_only_ ? "on-policy feature-only" : "exact-teacher",
                         falsifier_trace_path_.c_str(), sizeof(DfFalsifierEventV2));
         }
 
@@ -3225,6 +3244,15 @@ private:
         const std::vector<std::array<float, 8>> &router_summary,
         const std::vector<std::array<uint32_t, 4>> &candidate_residency,
         const float *input, int tokens);
+    void report_falsifier_features(
+        int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
+        const std::vector<int> &exec_count,
+        const std::vector<std::array<uint16_t, 32>> &candidate_experts,
+        const std::vector<std::array<float, 32>> &candidate_logits,
+        const std::vector<std::array<float, 32>> &candidate_choice,
+        const std::vector<std::array<float, 8>> &router_summary,
+        const std::vector<std::array<uint32_t, 4>> &candidate_residency,
+        const float *input, int tokens);
     void prefill_layer_chunk_exact(int layer, float *in_place, float *scratch,
                                    int count, int position_base, float *dflash_capture);
     const float *device_f32(std::string_view name);
@@ -3324,6 +3352,7 @@ private:
     FILE *moe_metrics_ = nullptr;
     std::string falsifier_trace_path_;
     FILE *falsifier_trace_ = nullptr;
+    bool falsifier_feature_only_ = false;
     std::vector<float> moe_metrics_expert_, moe_metrics_exact_, moe_metrics_input_;
     float *df_logits_host_ = nullptr, *df_hp_host_ = nullptr;
     std::unique_ptr<Q8Index> q8_index_;
@@ -4761,10 +4790,11 @@ void Runner::report_moe_metrics(
     const std::vector<std::array<float, 8>> &router_summary,
     const std::vector<std::array<uint32_t, 4>> &candidate_residency,
     const float *input, int tokens) {
-    require((moe_metrics_ || falsifier_trace_) && moe_topk_ == 8,
+    const bool write_exact_trace = falsifier_trace_ && !falsifier_feature_only_;
+    require((moe_metrics_ || write_exact_trace) && moe_topk_ == 8,
             "invalid MoE diagnostics state");
     require(selection.size() == size_t(tokens) &&
-                (!falsifier_trace_ ||
+                (!write_exact_trace ||
                  (candidate_experts.size() == size_t(tokens) &&
                   candidate_logits.size() == size_t(tokens) &&
                   candidate_choice.size() == size_t(tokens) &&
@@ -4781,7 +4811,7 @@ void Runner::report_moe_metrics(
     check(cudaMemcpy(moe_metrics_exact_.data(), c_routed_.get(),
                      exact_values * sizeof(float), cudaMemcpyDeviceToHost),
           "download exact routed output");
-    if (falsifier_trace_) {
+    if (write_exact_trace) {
         moe_metrics_input_.resize(exact_values);
         check(cudaMemcpy(moe_metrics_input_.data(), input,
                          exact_values * sizeof(float), cudaMemcpyDeviceToHost),
@@ -4819,7 +4849,7 @@ void Runner::report_moe_metrics(
         const double exact_norm = std::sqrt(exact_norm2);
         const double exact_cancel = exact_norm > 0.0 ? exact_term_sum / exact_norm : 0.0;
 
-        if (falsifier_trace_) {
+        if (write_exact_trace) {
             DfFalsifierEventV2 record{};
             record.epoch = verify_epoch_;
             record.layer = uint16_t(layer);
@@ -4921,7 +4951,82 @@ void Runner::report_moe_metrics(
         }
     }
     if (moe_metrics_) std::fflush(moe_metrics_);
-    if (falsifier_trace_) std::fflush(falsifier_trace_);
+    if (write_exact_trace) std::fflush(falsifier_trace_);
+}
+
+void Runner::report_falsifier_features(
+    int layer, const std::vector<std::vector<std::pair<int, float>>> &selection,
+    const std::vector<int> &exec_count,
+    const std::vector<std::array<uint16_t, 32>> &candidate_experts,
+    const std::vector<std::array<float, 32>> &candidate_logits,
+    const std::vector<std::array<float, 32>> &candidate_choice,
+    const std::vector<std::array<float, 8>> &router_summary,
+    const std::vector<std::array<uint32_t, 4>> &candidate_residency,
+    const float *input, int tokens) {
+    require(falsifier_trace_ && falsifier_feature_only_ && kda_archive_ && moe_topk_ == 8,
+            "invalid feature-only falsifier trace state");
+    require(selection.size() == size_t(tokens) && exec_count.size() == size_t(tokens) &&
+                candidate_experts.size() == size_t(tokens) &&
+                candidate_logits.size() == size_t(tokens) &&
+                candidate_choice.size() == size_t(tokens) &&
+                router_summary.size() == size_t(tokens) &&
+                candidate_residency.size() == size_t(tokens),
+            "incomplete feature-only falsifier context");
+
+    const size_t input_values = size_t(tokens) * hidden_;
+    moe_metrics_input_.resize(input_values);
+    check(cudaMemcpy(moe_metrics_input_.data(), input, input_values * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "download feature-only falsifier hidden input");
+    for (int row = 0; row < tokens; ++row) {
+        require(selection[size_t(row)].size() == size_t(moe_topk_) &&
+                    exec_count[size_t(row)] >= 1 && exec_count[size_t(row)] <= moe_topk_,
+                "invalid feature-only falsifier action");
+        DfFalsifierEventV2 record{};
+        record.epoch = verify_epoch_;
+        record.layer = uint16_t(layer);
+        record.row = uint8_t(row);
+        record.tokens = uint8_t(tokens);
+        const int verify_row = capture_offset_ + row;
+        require(verify_row >= 0 && verify_row <= 255,
+                "feature-only falsifier verify row is out of range");
+        record.verify_row = uint8_t(verify_row);
+        record.exec_k = uint8_t(exec_count[size_t(row)]);
+        record.flags = uint16_t((is_mla_[size_t(layer)] ? 1u : 0u) |
+                                (kda_archive_ ? 2u : 0u) | 4u);
+        record.candidate_residency = candidate_residency[size_t(row)];
+        for (int slot = 0; slot < moe_topk_; ++slot) {
+            record.expert[size_t(slot)] =
+                uint16_t(selection[size_t(row)][size_t(slot)].first);
+            record.weight[size_t(slot)] =
+                selection[size_t(row)][size_t(slot)].second;
+        }
+        record.candidate_expert = candidate_experts[size_t(row)];
+        record.candidate_logit = candidate_logits[size_t(row)];
+        record.candidate_choice = candidate_choice[size_t(row)];
+        record.router_summary = router_summary[size_t(row)];
+
+        const float *hidden = moe_metrics_input_.data() + size_t(row) * hidden_;
+        double input_norm2 = 0.0;
+        for (int column = 0; column < hidden_; ++column) {
+            uint32_t hash = uint32_t(column + 1) * 0x9e3779b1u;
+            hash ^= hash >> 16;
+            hash *= 0x85ebca6bu;
+            hash ^= hash >> 13;
+            const int bucket = int(hash & 63u);
+            record.hidden_countsketch[size_t(bucket)] +=
+                (hash & 64u) ? hidden[column] : -hidden[column];
+            input_norm2 += double(hidden[column]) * hidden[column];
+        }
+        const float sketch_scale = std::sqrt(64.0f / float(hidden_));
+        for (float &value : record.hidden_countsketch) value *= sketch_scale;
+        // Gram and the first three tail values are labels and deliberately
+        // remain zero in an on-policy feature trace. The input norm is causal.
+        record.tail[3] = float(input_norm2 / hidden_);
+        require(std::fwrite(&record, sizeof(record), 1, falsifier_trace_) == 1,
+                "write feature-only DFlash falsifier event");
+    }
+    std::fflush(falsifier_trace_);
 }
 
 // Router scores for the whole chunk download once; each distinct expert's
@@ -4944,7 +5049,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     const std::vector<float> &bias = host_f32(stem + "gate.e_score_correction_bias");
     require(bias.size() == size_t(experts), "wrong router bias geometry");
     std::vector<std::vector<std::pair<int, float>>> selection(tokens);
-    const bool trace_falsifier = falsifier_trace_ != nullptr;
+    // Prompt prefill is not part of the speculative verify trajectory; only
+    // widen and emit the fixed records once the KDA replay archive is active.
+    const bool trace_falsifier = falsifier_trace_ != nullptr && kda_archive_;
     const bool widen_router = trace_falsifier || (kda_archive_ && df_cache_route_k_);
     const size_t widened_rows = widen_router ? size_t(tokens) : 0;
     std::vector<std::array<uint16_t, 32>> candidate_experts(widened_rows);
@@ -5145,6 +5252,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 selection[token][size_t(slot)].second *= scale;
         }
     }
+    if (trace_falsifier && falsifier_feature_only_)
+        report_falsifier_features(layer, selection, exec_count, candidate_experts,
+                                  candidate_logits, candidate_choice, router_summary,
+                                  candidate_residency, input, tokens);
     std::vector<int> distinct;
     for (int token = 0; token < tokens; ++token) {
         const auto &picks = selection[size_t(token)];
@@ -5441,7 +5552,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         (size_t(token) * topk + size_t(pick_slot)) * hidden_,
                                     selection[size_t(token)][size_t(pick_slot)].second, hidden_);
             }
-        if (ordered_accumulation && (moe_metrics_ || falsifier_trace_))
+        if (ordered_accumulation &&
+            (moe_metrics_ || (falsifier_trace_ && !falsifier_feature_only_)))
             report_moe_metrics(layer, selection, candidate_experts, candidate_logits,
                                candidate_choice, router_summary, candidate_residency,
                                input, tokens);

@@ -103,6 +103,20 @@ def test_model() -> None:
     assert abs(float(model.cell.moe.routing_bias.mean())) < 2e-6
     assert min(step["qk_gamma"]) < 1.0
 
+    model.eval()
+    sequence = {name: value[:1] for name, value in batch.items()}
+    with torch.no_grad():
+        full = model(sequence)
+        state = None
+        pieces = []
+        for start, stop in ((0, 3), (3, 8)):
+            chunk = {name: value[:, start:stop] for name, value in sequence.items()}
+            output, state = model.forward_incremental(chunk, state, max_history=16)
+            pieces.append(output["hidden"])
+        incremental = torch.cat(pieces, dim=1)
+    assert torch.allclose(full["hidden"], incremental, atol=2e-5, rtol=2e-5)
+    assert all(latent is not None and latent.shape[1] == 8 for latent in state.latents)
+
     groups = model.dion_parameter_groups()
     grouped = [parameter for group in groups for parameter in group["params"]]
     assert len({id(parameter) for parameter in grouped}) == len(grouped)

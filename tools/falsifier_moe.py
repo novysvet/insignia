@@ -60,6 +60,17 @@ class FalsifierMoEConfig:
         return asdict(self)
 
 
+@dataclass
+class FalsifierIncrementalState:
+    """External per-depth MLA latents; safe to reset at a request boundary."""
+
+    latents: list[Tensor | None]
+
+    @classmethod
+    def empty(cls, repeats: int) -> "FalsifierIncrementalState":
+        return cls([None] * repeats)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, width: int, epsilon: float = 1e-6):
         super().__init__()
@@ -197,6 +208,43 @@ class CausalMLA(nn.Module):
                 self._qk_smax = observed if self._qk_smax is None else torch.maximum(
                     self._qk_smax.to(observed.device), observed)
         return result
+
+    def forward_incremental(self, value: Tensor, cached_latent: Tensor | None,
+                            max_history: int, observe_qk: bool = False
+                            ) -> tuple[Tensor, Tensor]:
+        """Causal chunk append while retaining only the compressed latent.
+
+        Re-expanding the bounded latent history deliberately spends Ada compute
+        to keep the controller cache tiny.  A fused absorbed kernel is a later
+        runtime optimization, not a prerequisite for training or shadow mode.
+        """
+        batch, tokens, _ = value.shape
+        query = self.q_proj(value).view(batch, tokens, self.heads, self.head_dim).transpose(1, 2)
+        current_latent = self.kv_norm(self.kv_down(value))
+        all_latent = (current_latent if cached_latent is None else
+                      torch.cat((cached_latent.to(current_latent.dtype), current_latent), dim=1))
+        if all_latent.shape[1] > max_history:
+            all_latent = all_latent[:, -max_history:]
+        key_value = self.kv_up(all_latent).view(
+            batch, all_latent.shape[1], 2, self.heads, self.head_dim)
+        key = key_value[:, :, 0].transpose(1, 2)
+        val = key_value[:, :, 1].transpose(1, 2)
+        past = all_latent.shape[1] - tokens
+        query_position = torch.arange(tokens, device=value.device)[:, None] + past
+        key_position = torch.arange(all_latent.shape[1], device=value.device)[None, :]
+        mask = (key_position <= query_position).view(1, 1, tokens, all_latent.shape[1])
+        result = F.scaled_dot_product_attention(query, key, val, attn_mask=mask)
+        result = result.transpose(1, 2).reshape(batch, tokens, self.projected)
+        result = self.out_proj(result * torch.sigmoid(self.output_gate(value)))
+        if observe_qk:
+            with torch.no_grad():
+                score = torch.einsum("bhtd,bhsd->bhts", query.float(), key.float())
+                score /= math.sqrt(self.head_dim)
+                score = score.masked_fill(~mask, -torch.inf)
+                observed = score.amax(dim=(0, 2, 3))
+                self._qk_smax = observed if self._qk_smax is None else torch.maximum(
+                    self._qk_smax.to(observed.device), observed)
+        return result, all_latent.detach()
 
     @torch.no_grad()
     def qk_clip_(self, tau: float = 100.0) -> Tensor:
@@ -413,6 +461,21 @@ class ControllerCell(nn.Module):
             streams = streams * valid[..., None, None]
         return streams, diagnostics
 
+    def forward_incremental(self, streams: Tensor, history: list[Tensor],
+                            cached_latent: Tensor | None, max_history: int,
+                            collect_quantiles: bool, observe_qk: bool
+                            ) -> tuple[Tensor, dict[str, Tensor], Tensor]:
+        depth = self.depth(history)
+        streams = self.mixer(streams, depth)
+        attention, next_latent = self.attention.forward_incremental(
+            self.attention_norm(depth), cached_latent, max_history, observe_qk)
+        streams = streams + attention.unsqueeze(-2) * self.attention_stream_scale.view(1, 1, -1, 1)
+        collapsed = streams.mean(dim=-2)
+        moe, diagnostics = self.moe(self.moe_norm(collapsed), None, collect_quantiles)
+        streams = streams + moe.unsqueeze(-2) * self.moe_stream_scale.view(1, 1, -1, 1)
+        streams = self.mixer(streams, streams.mean(dim=-2))
+        return streams, diagnostics, next_latent
+
 
 def pack_upper(matrix: Tensor) -> Tensor:
     indices = torch.triu_indices(matrix.shape[-1], matrix.shape[-1], device=matrix.device)
@@ -449,6 +512,10 @@ class FalsifierMoE(nn.Module):
             history.append(streams.mean(dim=-2))
             routing.append(diagnostics)
         hidden = self.final_norm(self.cell.depth(history, valid))
+        return self._heads(hidden, routing)
+
+    def _heads(self, hidden: Tensor,
+               routing: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         factor = self.gram_factor(hidden).view(*hidden.shape[:-1], 8, self.config.gram_rank)
         diagonal = F.softplus(self.gram_diagonal(hidden))
         gram = factor @ factor.transpose(-1, -2) + torch.diag_embed(diagonal)
@@ -470,6 +537,32 @@ class FalsifierMoE(nn.Module):
             "router_logits": torch.stack([item["router_logits"] for item in routing]),
             "selected_experts": torch.stack([item["selected_experts"] for item in routing]),
         }
+
+    def forward_incremental(self, batch: dict[str, Tensor],
+                            state: FalsifierIncrementalState | None = None, *,
+                            max_history: int = 336, collect_quantiles: bool = False,
+                            observe_qk: bool = False
+                            ) -> tuple[dict[str, Tensor], FalsifierIncrementalState]:
+        """Append one causal layer-group chunk (normally one to four rows)."""
+        if max_history < batch["event_meta"].shape[1]:
+            raise ValueError("max_history cannot be shorter than the appended chunk")
+        if state is None:
+            state = FalsifierIncrementalState.empty(self.config.cell_repeats)
+        if len(state.latents) != self.config.cell_repeats:
+            raise ValueError("incremental state has the wrong controller depth")
+        streams = self.encoder(batch)
+        history = [streams.mean(dim=-2)]
+        routing: list[dict[str, Tensor]] = []
+        next_latents: list[Tensor] = []
+        for repeat in range(self.config.cell_repeats):
+            streams, diagnostics, latent = self.cell.forward_incremental(
+                streams, history, state.latents[repeat], max_history,
+                collect_quantiles, observe_qk)
+            history.append(streams.mean(dim=-2))
+            routing.append(diagnostics)
+            next_latents.append(latent)
+        hidden = self.final_norm(self.cell.depth(history))
+        return self._heads(hidden, routing), FalsifierIncrementalState(next_latents)
 
     def parameter_ledger(self) -> dict[str, int | float]:
         total = sum(parameter.numel() for parameter in self.parameters())

@@ -258,6 +258,24 @@ def main() -> None:
               f"{captured}/{total_flips} | [{minimum:.5g}, {maximum:.5g}] | "
               f"{'high' if sign > 0 else 'low'} |")
 
+    row_exec_k = np.full(len(labels), -1, dtype=np.int32)
+    for event_index, row_index in enumerate(event_rows):
+        if row_index >= 0:
+            value = int(event_meta[event_index, 5])
+            if row_exec_k[row_index] >= 0 and row_exec_k[row_index] != value:
+                raise SystemExit("exec_k differs by layer for one verifier row")
+            row_exec_k[row_index] = value
+    print("\nResidual top-1 mismatch locations:")
+    print("| output record | block | row | exec k | draft p | p drop | entropy delta | margin |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for index in np.flatnonzero(labels):
+        print(f"| {int(row_meta[index, 3])} | {int(row_meta[index, 1])} "
+              f"| {int(row_meta[index, 2])} | {row_exec_k[index]} "
+              f"| {features['draft_top1_p'][index]:.6f} "
+              f"| {features['draft_top1_p_drop'][index]:+.6f} "
+              f"| {features['draft_entropy_delta'][index]:+.6f} "
+              f"| {features['draft_margin'][index]:.6f} |")
+
     print("\nCausal whole-block guard frontier (direction fitted only for this diagnostic):")
     print("| feature | exact blocks | exact rows | flips captured | approximate rows kept |")
     print("|---|---:|---:|---:|---:|")

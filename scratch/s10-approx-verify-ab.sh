@@ -4,6 +4,30 @@
 # processes, exact controls bracketing top-6/top-4 experiments.
 set -euo pipefail
 
+if [[ ${1:-} == --summarize ]]; then
+  DIR=$2
+  reference=$(sed -n '/^greedy IDs/{p;q;}' "$DIR/exact-a.log")
+  read -ra reference_ids <<< "${reference#greedy IDs }"
+  for log in "$DIR"/*.log; do
+    line=$(sed -n '/^greedy IDs/{p;q;}' "$log")
+    read -ra ids <<< "${line#greedy IDs }"
+    first=none
+    limit=${#reference_ids[@]}
+    (( ${#ids[@]} < limit )) && limit=${#ids[@]}
+    for ((index = 0; index < limit; ++index)); do
+      if [[ ${ids[index]} != "${reference_ids[index]}" ]]; then
+        first=$((index + 1))
+        break
+      fi
+    done
+    [[ $first == none && ${#ids[@]} -ne ${#reference_ids[@]} ]] && first=$((limit + 1))
+    digest=$(printf '%s\n' "$line" | sha256sum)
+    printf '%-14s first_divergence=%-4s ids_sha256=%s\n' \
+        "$(basename "$log" .log)" "$first" "${digest%% *}"
+  done
+  exit 0
+fi
+
 PROMPT=${1:-/var/lib/insignia/tracecampaign/prompts/p02.csv}
 GENERATE=${2:-32}
 LABEL=${3:-p02-k4-g32}

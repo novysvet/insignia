@@ -227,9 +227,6 @@ def event_derived(events: np.ndarray, epoch_rank: dict[int, int]) -> tuple[np.nd
 
 
 def validate_events(events: np.ndarray, layers: int) -> tuple[list[int], dict[int, int]]:
-    order = np.lexsort((events["verify_row"], events["layer"], events["epoch"]))
-    if not np.array_equal(order, np.arange(len(events))):
-        raise SystemExit("falsifier events are not ordered by epoch,layer,row")
     keys = [(int(row["epoch"]), int(row["layer"]), int(row["verify_row"]))
             for row in events]
     if len(keys) != len(set(keys)):
@@ -252,7 +249,8 @@ def validate_events(events: np.ndarray, layers: int) -> tuple[list[int], dict[in
 
 def build(args: argparse.Namespace) -> None:
     geometry, raw_events = read_trace(args.trace)
-    events = np.asarray(raw_events)
+    order = np.lexsort((raw_events["verify_row"], raw_events["layer"], raw_events["epoch"]))
+    events = np.asarray(raw_events[order])
     epochs, epoch_rank = validate_events(events, geometry["layers"])
     exact = read_logits(args.exact_logits, args.vocab)
     approximate = read_logits(args.approx_logits, args.vocab)

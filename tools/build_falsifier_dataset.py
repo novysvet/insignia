@@ -10,6 +10,7 @@ training sample.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import struct
@@ -230,7 +231,8 @@ def validate_events(events: np.ndarray, layers: int) -> tuple[list[int], dict[in
     keys = [(int(row["epoch"]), int(row["layer"]), int(row["verify_row"]))
             for row in events]
     if len(keys) != len(set(keys)):
-        raise SystemExit("duplicate falsifier (epoch,layer,row) event")
+        duplicates = [(key, count) for key, count in Counter(keys).items() if count > 1]
+        raise SystemExit(f"duplicate falsifier (epoch,layer,row) event: {duplicates[:8]}")
     epochs = sorted({int(value) for value in events["epoch"]})
     rank = {epoch: index for index, epoch in enumerate(epochs)}
     sparse_layers = sorted({int(value) for value in events["layer"]})

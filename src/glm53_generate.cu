@@ -4394,6 +4394,7 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
     }();
     verify_may_rollback_ = false;
     for (size_t consumed = 0; consumed + 1 < tokens.size(); ) {
+        begin_verify_epoch();
         const int count = int(std::min<size_t>(verify_k, tokens.size() - 1 - consumed));
         if (draft_dump || df_logit_guard_margin_ > 0.0f) {
             (void)df_draft(anchor, position_base + int(consumed) - 1);

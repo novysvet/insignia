@@ -249,10 +249,33 @@ def validate_events(events: np.ndarray, layers: int) -> tuple[list[int], dict[in
     return epochs, rank
 
 
+def repair_legacy_zero_epochs(raw_events: np.ndarray) -> np.ndarray:
+    """Recover forced-quality blocks written before force_logits advanced epochs."""
+    keys = [(int(row["epoch"]), int(row["layer"]), int(row["verify_row"]))
+            for row in raw_events]
+    if len(keys) == len(set(keys)):
+        return np.asarray(raw_events)
+    if len({key[0] for key in keys}) != 1:
+        return np.asarray(raw_events)
+    repaired = np.array(raw_events, copy=True)
+    block = 0
+    previous_layer = int(repaired[0]["layer"])
+    base_epoch = int(repaired[0]["epoch"])
+    for event in repaired:
+        layer = int(event["layer"])
+        if layer < previous_layer:
+            block += 1
+        event["epoch"] = base_epoch + block
+        previous_layer = layer
+    return repaired
+
+
 def build(args: argparse.Namespace) -> None:
     geometry, raw_events = read_trace(args.trace)
-    order = np.lexsort((raw_events["verify_row"], raw_events["layer"], raw_events["epoch"]))
-    events = np.asarray(raw_events[order])
+    repaired_events = repair_legacy_zero_epochs(raw_events)
+    order = np.lexsort((repaired_events["verify_row"], repaired_events["layer"],
+                        repaired_events["epoch"]))
+    events = np.asarray(repaired_events[order])
     epochs, epoch_rank = validate_events(events, geometry["layers"])
     exact = read_logits(args.exact_logits, args.vocab)
     approximate = read_logits(args.approx_logits, args.vocab)

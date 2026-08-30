@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from build_falsifier_dataset import EVENT_DTYPE, TRACE_HEADER, build
+from build_falsifier_dataset import EVENT_DTYPE, TRACE_HEADER, build, repair_legacy_zero_epochs
 
 
 def main() -> None:
@@ -57,6 +57,10 @@ def main() -> None:
         with trace.open("wb") as handle:
             handle.write(header)
             events.tofile(handle)
+        legacy = events.copy()
+        legacy["epoch"] = 0
+        repaired = repair_legacy_zero_epochs(legacy)
+        assert list(np.unique(repaired["epoch"])) == [0, 1]
 
         generator = np.random.default_rng(123)
         exact = generator.normal(size=(5, 32)).astype("<f4")

@@ -33,6 +33,12 @@ constexpr int kLatent = 64;
 constexpr int kMaxHistory = 336;
 constexpr int kScratchWidth = 768;
 
+#if defined(INSIGNIA_FALSIFIER_PROFILE)
+#define INSIGNIA_PROFILE_NOINLINE __attribute__((noinline))
+#else
+#define INSIGNIA_PROFILE_NOINLINE
+#endif
+
 struct Matrix {
     int rows;
     int logical_cols;
@@ -301,8 +307,8 @@ static void collapse_streams(const Scratch &scratch, float *output) {
                             + scratch.streams[2][d] + scratch.streams[3][d]);
 }
 
-static void mix_streams(const Weights &weights, Scratch &scratch,
-                        const float *context) {
+INSIGNIA_PROFILE_NOINLINE static void mix_streams(
+    const Weights &weights, Scratch &scratch, const float *context) {
     linear(weights.mhc_dynamic, context, scratch.mix_logits.data(), scratch);
     for (int row = 0; row < 4; ++row)
         for (int column = 0; column < 4; ++column) {
@@ -337,8 +343,8 @@ static void mix_streams(const Weights &weights, Scratch &scratch,
     scratch.streams = scratch.mixed;
 }
 
-static void depth_attention(const Weights &weights, Scratch &scratch,
-                            int source_count, float *output) {
+INSIGNIA_PROFILE_NOINLINE static void depth_attention(
+    const Weights &weights, Scratch &scratch, int source_count, float *output) {
     const float *current = scratch.block_history[source_count - 1].data();
     linear(weights.depth_q, current, scratch.temp0.data(), scratch);
     for (int source = 0; source < source_count; ++source) {
@@ -375,8 +381,9 @@ static void depth_attention(const Weights &weights, Scratch &scratch,
     linear(weights.depth_out, scratch.temp1.data(), output, scratch);
 }
 
-static void causal_mla(const Weights &weights, Scratch &scratch, int repeat,
-                       int history_count, const float *input, float *output) {
+INSIGNIA_PROFILE_NOINLINE static void causal_mla(
+    const Weights &weights, Scratch &scratch, int repeat, int history_count,
+    const float *input, float *output) {
     std::copy_n(input, kWidth, scratch.temp4.data());
     rms_norm(scratch.temp4.data(), kWidth);
     const float input_scale = quantize_vector(
@@ -447,8 +454,8 @@ static void causal_mla(const Weights &weights, Scratch &scratch, int repeat,
     linear(weights.mla_out, scratch.temp3.data(), output, scratch);
 }
 
-static void stable_moe(const Weights &weights, Scratch &scratch,
-                       const float *input, float *output) {
+INSIGNIA_PROFILE_NOINLINE static void stable_moe(
+    const Weights &weights, Scratch &scratch, const float *input, float *output) {
     std::copy_n(input, kWidth, scratch.temp4.data());
     rms_norm(scratch.temp4.data(), kWidth);
     const float input_scale = quantize_vector(
@@ -513,7 +520,8 @@ static void stable_moe(const Weights &weights, Scratch &scratch,
         output[d] = scratch.temp0[d] + scratch.temp1[d];
 }
 
-static void encode(const Weights &weights, Scratch &scratch, int layer, int row) {
+INSIGNIA_PROFILE_NOINLINE static void encode(
+    const Weights &weights, Scratch &scratch, int layer, int row) {
     linear(weights.logit, scratch.input.data(), scratch.streams[0].data(), scratch);
     rms_norm(scratch.streams[0].data(), kWidth);
 
@@ -542,8 +550,9 @@ static void encode(const Weights &weights, Scratch &scratch, int layer, int row)
     rms_norm(scratch.streams[3].data(), kWidth);
 }
 
-static uint64_t run_event(const Weights &weights, Scratch &scratch,
-                          int layer, int row, int verify_rows) {
+INSIGNIA_PROFILE_NOINLINE static uint64_t run_event(
+    const Weights &weights, Scratch &scratch, int layer, int row,
+    int verify_rows) {
     encode(weights, scratch, layer, row);
     collapse_streams(scratch, scratch.block_history[0].data());
     const int history_count = std::min(kMaxHistory, layer * verify_rows + row + 1);

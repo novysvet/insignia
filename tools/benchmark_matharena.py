@@ -395,6 +395,8 @@ def main() -> None:
     parser.add_argument("--row", type=int, action="append", default=[],
                         help="MathArena problem_idx (repeatable)")
     parser.add_argument("--policy", action="append", choices=sorted(POLICIES), default=[])
+    parser.add_argument("--candidate-only", action="store_true",
+                        help="run requested free-generation arms without inserting exact; requires quality=0")
     parser.add_argument("--generate", type=int, default=320)
     parser.add_argument("--quality-tokens", type=int, default=64,
                         help="same-token full-vocab comparison length; 0 disables")
@@ -419,6 +421,8 @@ def main() -> None:
         parser.error("--quality-tokens cannot be negative")
     if args.max_ppl_delta < 0:
         parser.error("--max-ppl-delta cannot be negative")
+    if args.candidate_only and (not args.policy or args.quality_tokens):
+        parser.error("--candidate-only requires an explicit --policy and --quality-tokens 0")
 
     tokenizer = Tokenizer.from_file(str(args.model / "tokenizer.json"))
     rows = load_rows(args.dataset)
@@ -446,7 +450,7 @@ def main() -> None:
     if missing:
         parser.error(f"unknown MathArena problem_idx values: {missing}")
     policies = args.policy or ["exact", "top6", "top6-cache"]
-    if "exact" not in policies:
+    if not args.candidate_only and "exact" not in policies:
         policies.insert(0, "exact")
     if len(set(policies)) != len(policies):
         parser.error("duplicate --policy")
@@ -522,6 +526,7 @@ def main() -> None:
         "official_matharena_score": False,
         "reason": "No iterative Lean verifier/search tools were exposed.",
         "policies": policies,
+        "candidate_only": args.candidate_only,
         "generate": args.generate,
         "quality_tokens": args.quality_tokens,
         "max_ppl_delta": args.max_ppl_delta,

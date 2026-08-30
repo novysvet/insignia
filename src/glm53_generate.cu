@@ -2611,6 +2611,14 @@ public:
         if (df_approx_mass_ > 0.0f)
             std::printf("DFlash2 adaptive verify: mass %.3f, k=%d..%d, retained weights unchanged\n",
                         df_approx_mass_, df_approx_min_k_, df_approx_max_k_);
+        if (const char *margin = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN")) {
+            df_logit_guard_margin_ = std::strtof(margin, nullptr);
+            require(df_logit_guard_margin_ > 0.0f,
+                    "INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN must be positive");
+            require(dflash2_on_, "DFlash logit guard requires DFlash2");
+            std::printf("DFlash2 logit guard: exact row when draft margin < %.3f\n",
+                        df_logit_guard_margin_);
+        }
         if (const char *path = std::getenv("INSIGNIA_GLM53_DF_MOE_METRICS"))
             moe_metrics_path_ = path;
         forced_sequential_verify_ =
@@ -3106,6 +3114,9 @@ private:
     int df_approx_topm_ = 0;
     float df_approx_mass_ = 0.0f;
     int df_approx_min_k_ = 3, df_approx_max_k_ = 8;
+    float df_logit_guard_margin_ = 0.0f;
+    std::array<uint8_t, kMaxVerify> df_logit_guard_exact_{};
+    uint64_t df_logit_guard_rows_ = 0, df_logit_guarded_rows_ = 0;
     bool df_approx_renorm_ = false;
     uint64_t df_approx_rows_ = 0, df_approx_slots_ = 0;
     uint64_t df_approx_union_ = 0, df_approx_exact_union_ = 0;
@@ -4082,6 +4093,33 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
                          sizeof(float),
                      cudaMemcpyDeviceToHost),
           "download DFlash2 hp");
+    df_logit_guard_exact_.fill(0);
+    if (df_logit_guard_margin_ > 0.0f) {
+        const int vocab = int(model_.vocab_size());
+        for (int verify_row = 0; verify_row < kMaxVerify; ++verify_row) {
+            // Target output after candidate r predicts candidate r+1. DFlash
+            // row r+1 is the same-position risk signal. The final draft row
+            // has no look-ahead row, so keep it exact.
+            if (verify_row + 1 >= insignia::glm53::DFlash2Drafter::kDrafts) {
+                df_logit_guard_exact_[size_t(verify_row)] = 1;
+                continue;
+            }
+            const float *row = df_logits_host_ + size_t(verify_row + 1) * vocab;
+            float first = -std::numeric_limits<float>::infinity();
+            float second = first;
+            for (int token = 0; token < vocab; ++token) {
+                const float value = row[token];
+                if (value > first) {
+                    second = first;
+                    first = value;
+                } else if (value > second) {
+                    second = value;
+                }
+            }
+            df_logit_guard_exact_[size_t(verify_row)] =
+                uint8_t(first - second < df_logit_guard_margin_);
+        }
+    }
     static const bool df_debug = std::getenv("INSIGNIA_GLM53_DF_DEBUG") != nullptr;
     if (df_debug) {
         const int vocab = int(model_.vocab_size());
@@ -4266,13 +4304,15 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
     verify_may_rollback_ = false;
     for (size_t consumed = 0; consumed + 1 < tokens.size(); ) {
         const int count = int(std::min<size_t>(verify_k, tokens.size() - 1 - consumed));
-        if (draft_dump) {
+        if (draft_dump || df_logit_guard_margin_ > 0.0f) {
             (void)df_draft(anchor, position_base + int(consumed) - 1);
-            const size_t draft_values =
-                size_t(insignia::glm53::DFlash2Drafter::kDrafts) * vocab;
-            require(std::fwrite(df_logits_host_, sizeof(float), draft_values, draft_dump) ==
-                        draft_values,
-                    "write target-forced DFlash logits");
+            if (draft_dump) {
+                const size_t draft_values =
+                    size_t(insignia::glm53::DFlash2Drafter::kDrafts) * vocab;
+                require(std::fwrite(df_logits_host_, sizeof(float), draft_values, draft_dump) ==
+                            draft_values,
+                        "write target-forced DFlash logits");
+            }
         }
         std::vector<int> chunk(tokens.begin() + consumed, tokens.begin() + consumed + count);
         capture_offset_ = 0;
@@ -4633,7 +4673,13 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         for (int slot = 0; slot < topk; ++slot) denominator += scores[order[slot]];
         for (int slot = 0; slot < topk; ++slot)
             selection[token].emplace_back(order[slot], 2.5f * scores[order[slot]] / denominator);
-        if (kda_archive_ && df_approx_topm_)
+        const int verify_row = capture_offset_ + token;
+        const bool logit_guarded = kda_archive_ && df_logit_guard_margin_ > 0.0f &&
+            verify_row >= 0 && verify_row < kMaxVerify &&
+            df_logit_guard_exact_[size_t(verify_row)];
+        if (logit_guarded)
+            exec_count[size_t(token)] = topk;
+        else if (kda_archive_ && df_approx_topm_)
             exec_count[size_t(token)] = df_approx_topm_;
         else if (kda_archive_ && df_approx_mass_ > 0.0f) {
             float original_sum = 0.0f;
@@ -4689,6 +4735,14 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_approx_slots_ += uint64_t(count);
             ++df_approx_k_hist_[size_t(count)];
         }
+        if (layer == 3 && df_logit_guard_margin_ > 0.0f)
+            for (int token = 0; token < tokens; ++token) {
+                ++df_logit_guard_rows_;
+                const int verify_row = capture_offset_ + token;
+                if (verify_row >= 0 && verify_row < kMaxVerify &&
+                    df_logit_guard_exact_[size_t(verify_row)])
+                    ++df_logit_guarded_rows_;
+            }
     }
     if (early_multi_route_on_) {
         const auto &predicted_rows = early_multi_rows_[size_t(layer)];
@@ -5541,6 +5595,11 @@ std::vector<std::pair<int, float>> Runner::step(
             if (df_approx_k_hist_[size_t(k)])
                 std::printf(" k%d=%llu", k, (unsigned long long)df_approx_k_hist_[size_t(k)]);
         std::fputc('\n', stdout);
+        if (df_logit_guard_rows_)
+            std::printf("  DFlash logit guard exactified %llu/%llu verify rows (%.1f%%)\n",
+                        (unsigned long long)df_logit_guarded_rows_,
+                        (unsigned long long)df_logit_guard_rows_,
+                        100.0 * df_logit_guarded_rows_ / df_logit_guard_rows_);
     }
     if (q8_stager_)
         std::printf("  %s matrix cache %.3f GiB / %.3f s (%.2f GB/s)\n",

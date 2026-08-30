@@ -71,13 +71,23 @@ nll delta (B-A) total +2.0  ppl A 1.1587 -> B 1.1893
 
     def test_prefill_scheduler_is_an_explicit_ab(self):
         common = dict(q8_budget_mb=10240, cache_mb=32768, readers=4,
-                      dflash_fp8="/tmp/df", verify_k=4)
+                      dflash_fp8="/tmp/df", verify_k=4,
+                      prefill_approx_moe=False)
         chunked = benchmark.base_environment(
             SimpleNamespace(**common, prefill_full_layer_major=False), "exact")
         layer_major = benchmark.base_environment(
             SimpleNamespace(**common, prefill_full_layer_major=True), "exact")
         self.assertEqual(chunked["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"], "0")
         self.assertEqual(layer_major["INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR"], "1")
+
+    def test_prefill_approximation_never_touches_exact_policy(self):
+        common = dict(q8_budget_mb=10240, cache_mb=32768, readers=4,
+                      dflash_fp8="/tmp/df", verify_k=4,
+                      prefill_full_layer_major=True, prefill_approx_moe=True)
+        exact = benchmark.base_environment(SimpleNamespace(**common), "exact")
+        candidate = benchmark.base_environment(SimpleNamespace(**common), "top6-cache")
+        self.assertEqual(exact["INSIGNIA_GLM53_PREFILL_APPROX_MOE"], "0")
+        self.assertEqual(candidate["INSIGNIA_GLM53_PREFILL_APPROX_MOE"], "1")
 
 
 if __name__ == "__main__":

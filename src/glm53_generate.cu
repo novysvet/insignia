@@ -2806,6 +2806,16 @@ public:
                 std::printf("DFlash2 cache guard fallback: retain %d\n",
                             df_cache_guard_retain_);
         }
+        if (const char *prefill_approx =
+                std::getenv("INSIGNIA_GLM53_PREFILL_APPROX_MOE")) {
+            prefill_approx_moe_ = std::atoi(prefill_approx) != 0;
+            require(!prefill_approx_moe_ || df_approx_topm_ || df_approx_mass_ > 0.0f,
+                    "approximate prefill needs DF_APPROX_TOPM or DF_APPROX_MASS");
+            if (prefill_approx_moe_)
+                std::printf("prefill approximate MoE: reuse DFlash %s policy%s\n",
+                            df_approx_topm_ ? "fixed-k" : "adaptive-mass",
+                            df_cache_route_k_ ? " + cache-aware tail" : "");
+        }
         if (const char *margin = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN")) {
             df_logit_guard_margin_ = std::strtof(margin, nullptr);
             require(df_logit_guard_margin_ > 0.0f,
@@ -3435,6 +3445,7 @@ private:
     std::vector<float> seam_host_;
     bool prefetch_on_ = true, deep_checks_ = false, trace_layers_ = false;
     bool full_layer_major_active_ = false;
+    bool prefill_approx_moe_ = false;
     bool early_route_on_ = false, early_route_prefetch_ = false;
     int early_route_prefetch_n_ = 8;
     uint64_t early_route_hits_ = 0, early_route_total_ = 0;
@@ -5381,10 +5392,14 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     const std::string stem = layer_stem(layer) + "mlp.";
     const int experts = moe_experts_;
     const int topk = moe_topk_;
-    // Approximation is restricted to provisional DFlash verify rows. Prompt
-    // prefill and scalar decode retain all eight routed experts, and the
-    // unset path keeps the existing arithmetic and traffic exactly intact.
-    const bool approximate_verify = kda_archive_ &&
+    // Approximation normally remains restricted to provisional DFlash verify
+    // rows. An explicit full-layer-major prefill experiment may reuse the same
+    // policy; scalar decode and the unset prefill path retain all eight routed
+    // experts and keep the existing arithmetic and traffic exactly intact.
+    const bool approximate_prefill =
+        full_layer_major_active_ && prefill_approx_moe_;
+    const bool approximate_pass = kda_archive_ || approximate_prefill;
+    const bool approximate_moe = approximate_pass &&
         (df_approx_topm_ || df_approx_mass_ > 0.0f || df_cache_route_k_);
     std::vector<int> exec_count(size_t(tokens), topk);
     linear_multi(stem + "gate.weight", input, c_router_, tokens, experts, hidden_);
@@ -5398,7 +5413,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     // widen and emit the fixed records once the KDA replay archive is active.
     const bool trace_falsifier = falsifier_trace_ != nullptr && kda_archive_ &&
         !df_retry_replay_;
-    const bool widen_router = trace_falsifier || (kda_archive_ && df_cache_route_k_);
+    const bool widen_router = trace_falsifier ||
+        (approximate_pass && df_cache_route_k_);
     const size_t widened_rows = widen_router ? size_t(tokens) : 0;
     std::vector<std::array<uint16_t, 32>> candidate_experts(widened_rows);
     std::vector<std::array<float, 32>> candidate_logits(widened_rows);
@@ -5407,7 +5423,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     std::vector<std::array<uint32_t, 4>> candidate_residency(widened_rows);
     std::vector<float> baseline_denominator(widened_rows);
     std::vector<std::array<int, 8>> baseline_experts(
-        kda_archive_ && df_cache_route_k_ ? size_t(tokens) : 0);
+        approximate_pass && df_cache_route_k_ ? size_t(tokens) : 0);
     for (int token = 0; token < tokens; ++token) {
         const float *row = logits.data() + size_t(token) * experts;
         std::vector<float> scores(experts), choice(experts);
@@ -5473,7 +5489,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_logit_guard_exact_[size_t(verify_row)];
         const int cache_route_retain = logit_guarded
             ? df_cache_guard_retain_ : df_cache_route_retain_;
-        if (kda_archive_ && df_cache_route_k_ && !df_approx_topm_ &&
+        if (approximate_pass && df_cache_route_k_ && !df_approx_topm_ &&
             df_cache_route_regret_ > 0.0f &&
             cache_route_retain < 8 && !df_cache_joint_options_) {
             const auto &candidates = candidate_experts[size_t(token)];
@@ -5578,9 +5594,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 ? int(df_logit_guard_k_[size_t(verify_row)]) : topk;
             exec_count[size_t(token)] = guarded_k;
         }
-        else if (kda_archive_ && df_approx_topm_)
+        else if (approximate_pass && df_approx_topm_)
             exec_count[size_t(token)] = df_approx_topm_;
-        else if (kda_archive_ && df_approx_mass_ > 0.0f) {
+        else if (approximate_pass && df_approx_mass_ > 0.0f) {
             float original_sum = 0.0f;
             for (int slot = 0; slot < topk; ++slot)
                 original_sum += selection[token][size_t(slot)].second;
@@ -5614,7 +5630,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     // Raptor Lake scalar work to avoid NVMe reads and PCIe uploads.  We retain
     // the original Top-8 denominator, so this is fixed-Top-M zero-fill with a
     // bounded tail substitution rather than a hidden renormalization.
-    if (kda_archive_ && df_approx_topm_ && df_cache_route_k_ &&
+    if (approximate_pass && df_approx_topm_ && df_cache_route_k_ &&
         df_cache_route_regret_ > 0.0f) {
         struct PrunedCacheChoice {
             int expert = -1;
@@ -5651,7 +5667,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 }
             }
             const int verify_row = capture_offset_ + token;
-            guarded[size_t(token)] = df_logit_guard_on() && verify_row >= 0 &&
+            guarded[size_t(token)] = kda_archive_ && df_logit_guard_on() &&
+                verify_row >= 0 &&
                 verify_row < kMaxVerify &&
                 df_logit_guard_exact_[size_t(verify_row)];
             if (guarded[size_t(token)])
@@ -5863,7 +5880,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_cache_route_h2d_saved_ += baseline_action->h2d - action.h2d;
         }
     }
-    if (kda_archive_ && !df_approx_topm_ && df_cache_joint_options_ &&
+    if (approximate_pass && !df_approx_topm_ && df_cache_joint_options_ &&
         df_cache_route_regret_ > 0.0f) {
         struct CacheChoice {
             std::array<int, 8> experts{};
@@ -5904,7 +5921,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 score_scale += std::fabs(value);
             }
             const int verify_row = capture_offset_ + token;
-            const bool guarded = df_logit_guard_on() && verify_row >= 0 &&
+            const bool guarded = kda_archive_ && df_logit_guard_on() &&
+                verify_row >= 0 &&
                 verify_row < kMaxVerify && df_logit_guard_exact_[size_t(verify_row)];
             const int cache_route_retain = guarded
                 ? df_cache_guard_retain_ : df_cache_route_retain_;
@@ -6061,7 +6079,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         }
         for (int token = 0; token < tokens; ++token) {
             const int verify_row = capture_offset_ + token;
-            const bool guarded = df_logit_guard_on() && verify_row >= 0 &&
+            const bool guarded = kda_archive_ && df_logit_guard_on() &&
+                verify_row >= 0 &&
                 verify_row < kMaxVerify && df_logit_guard_exact_[size_t(verify_row)];
             const CacheChoice &action =
                 options[size_t(token)][size_t(chosen[size_t(token)])];
@@ -6110,7 +6129,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                 distinct.push_back(expert);
         }
     }
-    if (approximate_verify) {
+    if (approximate_moe) {
         std::vector<uint8_t> exact_seen(size_t(experts), 0);
         uint64_t exact_union = 0;
         for (int token = 0; token < tokens; ++token)

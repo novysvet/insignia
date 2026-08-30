@@ -409,3 +409,26 @@ regression. DFlash saves only 104,194,871 logical bytes (about seven slots) and
 is closed. The final analyzer decisions were
 `eligible_for_allocator_only_probe` for dense and
 `stop_or_revisit_fixed_block_formats` for DFlash.
+
+## User decision override (2026-08-30)
+
+The user accepts the measured 0.906244 dense and 0.907438 DFlash total ratios;
+missing the original 0.90 gate by roughly 0.6--0.7 percentage points is not a
+reason to abandon this compute-for-bandwidth path. The codec is now **PARKED
+FOR IMPLEMENTATION**, not rejected.
+
+Deferred order:
+
+1. implement the exact 1024-byte slab decoder and standalone fused-MMA
+   benchmark for dense matrices;
+2. integrate versioned cold/resident allocation and measure whether the modeled
+   780.7 MiB becomes usable expert-cache space;
+3. implement the DFlash variant after the dense path is understood;
+4. preserve decoded bytes and accumulation order exactly, and report output
+   parity, registers, spills, occupancy, compressed bytes loaded, and total
+   kernel/engine time.
+
+The old 1.08x speed and 0.90 ratio thresholds become comparison baselines, not
+implementation prerequisites. A slowdown is not to be hidden: keep the codec
+available for residency-sensitive configurations and establish its actual
+break-even point against extra expert-cache hits.

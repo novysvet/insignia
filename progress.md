@@ -59,10 +59,28 @@ fragments. This point remains experimental despite the numeric pass.
 
 Late handoff triage is recorded in `audits/s10-late-handoff-triage.md`. The DSA
 archive had only `SKIP_NO_NVCC`/`SKIP_NOT_BUILT` logs and no patch. The exact
-FP8 codec handoff passed all 25 Linux checks, but real held-out total ratios were
-0.906244 dense and 0.907438 DFlash, missing the <=0.90 gate. No fused decoder is
-warranted. Dense has a modeled allocator-only ceiling of ~780.7 MiB/~57 expert
-slots; DFlash is closed.
+FP8 codec handoff passed all 25 Linux checks. Real held-out total ratios were
+0.906244 dense and 0.907438 DFlash, narrowly missing the original <=0.90 gate.
+The user explicitly accepts this result: the exact fused codec is now deferred
+implementation work rather than rejected, dense first and DFlash second. Dense
+has a modeled ~780.7 MiB/~57-slot ceiling. The implementation must still report
+decoded-byte parity, SASS/register/spill evidence, allocator reclaim, and
+matched kernel/engine time; the old ratio/speed gates are comparison baselines,
+not blockers.
+
+Temporary box planning constraint (Europe/Rome): expected glm-box access is
+weekdays 15:00--07:00 and all day on weekends, but current access may still be
+absent. CPU-only mathematics, trace analysis, codec design, and local tooling
+should fill unavailable windows; do not repeatedly probe an unavailable host.
+
+`tasks/math-frontier-20260830/README.md` is a self-contained, generic-PC packet
+of 13 theorem/counterexample/algorithm problems derived from the current engine:
+adaptive expert count, cache-route hypergraphs, contextual Belady bounds, codec
+break-even, hybrid precision placement, routing discontinuities, speculative
+renewal control, falsifier sufficiency, logit-sketch limits, MLA stability,
+heterogeneous scheduling, prefetch information value, and hierarchy
+separability. No model files, CUDA device, private trace, or glm-box access is
+required.
 
 ### 2026-08-30 (session 10) - MathArena ArXivLean frontier; cache-aware Top-6 survives
 

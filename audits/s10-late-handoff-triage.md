@@ -15,8 +15,15 @@ internal manifest entry was hash-checked before any patch was considered.
 - Existing sample-collector checks: 8/8.
 - Production action: the clean patch adding the exact codec/analyzer/reference
   runner was applied in commit `a6880ad`.
-- Real-data verdict: no fused codec; see
+- Original real-data verdict: the 0.906244 dense / 0.907438 DFlash total ratios
+  missed the predeclared 0.90 fused-decoder gate; see
   `audits/s10-fp8-residency-codec-design.md`.
+- **User override (2026-08-30): accepted for deferred implementation.** The
+  miss is small enough for this project's compute-for-bandwidth policy. Build
+  the exact fused decoder later, dense first; retain the DFlash path as a
+  second-stage target. The ratio gate no longer blocks implementation, but
+  decoded-byte parity, register/spill evidence, and measured kernel/runtime
+  effects must still be reported rather than assumed.
 
 ## DSA task 3
 
@@ -44,4 +51,3 @@ internal manifest entry was hash-checked before any patch was considered.
   perfect selector; width three or larger needs lattice evidence.
 - Production action: none until the missing artifact is supplied against the
   current trace schema.
-

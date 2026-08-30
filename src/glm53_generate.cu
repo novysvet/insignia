@@ -532,7 +532,7 @@ struct PackedExpertRecordHeader {
     uint32_t escapes[3];
     float globals[3];
     uint8_t codebooks[3][16];
-    uint8_t reserved[52];
+    uint8_t reserved[48];
 };
 static_assert(sizeof(PackedExpertRecordHeader) == 128);
 
@@ -573,7 +573,7 @@ struct alignas(64) DfFalsifierEventV2 {
     // exact norm2/hidden, cancellation ratio, exact replay max error,
     // normalized-input norm2/hidden.
     std::array<float, 4> tail;
-    uint8_t reserved[48];
+    uint8_t reserved[52];
 };
 static_assert(sizeof(DfFalsifierEventV2) == 896);
 

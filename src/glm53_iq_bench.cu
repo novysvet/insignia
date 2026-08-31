@@ -606,6 +606,57 @@ int main(int argc, char **argv) {
                         resident_down_us,
                         hidden_quant_us + pair_us + swiglu_quant_us + resident_down_us,
                         pipeline_us);
+
+            if (count == 1) {
+                launch_pipeline();
+                check(cudaDeviceSynchronize(),
+                      "resident expert baseline synchronize");
+                std::vector<float> resident_baseline(
+                    size_t(kTokens) * down.rows);
+                check(cudaMemcpy(resident_baseline.data(), down.output_device,
+                                 resident_baseline.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost),
+                      "copy resident expert baseline");
+
+                const auto launch_optimized_pipeline = [&] {
+                    check(insignia::glm53::iq_quantize_activation_rows(
+                              gate.x_device, gate.cols, row_ids, 1,
+                              gate.workspace),
+                          "timed optimized resident hidden quantize");
+                    check(insignia::glm53::iq3_xxs_gemv2_wim32_rows(
+                              gate_wim32_device, up_wim32_device,
+                              gate.workspace, 1, gate.output_device,
+                              up_output_device, out_ids, gate.rows, gate.cols),
+                          "timed optimized resident WIM32 pair");
+                    check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                              down.weights_device, gate.output_device,
+                              up_output_device, out_ids[0], down.output_device,
+                              out_ids[0], down.rows, down.cols, 32),
+                          "timed optimized resident fused down");
+                };
+                launch_optimized_pipeline();
+                check(cudaDeviceSynchronize(),
+                      "optimized resident expert synchronize");
+                std::vector<float> resident_optimized(
+                    size_t(kTokens) * down.rows);
+                check(cudaMemcpy(resident_optimized.data(), down.output_device,
+                                 resident_optimized.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost),
+                      "copy optimized resident expert");
+                const Metrics resident_metrics = compare(
+                    gather(resident_optimized, out_ids, 1, down.rows),
+                    gather(resident_baseline, out_ids, 1, down.rows));
+                print_metrics("IQ3/IQ4 optimized resident x1",
+                              resident_metrics);
+                failed |= resident_metrics.maximum != 0.0;
+
+                const float optimized_pipeline_us =
+                    benchmark_us(launch_optimized_pipeline);
+                std::printf("IQ3/IQ4 resident expert x1 old/optimized "
+                            "%8.3f/%8.3f us %.3fx\n",
+                            pipeline_us, optimized_pipeline_us,
+                            pipeline_us / optimized_pipeline_us);
+            }
         }
 
         check(insignia::glm53::iq_quantize_activation_rows(

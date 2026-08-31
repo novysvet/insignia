@@ -16,6 +16,7 @@ namespace {
 constexpr int kRows = 4096;
 constexpr int kCols = 2048;
 constexpr int kTokens = insignia::glm53::kIQMaxRows;
+constexpr int kPrefillTokens = 32;
 constexpr size_t kExpertBytes =
     size_t(kRows) * (kCols / insignia::glm53::kIQBlockWeights) *
     insignia::glm53::kQ6KBlockBytes;
@@ -61,16 +62,17 @@ T *device_alloc(size_t count) {
 }
 
 std::vector<float> cpu_reference(const std::vector<uint8_t> &weights,
-                                 const std::vector<float> &x) {
+                                 const std::vector<float> &x,
+                                 int tokens) {
     constexpr size_t row_bytes =
         size_t(kCols / insignia::glm53::kIQBlockWeights) *
         insignia::glm53::kQ6KBlockBytes;
-    std::vector<float> result(size_t(kTokens) * kRows);
+    std::vector<float> result(size_t(tokens) * kRows);
     std::vector<float> row(kCols);
     for (int output = 0; output < kRows; ++output) {
         insignia::glm53::q6_k_dequantize_row_cpu(
             weights.data() + size_t(output) * row_bytes, row.data(), kCols);
-        for (int token = 0; token < kTokens; ++token) {
+        for (int token = 0; token < tokens; ++token) {
             double sum = 0.0;
             for (int col = 0; col < kCols; ++col)
                 sum += double(row[col]) * x[size_t(token) * kCols + col];
@@ -137,16 +139,29 @@ int main(int argc, char **argv) {
         if (index % 521 == 0) value *= 9.0f;
         activations[index] = value;
     }
-    const std::vector<float> reference = cpu_reference(weights, activations);
+    const std::vector<float> reference =
+        cpu_reference(weights, activations, kTokens);
+    std::vector<float> prefill(size_t(kPrefillTokens) * kCols);
+    for (size_t index = 0; index < prefill.size(); ++index) {
+        float value = normal(rng);
+        if (index % 521 == 0) value *= 9.0f;
+        prefill[index] = value;
+    }
+    const std::vector<float> prefill_reference =
+        cpu_reference(weights, prefill, kPrefillTokens);
     auto *weights_device = device_copy(weights);
     auto *x_device = device_copy(activations);
     auto *y_device = device_alloc<float>(size_t(kTokens) * kRows);
+    auto *prefill_device = device_copy(prefill);
+    auto *prefill_output_device =
+        device_alloc<float>(size_t(kPrefillTokens) * kRows);
     void *workspace = nullptr;
     check(cudaMalloc(&workspace,
                      insignia::glm53::iq_workspace_rows_bytes(kCols, kTokens)),
           "cudaMalloc Q6 workspace");
     const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
     const int out_ids[kTokens] = {3, 7, 1, 6, 0, 5, 2, 4};
+    const int linear_ids[kTokens] = {0, 1, 2, 3, 4, 5, 6, 7};
     bool failed = false;
     for (int count = 1; count <= kTokens; ++count) {
         check(insignia::glm53::iq_quantize_activation_rows(
@@ -173,6 +188,20 @@ int main(int argc, char **argv) {
                     metrics.cosine, metrics.maximum);
         failed |= metrics.relative > 2.0e-2 || metrics.cosine < 0.99980;
     }
+    check(insignia::glm53::q6_k_gemm_prefill32(
+              weights_device, prefill_device, kPrefillTokens,
+              prefill_output_device, kRows, kCols), "Q6_K WMMA32");
+    check(cudaDeviceSynchronize(), "Q6 WMMA32 sync");
+    std::vector<float> prefill_output(size_t(kPrefillTokens) * kRows);
+    check(cudaMemcpy(prefill_output.data(), prefill_output_device,
+                     prefill_output.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "copy Q6 WMMA32 output");
+    const Metrics prefill_metrics = compare(prefill_output, prefill_reference);
+    std::printf("Q6_K WMMA prefill32 mse %.7g rel %.7g cos %.10f max %.7g\n",
+                prefill_metrics.mse, prefill_metrics.relative,
+                prefill_metrics.cosine, prefill_metrics.maximum);
+    failed |= prefill_metrics.relative > 2.0e-2 ||
+              prefill_metrics.cosine < 0.99980;
     if (run_benchmark) {
         check(insignia::glm53::iq_quantize_activation_rows(
                   x_device, kCols, row_ids, kTokens, workspace),
@@ -187,13 +216,38 @@ int main(int argc, char **argv) {
             std::printf("Q6_K down x%d %8.3f us %7.1f GB/s\n", count,
                         microseconds, double(kExpertBytes) / (microseconds * 1000.0));
         }
+        const auto launch_q8_pipeline32 = [&] {
+            for (int batch = 0; batch < 4; ++batch) {
+                check(insignia::glm53::iq_quantize_activation_rows(
+                          prefill_device + size_t(batch * kTokens) * kCols,
+                          kCols, linear_ids, kTokens, workspace),
+                      "timed Q6 prefill quantize");
+                check(insignia::glm53::q6_k_gemv_rows(
+                          weights_device, workspace, kTokens,
+                          prefill_output_device + size_t(batch * kTokens) * kRows,
+                          linear_ids, kRows, kCols),
+                      "timed Q6 prefill Q8");
+            }
+        };
+        const auto launch_wmma32 = [&] {
+            check(insignia::glm53::q6_k_gemm_prefill32(
+                      weights_device, prefill_device, kPrefillTokens,
+                      prefill_output_device, kRows, kCols),
+                  "timed Q6 WMMA32");
+        };
+        const float q8_pipeline32_us = benchmark_us(launch_q8_pipeline32);
+        const float wmma32_us = benchmark_us(launch_wmma32);
+        std::printf("Q6_K prefill32 Q8pipe/WMMA %8.3f/%8.3f us %.3fx\n",
+                    q8_pipeline32_us, wmma32_us,
+                    q8_pipeline32_us / wmma32_us);
     } else {
         std::puts("timing skipped; pass --bench only on an uncontended glm-box run");
     }
     cudaFree(weights_device);
     cudaFree(x_device);
     cudaFree(y_device);
+    cudaFree(prefill_device);
+    cudaFree(prefill_output_device);
     cudaFree(workspace);
     return failed ? 3 : 0;
 }
-

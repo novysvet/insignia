@@ -626,6 +626,72 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
         accumulator, rows, wmma::mem_col_major);
 }
 
+template <int BLOCKS>
+__global__ __launch_bounds__(128, 4) void q6_k_wmma32_kernel(
+    const Q6KBlock *__restrict__ weights,
+    const float *__restrict__ x,
+    float *__restrict__ y,
+    int rows,
+    int cols) {
+    using namespace nvcuda;
+    __shared__ __align__(128) __half shared_a[16 * 32];
+    __shared__ __align__(128) __half shared_b[2][16 * 32];
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5;
+    const int row_start = blockIdx.x * 16;
+    const int token_start = blockIdx.y * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+
+    for (int k0 = 0; k0 < cols; k0 += 32) {
+        const int local_row = thread >> 3;
+        const int local_word = thread & 7;
+        const int block_id = k0 >> 8;
+        const int subgroup = (k0 >> 5) & 7;
+        const int half = subgroup >> 2;
+        const int quadrant = subgroup & 3;
+        const Q6KBlock &block =
+            weights[static_cast<size_t>(row_start + local_row) * BLOCKS + block_id];
+        const int scale_index = 8 * half + 2 * quadrant + (local_word >> 2);
+        const float scale =
+            __half2float(block.d) * float(block.scales[scale_index]);
+        const uint32_t decoded =
+            decode_q6_word(block, half, quadrant, local_word);
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte) {
+            const int8_t value = int8_t(decoded >> (8 * byte));
+            shared_a[local_row * 32 + 4 * local_word + byte] =
+                __float2half_rn(float(value) * scale);
+        }
+#pragma unroll
+        for (int item = thread; item < 32 * 32; item += 128) {
+            const int local_token = item >> 5;
+            const int local_k = item & 31;
+            shared_b[local_token >> 4][local_k + (local_token & 15) * 32] =
+                __float2half_rn(x[static_cast<size_t>(token_start + local_token) * cols +
+                                   k0 + local_k]);
+        }
+        __syncthreads();
+        if (warp < 2) {
+#pragma unroll
+            for (int tile = 0; tile < 2; ++tile) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                               wmma::row_major> a_fragment;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                               wmma::col_major> b_fragment;
+                wmma::load_matrix_sync(a_fragment, shared_a + 16 * tile, 32);
+                wmma::load_matrix_sync(b_fragment, shared_b[warp] + 16 * tile, 32);
+                wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+            }
+        }
+        __syncthreads();
+    }
+    if (warp < 2)
+        wmma::store_matrix_sync(
+            y + static_cast<size_t>(token_start + warp * 16) * rows + row_start,
+            accumulator, rows, wmma::mem_col_major);
+}
+
 template <int R, int BLOCKS, bool REPACKED, int WARPS = 8>
 cudaError_t launch_iq3(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
@@ -797,6 +863,21 @@ cudaError_t iq4_xs_gemm_prefill32(
     else
         iq4_xs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
             reinterpret_cast<const IQ4XSBlock *>(weights), x, y, rows, cols);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t q6_k_gemm_prefill32(
+    const uint8_t *weights, const float *x, int tokens, float *y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!weights || !x || !y || rows <= 0 || (rows & 15) ||
+        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
+        return cudaErrorInvalidValue;
+    if (cols == 4096)
+        q6_k_wmma32_kernel<16><<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
+            reinterpret_cast<const Q6KBlock *>(weights), x, y, rows, cols);
+    else
+        q6_k_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
+            reinterpret_cast<const Q6KBlock *>(weights), x, y, rows, cols);
     return cudaPeekAtLastError();
 }
 

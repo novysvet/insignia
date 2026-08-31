@@ -116,6 +116,18 @@ __device__ __forceinline__ int2 iq4_lookup8(uint32_t q4) {
                      __byte_perm(result[0], result[1], 0x7531));
 }
 
+__device__ __forceinline__ uint32_t decode_q6_word(
+    const Q6KBlock &block, int half, int quadrant, int word) {
+    const uint8_t *ql = block.ql + 64 * half + 32 * (quadrant & 1);
+    const uint8_t *qh = block.qh + 32 * half;
+    const uint32_t low =
+        (load_u32_any(ql + 4 * word) >> (4 * (quadrant >> 1))) &
+        0x0f0f0f0fu;
+    const uint32_t high =
+        (load_u32_any(qh + 4 * word) >> (2 * quadrant)) & 0x03030303u;
+    return __vsub4(low | (high << 4), 0x20202020u);
+}
+
 template <int R>
 __global__ __launch_bounds__(128, 4) void iq_quantize_x32_rows_kernel(
     const float *__restrict__ x,
@@ -389,40 +401,61 @@ __global__ __launch_bounds__(256, 2) void q6_k_rows_kernel(
         const Q6KBlock &block = row_weights[block_id];
         const int half = subgroup >> 2;
         const int quadrant = subgroup & 3;
-        const uint8_t *ql = block.ql + 64 * half + 32 * (quadrant & 1);
-        const uint8_t *qh = block.qh + 32 * half;
-        uint32_t decoded[8];
-#pragma unroll
-        for (int word = 0; word < 8; ++word) {
-            const uint32_t low =
-                (load_u32_any(ql + 4 * word) >> (4 * (quadrant >> 1))) &
-                0x0f0f0f0fu;
-            const uint32_t high =
-                (load_u32_any(qh + 4 * word) >> (2 * quadrant)) &
-                0x03030303u;
-            decoded[word] = __vsub4(low | (high << 4), 0x20202020u);
-        }
         const int scale_index = 8 * half + 2 * quadrant;
         const float d = __half2float(block.d);
         const float weight_scale0 = d * float(block.scales[scale_index + 0]);
         const float weight_scale1 = d * float(block.scales[scale_index + 1]);
         const int activation_group = block_id * 8 + subgroup;
+        if constexpr (R <= 2) {
+            int dot0[R] = {}, dot1[R] = {};
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const uint32_t *activation =
-                xq + static_cast<size_t>(r) * words_per_row +
-                activation_group * 8;
-            int dot0 = 0, dot1 = 0;
+            for (int word = 0; word < 8; ++word) {
+                const uint32_t decoded =
+                    decode_q6_word(block, half, quadrant, word);
 #pragma unroll
-            for (int word = 0; word < 4; ++word)
-                dot0 = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot0);
+                for (int r = 0; r < R; ++r) {
+                    const uint32_t *activation =
+                        xq + static_cast<size_t>(r) * words_per_row +
+                        activation_group * 8;
+                    if (word < 4)
+                        dot0[r] = __dp4a(int(decoded), int(__ldg(activation + word)),
+                                         dot0[r]);
+                    else
+                        dot1[r] = __dp4a(int(decoded), int(__ldg(activation + word)),
+                                         dot1[r]);
+                }
+            }
 #pragma unroll
-            for (int word = 4; word < 8; ++word)
-                dot1 = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot1);
-            const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
-                                       activation_group];
-            sums[r] = fmaf(float(dot0), weight_scale0 * scale, sums[r]);
-            sums[r] = fmaf(float(dot1), weight_scale1 * scale, sums[r]);
+            for (int r = 0; r < R; ++r) {
+                const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                           activation_group];
+                sums[r] = fmaf(float(dot0[r]), weight_scale0 * scale, sums[r]);
+                sums[r] = fmaf(float(dot1[r]), weight_scale1 * scale, sums[r]);
+            }
+        } else {
+            uint32_t decoded[8];
+#pragma unroll
+            for (int word = 0; word < 8; ++word)
+                decoded[word] = decode_q6_word(block, half, quadrant, word);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t *activation =
+                    xq + static_cast<size_t>(r) * words_per_row +
+                    activation_group * 8;
+                int dot0 = 0, dot1 = 0;
+#pragma unroll
+                for (int word = 0; word < 4; ++word)
+                    dot0 = __dp4a(int(decoded[word]), int(__ldg(activation + word)),
+                                  dot0);
+#pragma unroll
+                for (int word = 4; word < 8; ++word)
+                    dot1 = __dp4a(int(decoded[word]), int(__ldg(activation + word)),
+                                  dot1);
+                const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                           activation_group];
+                sums[r] = fmaf(float(dot0), weight_scale0 * scale, sums[r]);
+                sums[r] = fmaf(float(dot1), weight_scale1 * scale, sums[r]);
+            }
         }
     }
 #pragma unroll

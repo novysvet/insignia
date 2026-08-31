@@ -364,7 +364,7 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
 // once, then two warps reuse it through HMMA.  The expert payload is therefore
 // read once per 32 tokens instead of once per eight-token GEMV launch.
 template <int BLOCKS>
-__global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
+__global__ __launch_bounds__(128, 4) void iq3_xxs_wmma32_kernel(
     const uint8_t *__restrict__ weights,
     const float *__restrict__ x,
     float *__restrict__ y,
@@ -382,12 +382,12 @@ __global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
     wmma::fill_fragment(accumulator, 0.0f);
 
     for (int k0 = 0; k0 < cols; k0 += 32) {
-        // Decode the whole 32-value scale/sign group once.  Each thread owns
-        // the same codeword in two output rows, covering 16x32 with 64 lanes.
+        // Decode the whole 32-value scale/sign group once.  The 128 threads
+        // each own one codeword, covering the entire 16x32 tile in one pass.
         const int block_id = k0 >> 8;
         const int subgroup = (k0 >> 5) & 7;
 #pragma unroll
-        for (int slot = thread; slot < 16 * 8; slot += 64) {
+        for (int slot = thread; slot < 16 * 8; slot += 128) {
             const int local_row = slot >> 3;
             const int local_code = slot & 7;
             const auto &block = reinterpret_cast<const IQ3XXSBlock *>(
@@ -416,7 +416,7 @@ __global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
         // The input tile is stored exactly in the col-major layout expected by
         // matrix_b: [K, token].  Each thread converts eight FP32 activations.
 #pragma unroll
-        for (int item = thread; item < 32 * 32; item += 64) {
+        for (int item = thread; item < 32 * 32; item += 128) {
             const int local_token = item >> 5;
             const int local_k = item & 31;
             shared_b[local_token >> 4][local_k + (local_token & 15) * 32] =
@@ -424,21 +424,24 @@ __global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
                                    k0 + local_k]);
         }
         __syncthreads();
+        if (warp < 2) {
 #pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                           wmma::row_major> a_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                           wmma::col_major> b_fragment;
-            wmma::load_matrix_sync(a_fragment, shared_a + 16 * half, 32);
-            wmma::load_matrix_sync(b_fragment, shared_b[warp] + 16 * half, 32);
-            wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+            for (int half = 0; half < 2; ++half) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                               wmma::row_major> a_fragment;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                               wmma::col_major> b_fragment;
+                wmma::load_matrix_sync(a_fragment, shared_a + 16 * half, 32);
+                wmma::load_matrix_sync(b_fragment, shared_b[warp] + 16 * half, 32);
+                wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+            }
         }
         __syncthreads();
     }
-    wmma::store_matrix_sync(
-        y + static_cast<size_t>(token_start + warp * 16) * rows + row_start,
-        accumulator, rows, wmma::mem_col_major);
+    if (warp < 2)
+        wmma::store_matrix_sync(
+            y + static_cast<size_t>(token_start + warp * 16) * rows + row_start,
+            accumulator, rows, wmma::mem_col_major);
 }
 
 template <int BLOCKS>
@@ -618,10 +621,10 @@ cudaError_t iq3_xxs_gemm_prefill32(
         tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
         return cudaErrorInvalidValue;
     if (cols == 4096)
-        iq3_xxs_wmma32_kernel<16><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
+        iq3_xxs_wmma32_kernel<16><<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
             weights, x, y, rows, cols);
     else
-        iq3_xxs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
+        iq3_xxs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
             weights, x, y, rows, cols);
     return cudaPeekAtLastError();
 }

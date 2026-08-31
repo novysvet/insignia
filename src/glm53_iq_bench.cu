@@ -495,6 +495,61 @@ int main(int argc, char **argv) {
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "restore x8 gate benchmark workspace");
 
+        for (int count : {1, kTokens}) {
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      gate.x_device, gate.cols, row_ids, count, gate.workspace),
+                  "prepare resident expert gate workspace");
+            check(insignia::glm53::iq3_xxs_gemv2_repacked_rows(
+                      gate_repacked_device, up_repacked_device, gate.workspace,
+                      count, gate.output_device, up_output_device, out_ids,
+                      gate.rows, gate.cols), "prepare resident expert gate/up");
+            check(insignia::glm53::iq_quantize_swiglu_rows(
+                      gate.output_device, up_output_device, down.cols,
+                      out_ids, count, down.workspace),
+                  "prepare resident expert SwiGLU workspace");
+            check(cudaDeviceSynchronize(), "prepare resident expert timing");
+            const auto launch_hidden_quant = [&] {
+                check(insignia::glm53::iq_quantize_activation_rows(
+                          gate.x_device, gate.cols, row_ids, count, gate.workspace),
+                      "timed resident hidden quantize");
+            };
+            const auto launch_pair = [&] {
+                check(insignia::glm53::iq3_xxs_gemv2_repacked_rows(
+                          gate_repacked_device, up_repacked_device, gate.workspace,
+                          count, gate.output_device, up_output_device, out_ids,
+                          gate.rows, gate.cols), "timed resident pair");
+            };
+            const auto launch_swiglu_quant = [&] {
+                check(insignia::glm53::iq_quantize_swiglu_rows(
+                          gate.output_device, up_output_device, down.cols,
+                          out_ids, count, down.workspace),
+                      "timed resident SwiGLU quantize");
+            };
+            const auto launch_down = [&] {
+                check(insignia::glm53::iq4_xs_gemv_rows(
+                          down.weights_device, down.workspace, count,
+                          down.output_device, out_ids, down.rows, down.cols),
+                      "timed resident IQ4 down");
+            };
+            const auto launch_pipeline = [&] {
+                launch_hidden_quant();
+                launch_pair();
+                launch_swiglu_quant();
+                launch_down();
+            };
+            const float hidden_quant_us = benchmark_us(launch_hidden_quant);
+            const float pair_us = benchmark_us(launch_pair);
+            const float swiglu_quant_us = benchmark_us(launch_swiglu_quant);
+            const float resident_down_us = benchmark_us(launch_down);
+            const float pipeline_us = benchmark_us(launch_pipeline);
+            std::printf("IQ3/IQ4 resident expert x%d hiddenQ/pair/swigluQ/down "
+                        "%7.3f/%7.3f/%7.3f/%7.3f us sum %7.3f pipe %7.3f\n",
+                        count, hidden_quant_us, pair_us, swiglu_quant_us,
+                        resident_down_us,
+                        hidden_quant_us + pair_us + swiglu_quant_us + resident_down_us,
+                        pipeline_us);
+        }
+
         void *gate_prefill_workspace[4]{};
         void *down_prefill_workspace[4]{};
         for (int batch = 0; batch < 4; ++batch) {

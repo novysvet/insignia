@@ -171,6 +171,10 @@ standalone E2M1-Q4 dense experiment was slower than FP8-TC and rejected.
   table-free E2M1 decoder raises matched glm-box decode throughput by 1.18%
   (five-run medians) and is byte-identical to the shared-LUT rollback; see
   `audits/s12-ti-tablefree-e2m1.md`.
+- Cache-aware DFlash joint search uses five-word expert masks plus Raptor Lake
+  POPCNT for 2--4 rows and the faster byte objective for one row. The live
+  shadow verifier is exact and forced-batch selector time fell 57.1%; see
+  `audits/s12-ti-cache-selector-popcnt.md`.
 - Hierarchy in working form: O_DIRECT reader pool → pinned host-RAM expert LRU
   (default 32 GiB with safe halve-and-retry; ~80% hit rate at 2425 slots on
   glm-box) → 576 MiB VRAM expert cache covering all 42 sparse layers → GPU.
@@ -240,7 +244,8 @@ checks. Wait for coherent token parity before claiming the engine is correct.
   `DFLASH2_FP8`, `DF_VERIFY_K`, `DF_SEQ_VERIFY`/`DF_BATCH_VERIFY`), MLA modes
   (`KV_FP8`, `MLA_LEGACY` exact oracle, `SCALAR_MLA_PREFILL`,
   `MLA_BF16_ABSORB`), striping (`STRIPE_INDEX` + `ALT_SHARD_DIR`), prefetch (`CCT`,
-  `PREFETCH`), packed expert decode (`NVFP4_TABLEFREE`), and the trace/dump hooks (`ROUTE_TRACE`, `LAYER_DUMP`,
+  `PREFETCH`), packed expert decode (`NVFP4_TABLEFREE`), cache-union search
+  (`DF_CACHE_MASK_SEARCH`/`DF_CACHE_MASK_VERIFY`), and the trace/dump hooks (`ROUTE_TRACE`, `LAYER_DUMP`,
   `MLA_DUMP`, `DF_DUMP`, `LOGITS_DUMP`).
 - `INSIGNIA_GLM53_DFLASH2_FP8` must point at
   `/var/lib/insignia/glm53-dflash2-fp8-fixed` — the default

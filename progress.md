@@ -33,12 +33,33 @@ the packed default; `INSIGNIA_GLM53_NVFP4_TABLEFREE=0` is the exact rollback.
 See `audits/s12-ti-tablefree-e2m1.md`.  No local-box timing contributed to this
 decision.
 
+The i7-14700KF joint cache selector now represents the 288 experts as five
+64-bit words and uses direct POPCNT union/disk/H2D objectives for 2--4-row
+Cartesian searches, retaining the faster byte path for one row.  An in-process
+ArXivLean-16 shadow run recomputed every live objective with both algorithms
+and found no disagreement.  In a forced-batch pair, selector time fell
+4.369->1.875 ms across 294 layer groups (14.862->6.377 us/group, -57.1%); the
+IDs and acceptance histogram matched.  The mixed adaptive verifier improved
+2.062->1.886 ms (-8.5%).  No end-to-end wall gain is claimed because the direct
+saving is only about 0.16 ms/token under variable NVMe I/O.  Roll back with
+`INSIGNIA_GLM53_DF_CACHE_MASK_SEARCH=0`; shadow-check with
+`INSIGNIA_GLM53_DF_CACHE_MASK_VERIFY=1`.  See
+`audits/s12-ti-cache-selector-popcnt.md`.
+
+The web API no longer overrides glm-box's 32 GiB expert tier with a 5 GiB
+local value.  Its default speed profile is the measured cache-aware Top-6
+policy (K=32, regret .001, eight joint actions), whose existing ArXivLean-40
+result is 1.678->2.491 tok/s (+48.4%) at PPL +0.86%.
+`INSIGNIA_WEB_SPEED_PROFILE=exact` is the exact verification rollback.
+
 The public `UD-Q3_K_XL` four-shard GGUF download writes only to
-`/var/lib/insignia/glm53-q3-k-xl`.  The Windows Scheduled Task stopped with
-result code 7 after caching 93 GiB, so it was replaced by the persistent WSL
-unit `insignia-q3-k-xl-download.service` at one worker.  The exact HF include is
-`UD-Q3_K_XL/*` (about 147.2 GB total); 342 GiB remained free when the resumable
-unit started.  Treat the box's SSD as contended while this unit is active.
+`/var/lib/insignia/glm53-q3-k-xl`.  Both the Windows Scheduled Task and a
+transient systemd unit were cleanly stopped after 15--22 seconds; neither was
+an OOM.  A direct one-worker HF resume stays alive through the SSH transport.
+Dry-run reports one complete shard and three remaining files (145.1 GB logical)
+on top of a 93 GiB partial cache; 342 GiB remained free.  The exact HF include
+is `UD-Q3_K_XL/*`.  Treat the box's SSD as contended while the foreground
+resume is active.
 
 The incoming Ada dispatch, DFlash capture, KDA shadowing, anytime WSL A/B,
 teacher-forcing/free-run, causal residual, joint adaptive compute, and anytime

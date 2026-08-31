@@ -492,6 +492,98 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     }
 }
 
+template <int BLOCKS, int PASSES>
+__global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_x1_kernel(
+    const IQ4XSBlock *__restrict__ weights,
+    const float *__restrict__ gate,
+    const float *__restrict__ up,
+    int input_id,
+    float *__restrict__ y,
+    int output_id,
+    int rows) {
+    __shared__ __align__(128) uint32_t shared_xq[64 * 8];
+    __shared__ __align__(128) float shared_xscale[64];
+    const int thread = threadIdx.x;
+    if (thread < 64) {
+        const size_t base = static_cast<size_t>(input_id) * 2048 + thread * 32;
+        const float4 *gate4 = reinterpret_cast<const float4 *>(gate + base);
+        const float4 *up4 = reinterpret_cast<const float4 *>(up + base);
+        float values[32];
+        float maximum = 0.0f;
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            const float4 g = __ldg(gate4 + word);
+            const float4 u = __ldg(up4 + word);
+            const float gv[4] = {g.x, g.y, g.z, g.w};
+            const float uv[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const float gc = fminf(gv[item], 10.0f);
+                const float uc = fminf(fmaxf(uv[item], -10.0f), 10.0f);
+                const float value = (gc / (1.0f + __expf(-gc))) * uc;
+                values[4 * word + item] = value;
+                maximum = fmaxf(maximum, fabsf(value));
+            }
+        }
+        const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+        shared_xscale[thread] = maximum * (1.0f / 127.0f);
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            uint32_t packed = 0;
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte)
+                packed |= uint32_t(uint8_t(__float2int_rn(
+                              values[4 * word + byte] * inverse))) << (8 * byte);
+            shared_xq[thread * 8 + word] = packed;
+        }
+    }
+    __syncthreads();
+
+    const int lane = thread & 31;
+    const int warp = thread >> 5;
+    const int cohort = lane >> 3;
+    const int subgroup = lane & 7;
+#pragma unroll
+    for (int pass = 0; pass < PASSES; ++pass) {
+        const int row = blockIdx.x * (8 * PASSES) + pass * 8 + warp;
+        const IQ4XSBlock *row_weights =
+            weights + static_cast<size_t>(row) * BLOCKS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int wave = 0; wave < BLOCKS / 4; ++wave) {
+            const int block_id = 4 * wave + cohort;
+            const IQ4XSBlock &block = row_weights[block_id];
+            const uint32_t *packed = reinterpret_cast<const uint32_t *>(
+                block.qs + 16 * subgroup);
+            int decoded[8];
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                const int2 values = iq4_lookup8(__ldcs(packed + word));
+                decoded[word] = values.x;
+                decoded[word + 4] = values.y;
+            }
+            const int low =
+                (block.scales_l[subgroup >> 1] >> (4 * (subgroup & 1))) & 15;
+            const int high = (block.scales_h >> (2 * subgroup)) & 3;
+            const float weight_scale = __half2float(block.d) *
+                                       float((low | (high << 4)) - 32);
+            const int activation_group = block_id * 8 + subgroup;
+            const uint32_t *activation = shared_xq + activation_group * 8;
+            int dot = 0;
+#pragma unroll
+            for (int word = 0; word < 8; ++word)
+                dot = __dp4a(decoded[word], int(activation[word]), dot);
+            sum = fmaf(float(dot),
+                       weight_scale * shared_xscale[activation_group], sum);
+        }
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (!lane)
+            y[static_cast<size_t>(output_id) * rows + row] = sum;
+    }
+}
+
 template <int R, int BLOCKS, bool ACCUMULATE>
 __global__ __launch_bounds__(256, 2) void q6_k_rows_kernel(
     const Q6KBlock *__restrict__ weights,
@@ -1195,6 +1287,38 @@ cudaError_t iq4_xs_gemv_acc_rows(
         return cudaErrorInvalidValue;
     return dispatch_iq4<true>(weights, workspace, count, y, y_ids, combine,
                               rows, cols, stream);
+}
+
+cudaError_t iq4_xs_swiglu_gemv_fused_x1(
+    const uint8_t *weights, const float *gate, const float *up, int input_id,
+    float *y, int output_id, int rows, int cols, int rows_per_cta,
+    cudaStream_t stream) {
+    if (!weights || !gate || !up || !y || input_id < 0 || output_id < 0 ||
+        rows <= 0 || cols != 2048 ||
+        (rows_per_cta != 16 && rows_per_cta != 32 && rows_per_cta != 64) ||
+        rows % rows_per_cta)
+        return cudaErrorInvalidValue;
+    const auto *blocks = reinterpret_cast<const IQ4XSBlock *>(weights);
+    switch (rows_per_cta) {
+        case 16:
+            iq4_xs_swiglu_x1_kernel<8, 2>
+                <<<rows / 16, 256, 0, stream>>>(
+                    blocks, gate, up, input_id, y, output_id, rows);
+            break;
+        case 32:
+            iq4_xs_swiglu_x1_kernel<8, 4>
+                <<<rows / 32, 256, 0, stream>>>(
+                    blocks, gate, up, input_id, y, output_id, rows);
+            break;
+        case 64:
+            iq4_xs_swiglu_x1_kernel<8, 8>
+                <<<rows / 64, 256, 0, stream>>>(
+                    blocks, gate, up, input_id, y, output_id, rows);
+            break;
+        default:
+            return cudaErrorInvalidValue;
+    }
+    return cudaPeekAtLastError();
 }
 
 cudaError_t q6_k_gemv_rows(

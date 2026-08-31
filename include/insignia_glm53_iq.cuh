@@ -147,6 +147,21 @@ cudaError_t iq4_xs_gemv_acc_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Decode-only compute-for-bandwidth arm: each CTA redundantly quantizes the
+// same SwiGLU row into shared memory, then reuses it across 16/32/64 output
+// rows.  This removes the standalone quantizer launch and global Q8 workspace.
+cudaError_t iq4_xs_swiglu_gemv_fused_x1(
+    const uint8_t *weights,
+    const float *gate,
+    const float *up,
+    int input_id,
+    float *y,
+    int output_id,
+    int rows,
+    int cols,
+    int rows_per_cta,
+    cudaStream_t stream = nullptr);
+
 // Q6_K exception path used by the routed down projections in blocks 11, 12,
 // and 44.  It reconstructs the split low-4/high-2 bitplanes directly into
 // signed DP4A operands and applies the two per-16 scales inside each Q8-per-32

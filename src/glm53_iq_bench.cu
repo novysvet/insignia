@@ -550,6 +550,78 @@ int main(int argc, char **argv) {
                         pipeline_us);
         }
 
+        check(insignia::glm53::iq_quantize_activation_rows(
+                  gate.x_device, gate.cols, row_ids, 1, gate.workspace),
+              "prepare fused SwiGLU/down input");
+        check(insignia::glm53::iq3_xxs_gemv2_repacked_rows(
+                  gate_repacked_device, up_repacked_device, gate.workspace, 1,
+                  gate.output_device, up_output_device, out_ids,
+                  gate.rows, gate.cols), "prepare fused SwiGLU/down gate/up");
+        check(insignia::glm53::iq_quantize_swiglu_rows(
+                  gate.output_device, up_output_device, down.cols,
+                  out_ids, 1, down.workspace),
+              "prepare fused SwiGLU/down baseline activation");
+        check(insignia::glm53::iq4_xs_gemv_rows(
+                  down.weights_device, down.workspace, 1,
+                  down.output_device, out_ids, down.rows, down.cols),
+              "prepare fused SwiGLU/down baseline output");
+        check(cudaDeviceSynchronize(), "prepare fused SwiGLU/down baseline");
+        std::vector<float> fused_baseline(size_t(kTokens) * down.rows);
+        check(cudaMemcpy(fused_baseline.data(), down.output_device,
+                         fused_baseline.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy fused SwiGLU/down baseline");
+        for (int rows_per_cta : {16, 32, 64}) {
+            check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                      down.weights_device, gate.output_device, up_output_device,
+                      out_ids[0], down.output_device, out_ids[0],
+                      down.rows, down.cols, rows_per_cta),
+                  "fused SwiGLU/down correctness");
+            check(cudaDeviceSynchronize(), "fused SwiGLU/down synchronize");
+            std::vector<float> fused_output(size_t(kTokens) * down.rows);
+            check(cudaMemcpy(fused_output.data(), down.output_device,
+                             fused_output.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost),
+                  "copy fused SwiGLU/down output");
+            const Metrics fused_metrics = compare(
+                gather(fused_output, out_ids, 1, down.rows),
+                gather(fused_baseline, out_ids, 1, down.rows));
+            char label[64];
+            std::snprintf(label, sizeof(label),
+                          "IQ4 fused SwiGLU r%d", rows_per_cta);
+            print_metrics(label, fused_metrics);
+            failed |= fused_metrics.maximum != 0.0;
+        }
+        const auto launch_swiglu_down_x1 = [&] {
+            check(insignia::glm53::iq_quantize_swiglu_rows(
+                      gate.output_device, up_output_device, down.cols,
+                      out_ids, 1, down.workspace), "timed baseline SwiGLU quantize");
+            check(insignia::glm53::iq4_xs_gemv_rows(
+                      down.weights_device, down.workspace, 1,
+                      down.output_device, out_ids, down.rows, down.cols),
+                  "timed baseline IQ4 down");
+        };
+        const float swiglu_down_x1_us = benchmark_us(launch_swiglu_down_x1);
+        float fused_swiglu_down_us[3]{};
+        int fused_index = 0;
+        for (int rows_per_cta : {16, 32, 64}) {
+            const auto launch_fused = [&] {
+                check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                          down.weights_device, gate.output_device, up_output_device,
+                          out_ids[0], down.output_device, out_ids[0],
+                          down.rows, down.cols, rows_per_cta),
+                      "timed fused SwiGLU/down");
+            };
+            fused_swiglu_down_us[fused_index++] = benchmark_us(launch_fused);
+        }
+        std::printf("IQ4 SwiGLU+down x1 separate/r16/r32/r64 "
+                    "%8.3f/%8.3f/%8.3f/%8.3f us speedups %.3fx/%.3fx/%.3fx\n",
+                    swiglu_down_x1_us, fused_swiglu_down_us[0],
+                    fused_swiglu_down_us[1], fused_swiglu_down_us[2],
+                    swiglu_down_x1_us / fused_swiglu_down_us[0],
+                    swiglu_down_x1_us / fused_swiglu_down_us[1],
+                    swiglu_down_x1_us / fused_swiglu_down_us[2]);
+
         void *gate_prefill_workspace[4]{};
         void *down_prefill_workspace[4]{};
         for (int batch = 0; batch < 4; ++batch) {

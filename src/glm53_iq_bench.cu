@@ -185,6 +185,11 @@ int main(int argc, char **argv) {
                        insignia::glm53::kIQ3XXSBlockBytes, iq3_bytes,
                        read_slice(path, gate_offset, iq3_bytes)};
     const std::vector<uint8_t> up_weights = read_slice(path, up_offset, iq3_bytes);
+    std::vector<uint8_t> gate_repacked(iq3_bytes), up_repacked(iq3_bytes);
+    insignia::glm53::iq3_xxs_repack_cpu(gate.weights.data(), gate_repacked.data(),
+                                         gate_rows, gate_cols);
+    insignia::glm53::iq3_xxs_repack_cpu(up_weights.data(), up_repacked.data(),
+                                         gate_rows, gate_cols);
     MatrixFixture down{"IQ4_XS down", down_rows, down_cols,
                        insignia::glm53::kIQ4XSBlockBytes, iq4_bytes,
                        read_slice(path, down_offset, iq4_bytes)};
@@ -220,6 +225,8 @@ int main(int argc, char **argv) {
               "cudaMalloc IQ workspace");
     }
     auto *up_device = device_copy(up_weights);
+    auto *gate_repacked_device = device_copy(gate_repacked);
+    auto *up_repacked_device = device_copy(up_repacked);
     auto *up_output_device = device_alloc<float>(size_t(kTokens) * gate_rows);
     const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
     const int out_ids[kTokens] = {3, 7, 1, 6, 0, 5, 2, 4};
@@ -258,6 +265,23 @@ int main(int argc, char **argv) {
         }
     }
 
+    check(insignia::glm53::iq_quantize_activation_rows(
+              gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
+          "prepare repacked IQ3 correctness");
+    check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
+              gate_repacked_device, gate.workspace, kTokens, gate.output_device,
+              out_ids, gate.rows, gate.cols), "iq3_xxs_gemv_repacked_rows");
+    check(cudaDeviceSynchronize(), "repacked IQ3 synchronize");
+    std::vector<float> repacked_output(size_t(kTokens) * gate.rows);
+    check(cudaMemcpy(repacked_output.data(), gate.output_device,
+                     repacked_output.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "copy repacked IQ3 output");
+    const Metrics repacked_metrics = compare(
+        gather(repacked_output, out_ids, kTokens, gate.rows),
+        select_reference(gate.reference, row_ids, kTokens, gate.rows));
+    print_metrics("IQ3 repacked x8", repacked_metrics);
+    failed |= repacked_metrics.relative > 2.0e-2 || repacked_metrics.cosine < 0.99980;
+
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
         check(insignia::glm53::iq_quantize_activation_rows(
@@ -279,11 +303,18 @@ int main(int argc, char **argv) {
                           down.output_device, out_ids, down.rows, down.cols),
                       "timed IQ4 down");
             };
+            const auto launch_gate_repacked = [&] {
+                check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
+                          gate_repacked_device, gate.workspace, count,
+                          gate.output_device, out_ids, gate.rows, gate.cols),
+                      "timed repacked IQ3 gate");
+            };
             const float gate_us = benchmark_us(launch_gate);
+            const float gate_repacked_us = benchmark_us(launch_gate_repacked);
             const float down_us = benchmark_us(launch_down);
-            std::printf("IQ3_XXS x%d %8.3f us %7.1f GB/s | "
+            std::printf("IQ3 raw/repacked x%d %8.3f/%8.3f us %.3fx | "
                         "IQ4_XS x%d %8.3f us %7.1f GB/s\n",
-                        count, gate_us, double(iq3_bytes) / (gate_us * 1000.0),
+                        count, gate_us, gate_repacked_us, gate_us / gate_repacked_us,
                         count, down_us, double(iq4_bytes) / (down_us * 1000.0));
         }
         const auto launch_gate_up = [&] {
@@ -296,9 +327,21 @@ int main(int argc, char **argv) {
                       up_output_device, out_ids, gate.rows, gate.cols),
                   "timed IQ3 up");
         };
+        const auto launch_gate_up_repacked = [&] {
+            check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
+                      gate_repacked_device, gate.workspace, kTokens,
+                      gate.output_device, out_ids, gate.rows, gate.cols),
+                  "timed repacked IQ3 gate");
+            check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
+                      up_repacked_device, gate.workspace, kTokens,
+                      up_output_device, out_ids, gate.rows, gate.cols),
+                  "timed repacked IQ3 up");
+        };
         const float gate_up_us = benchmark_us(launch_gate_up);
-        std::printf("IQ3_XXS gate+up x8 separate %8.3f us %7.1f GB/s\n",
-                    gate_up_us, double(2 * iq3_bytes) / (gate_up_us * 1000.0));
+        const float gate_up_repacked_us = benchmark_us(launch_gate_up_repacked);
+        std::printf("IQ3 gate+up x8 raw/repacked %8.3f/%8.3f us %.3fx\n",
+                    gate_up_us, gate_up_repacked_us,
+                    gate_up_us / gate_up_repacked_us);
     } else {
         std::puts("timing skipped; pass --bench only on an uncontended glm-box run");
     }
@@ -308,5 +351,6 @@ int main(int argc, char **argv) {
         cudaFree(fixture->output_device); cudaFree(fixture->workspace);
     }
     cudaFree(up_device); cudaFree(up_output_device);
+    cudaFree(gate_repacked_device); cudaFree(up_repacked_device);
     return failed ? 3 : 0;
 }

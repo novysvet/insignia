@@ -47,6 +47,26 @@ cudaError_t iq3_xxs_gemv_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Byte-size-neutral IQ3 sidecar layout.  Each output row stores all FP16
+// super-scales first, followed by all 64-byte codebook-index planes and all
+// 32-byte sign/scale planes.  It turns the awkward 98-byte GGUF stride into
+// naturally aligned streams without spending another byte of I/O or VRAM.
+void iq3_xxs_repack_cpu(
+    const uint8_t *source,
+    uint8_t *destination,
+    int rows,
+    int cols);
+
+cudaError_t iq3_xxs_gemv_repacked_rows(
+    const uint8_t *weights,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // IQ4_XS uses a nonlinear 16-entry nibble codebook and eight signed scales per
 // 256 values.  The same warp/block map is used so exception layers can be
 // dispatched without a generic matrix engine.

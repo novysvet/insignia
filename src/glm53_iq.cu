@@ -172,9 +172,9 @@ __global__ __launch_bounds__(128, 4) void iq_quantize_swiglu_x32_rows_kernel(
     }
 }
 
-template <int R, int BLOCKS, bool SHARED_GRID>
+template <int R, int BLOCKS, bool SHARED_GRID, bool REPACKED>
 __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
-    const IQ3XXSBlock *__restrict__ weights,
+    const uint8_t *__restrict__ weights,
     const uint32_t *__restrict__ xq,
     const float *__restrict__ xscale,
     int words_per_row,
@@ -190,15 +190,36 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
     const int cohort = lane >> 3;
     const int subgroup = lane & 7;
     const int row = blockIdx.x * 8 + warp;
-    const IQ3XXSBlock *row_weights = weights + static_cast<size_t>(row) * BLOCKS;
+    constexpr int row_bytes = BLOCKS * kIQ3XXSBlockBytes;
+    const uint8_t *row_weights = weights + static_cast<size_t>(row) * row_bytes;
     float sums[R] = {};
 #pragma unroll
     for (int wave = 0; wave < BLOCKS / 4; ++wave) {
         const int block_id = 4 * wave + cohort;
-        const IQ3XXSBlock &block = row_weights[block_id];
-        const uint32_t indices0 = load_u32_any(block.qs + 8 * subgroup);
-        const uint32_t indices1 = load_u32_any(block.qs + 8 * subgroup + 4);
-        const uint32_t aux = load_u32_any(block.qs + 64 + 4 * subgroup);
+        const uint8_t *indices;
+        const uint8_t *auxiliary;
+        float d;
+        if constexpr (REPACKED) {
+            const auto *scales = reinterpret_cast<const __half *>(row_weights);
+            indices = row_weights + 2 * BLOCKS + block_id * 64 + subgroup * 8;
+            auxiliary = row_weights + 66 * BLOCKS + block_id * 32 + subgroup * 4;
+            d = __half2float(scales[block_id]);
+        } else {
+            const IQ3XXSBlock &block =
+                reinterpret_cast<const IQ3XXSBlock *>(row_weights)[block_id];
+            indices = block.qs + 8 * subgroup;
+            auxiliary = block.qs + 64 + 4 * subgroup;
+            d = __half2float(block.d);
+        }
+        const uint32_t indices0 = REPACKED
+            ? __ldcs(reinterpret_cast<const uint32_t *>(indices + 0))
+            : load_u32_any(indices + 0);
+        const uint32_t indices1 = REPACKED
+            ? __ldcs(reinterpret_cast<const uint32_t *>(indices + 4))
+            : load_u32_any(indices + 4);
+        const uint32_t aux = REPACKED
+            ? __ldcs(reinterpret_cast<const uint32_t *>(auxiliary))
+            : load_u32_any(auxiliary);
         uint32_t decoded[8];
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
@@ -215,8 +236,7 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
             decoded[2 * pair + 1] = apply_iq3_signs(grid1, signs, 0x80402010u);
         }
         const int activation_group = block_id * 8 + subgroup;
-        const float weight_scale = __half2float(block.d) *
-                                   (0.25f + 0.5f * float(aux >> 28));
+        const float weight_scale = d * (0.25f + 0.5f * float(aux >> 28));
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const uint32_t *activation = xq + static_cast<size_t>(r) * words_per_row +
@@ -300,13 +320,13 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     }
 }
 
-template <int R, int BLOCKS, bool SHARED_GRID>
+template <int R, int BLOCKS, bool SHARED_GRID, bool REPACKED>
 cudaError_t launch_iq3(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
                        IQRowOut out, int rows, cudaStream_t stream) {
-    iq3_xxs_rows_kernel<R, BLOCKS, SHARED_GRID><<<rows / 8, 256, 0, stream>>>(
-        reinterpret_cast<const IQ3XXSBlock *>(weights), xq, xscale,
-        words_per_row, y, out);
+    iq3_xxs_rows_kernel<R, BLOCKS, SHARED_GRID, REPACKED>
+        <<<rows / 8, 256, 0, stream>>>(weights, xq, xscale,
+                                      words_per_row, y, out);
     return cudaPeekAtLastError();
 }
 
@@ -333,7 +353,7 @@ bool iq3_shared_grid_enabled() {
     return enabled;
 }
 
-template <bool SHARED_GRID>
+template <bool SHARED_GRID, bool REPACKED>
 cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
                          int count, float *y, const int *y_ids,
                          int rows, int cols, cudaStream_t stream) {
@@ -346,10 +366,10 @@ cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
 #define INSIGNIA_IQ3_CASE(R)                                                       \
     case R:                                                                        \
         return cols == 4096                                                        \
-            ? launch_iq3<R, 16, SHARED_GRID>(weights, xq, xscale, int(aligned / 4),\
-                                               y, out, rows, stream)                \
-            : launch_iq3<R, 8, SHARED_GRID>(weights, xq, xscale, int(aligned / 4), \
-                                              y, out, rows, stream)
+            ? launch_iq3<R, 16, SHARED_GRID, REPACKED>(                            \
+                  weights, xq, xscale, int(aligned / 4), y, out, rows, stream)     \
+            : launch_iq3<R, 8, SHARED_GRID, REPACKED>(                             \
+                  weights, xq, xscale, int(aligned / 4), y, out, rows, stream)
     switch (count) {
         INSIGNIA_IQ3_CASE(1); INSIGNIA_IQ3_CASE(2);
         INSIGNIA_IQ3_CASE(3); INSIGNIA_IQ3_CASE(4);
@@ -463,10 +483,40 @@ cudaError_t iq3_xxs_gemv_rows(
     if (!weights || !workspace || !y || !y_ids || !valid_geometry(rows, cols, count))
         return cudaErrorInvalidValue;
     if (iq3_shared_grid_enabled())
-        return dispatch_iq3<true>(weights, workspace, count, y, y_ids,
-                                  rows, cols, stream);
-    return dispatch_iq3<false>(weights, workspace, count, y, y_ids,
-                               rows, cols, stream);
+        return dispatch_iq3<true, false>(weights, workspace, count, y, y_ids,
+                                         rows, cols, stream);
+    return dispatch_iq3<false, false>(weights, workspace, count, y, y_ids,
+                                      rows, cols, stream);
+}
+
+void iq3_xxs_repack_cpu(const uint8_t *source, uint8_t *destination,
+                        int rows, int cols) {
+    const int blocks = cols / kIQBlockWeights;
+    const size_t row_bytes = static_cast<size_t>(blocks) * kIQ3XXSBlockBytes;
+    for (int row = 0; row < rows; ++row) {
+        const auto *input = reinterpret_cast<const IQ3XXSBlock *>(
+            source + static_cast<size_t>(row) * row_bytes);
+        uint8_t *output = destination + static_cast<size_t>(row) * row_bytes;
+        for (int block = 0; block < blocks; ++block) {
+            std::memcpy(output + 2 * block, &input[block].d, 2);
+            std::memcpy(output + 2 * blocks + 64 * block,
+                        input[block].qs, 64);
+            std::memcpy(output + 66 * blocks + 32 * block,
+                        input[block].qs + 64, 32);
+        }
+    }
+}
+
+cudaError_t iq3_xxs_gemv_repacked_rows(
+    const uint8_t *weights, const void *workspace, int count, float *y,
+    const int *y_ids, int rows, int cols, cudaStream_t stream) {
+    if (!weights || !workspace || !y || !y_ids || !valid_geometry(rows, cols, count))
+        return cudaErrorInvalidValue;
+    if (iq3_shared_grid_enabled())
+        return dispatch_iq3<true, true>(weights, workspace, count, y, y_ids,
+                                        rows, cols, stream);
+    return dispatch_iq3<false, true>(weights, workspace, count, y, y_ids,
+                                     rows, cols, stream);
 }
 
 cudaError_t iq4_xs_gemv_rows(

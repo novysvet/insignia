@@ -401,6 +401,31 @@ int main(int argc, char **argv) {
 
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
+        constexpr int kBatchExperts = 8;
+        uint8_t *batch_gate[kBatchExperts]{};
+        uint8_t *batch_up[kBatchExperts]{};
+        uint8_t *batch_down[kBatchExperts]{};
+        batch_gate[0] = gate_wim32_device;
+        batch_up[0] = up_wim32_device;
+        batch_down[0] = down.weights_device;
+        for (int expert = 1; expert < kBatchExperts; ++expert) {
+            const std::vector<uint8_t> expert_gate = read_slice(
+                path, gate_offset + uint64_t(expert) * iq3_bytes, iq3_bytes);
+            const std::vector<uint8_t> expert_up = read_slice(
+                path, up_offset + uint64_t(expert) * iq3_bytes, iq3_bytes);
+            std::vector<uint8_t> expert_gate_wim32(iq3_bytes);
+            std::vector<uint8_t> expert_up_wim32(iq3_bytes);
+            insignia::glm53::iq3_xxs_repack_wim32_cpu(
+                expert_gate.data(), expert_gate_wim32.data(),
+                gate_rows, gate_cols);
+            insignia::glm53::iq3_xxs_repack_wim32_cpu(
+                expert_up.data(), expert_up_wim32.data(),
+                gate_rows, gate_cols);
+            batch_gate[expert] = device_copy(expert_gate_wim32);
+            batch_up[expert] = device_copy(expert_up_wim32);
+            batch_down[expert] = device_copy(read_slice(
+                path, down_offset + uint64_t(expert) * iq4_bytes, iq4_bytes));
+        }
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "prepare gate benchmark");
@@ -772,6 +797,48 @@ int main(int argc, char **argv) {
             }
         }
 
+        const auto launch_top8_shared_quant = [&] {
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      gate.x_device, gate.cols, row_ids, 1, gate.workspace),
+                  "timed top8 shared hidden quantize");
+            for (int expert = 0; expert < kBatchExperts; ++expert) {
+                check(insignia::glm53::iq3_xxs_gemv2_wim32_rows(
+                          batch_gate[expert], batch_up[expert], gate.workspace,
+                          1, gate.output_device, up_output_device, out_ids,
+                          gate.rows, gate.cols),
+                      "timed top8 shared-Q gate/up");
+                check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                          batch_down[expert], gate.output_device,
+                          up_output_device, out_ids[0], down.output_device,
+                          out_ids[0], down.rows, down.cols, 32),
+                      "timed top8 shared-Q down");
+            }
+        };
+        const auto launch_top8_double_fused = [&] {
+            for (int expert = 0; expert < kBatchExperts; ++expert) {
+                check(insignia::glm53::
+                          iq3_xxs_gemv2_wim32_fused_quant_x1(
+                              batch_gate[expert], batch_up[expert],
+                              gate.x_device, row_ids[0], gate.output_device,
+                              up_output_device, out_ids[0], gate.rows,
+                              gate.cols, 8),
+                      "timed top8 double-fused gate/up");
+                check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                          batch_down[expert], gate.output_device,
+                          up_output_device, out_ids[0], down.output_device,
+                          out_ids[0], down.rows, down.cols, 32),
+                      "timed top8 double-fused down");
+            }
+        };
+        const float top8_shared_quant_us =
+            benchmark_us(launch_top8_shared_quant, 40, 400);
+        const float top8_double_fused_us =
+            benchmark_us(launch_top8_double_fused, 40, 400);
+        std::printf("IQ3/IQ4 resident top8 sharedQ/double-fused "
+                    "%8.3f/%8.3f us %.3fx\n",
+                    top8_shared_quant_us, top8_double_fused_us,
+                    top8_shared_quant_us / top8_double_fused_us);
+
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, 1, gate.workspace),
               "prepare fused SwiGLU/down input");
@@ -986,6 +1053,11 @@ int main(int argc, char **argv) {
         for (int batch = 0; batch < 4; ++batch) {
             cudaFree(gate_prefill_workspace[batch]);
             cudaFree(down_prefill_workspace[batch]);
+        }
+        for (int expert = 1; expert < kBatchExperts; ++expert) {
+            cudaFree(batch_gate[expert]);
+            cudaFree(batch_up[expert]);
+            cudaFree(batch_down[expert]);
         }
     } else {
         std::puts("timing skipped; pass --bench only on an uncontended glm-box run");

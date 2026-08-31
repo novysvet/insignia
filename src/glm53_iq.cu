@@ -531,67 +531,6 @@ void iq3_xxs_wim32_rows_kernel(
     }
 }
 
-template <int BLOCKS, int WARPS_PER_MATRIX>
-__global__ __launch_bounds__(WARPS_PER_MATRIX * 64, 8 / WARPS_PER_MATRIX)
-void iq3_xxs_wim64_pair_x1_kernel(
-    const uint8_t *__restrict__ gate_weights,
-    const uint8_t *__restrict__ up_weights,
-    const uint32_t *__restrict__ xq,
-    const float *__restrict__ xscale,
-    float *__restrict__ gate_y,
-    float *__restrict__ up_y,
-    int y_id) {
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int matrix = warp / WARPS_PER_MATRIX;
-    const int matrix_warp = warp - matrix * WARPS_PER_MATRIX;
-    const int cohort = lane >> 3;
-    const int row = blockIdx.x * WARPS_PER_MATRIX + matrix_warp;
-    constexpr int row_bytes = BLOCKS * kIQ3XXSBlockBytes;
-    const uint8_t *matrix_weights = matrix ? up_weights : gate_weights;
-    const uint8_t *row_weights =
-        matrix_weights + static_cast<size_t>(row) * row_bytes;
-    const auto *scales = reinterpret_cast<const __half *>(row_weights);
-    float sum = 0.0f;
-#pragma unroll
-    for (int wave = 0; wave < BLOCKS / 4; ++wave) {
-        const int block_id = 4 * wave + cohort;
-        const uint8_t *wave_words =
-            row_weights + 2 * BLOCKS + 384 * wave + 8 * lane;
-        const unsigned long long packed_indices = __ldcs(
-            reinterpret_cast<const unsigned long long *>(wave_words));
-        const uint32_t indices0 = uint32_t(packed_indices);
-        const uint32_t indices1 = uint32_t(packed_indices >> 32);
-        const uint32_t aux = __ldcs(
-            reinterpret_cast<const uint32_t *>(
-                row_weights + 2 * BLOCKS + 384 * wave + 256 + 4 * lane));
-        uint32_t decoded[8];
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
-            decode_iq3_pair(pair_indices, aux, pair,
-                            decoded[2 * pair + 0], decoded[2 * pair + 1]);
-        }
-        const int activation_group = 32 * wave + lane;
-        const uint32_t *activation = xq + activation_group * 8;
-        int dot = 0;
-#pragma unroll
-        for (int word = 0; word < 8; ++word)
-            dot = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot);
-        const float weight_scale = __half2float(scales[block_id]) *
-                                   (0.25f + 0.5f * float(aux >> 28));
-        sum = fmaf(float(dot), weight_scale * xscale[activation_group], sum);
-    }
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    if (!lane) {
-        float *output = matrix ? up_y : gate_y;
-        output[static_cast<size_t>(y_id) * gridDim.x * WARPS_PER_MATRIX + row] =
-            sum;
-    }
-}
-
 template <int R, int BLOCKS, bool ACCUMULATE>
 __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     const IQ4XSBlock *__restrict__ weights,
@@ -1219,18 +1158,6 @@ cudaError_t launch_iq3_wim32(const uint8_t *gate_weights,
     return cudaPeekAtLastError();
 }
 
-template <int BLOCKS, int WARPS_PER_MATRIX = 2>
-cudaError_t launch_iq3_wim64_pair_x1(
-    const uint8_t *gate_weights, const uint8_t *up_weights,
-    const uint32_t *xq, const float *xscale,
-    float *gate_y, float *up_y, int y_id, int rows, cudaStream_t stream) {
-    constexpr int threads = 2 * WARPS_PER_MATRIX * 32;
-    iq3_xxs_wim64_pair_x1_kernel<BLOCKS, WARPS_PER_MATRIX>
-        <<<rows / WARPS_PER_MATRIX, threads, 0, stream>>>(
-            gate_weights, up_weights, xq, xscale, gate_y, up_y, y_id);
-    return cudaPeekAtLastError();
-}
-
 template <int R, int BLOCKS, bool ACCUMULATE>
 cudaError_t launch_iq4(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
@@ -1649,50 +1576,6 @@ cudaError_t iq3_xxs_gemv2_wim32_rows(
         return cudaErrorInvalidValue;
     return dispatch_iq3_wim32<true>(gate_weights, up_weights, workspace, count,
                                     gate_y, up_y, y_ids, rows, cols, stream);
-}
-
-void iq3_xxs_repack_wim64_cpu(const uint8_t *source, uint8_t *destination,
-                              int rows, int cols) {
-    const int blocks = cols / kIQBlockWeights;
-    const size_t row_bytes = static_cast<size_t>(blocks) * kIQ3XXSBlockBytes;
-    for (int row = 0; row < rows; ++row) {
-        const auto *input = reinterpret_cast<const IQ3XXSBlock *>(
-            source + static_cast<size_t>(row) * row_bytes);
-        uint8_t *output = destination + static_cast<size_t>(row) * row_bytes;
-        for (int block = 0; block < blocks; ++block)
-            std::memcpy(output + 2 * block, &input[block].d, 2);
-        for (int wave = 0; wave < blocks / 4; ++wave) {
-            uint8_t *wave_output = output + 2 * blocks + 384 * wave;
-            for (int cohort = 0; cohort < 4; ++cohort) {
-                const IQ3XXSBlock &block = input[4 * wave + cohort];
-                for (int subgroup = 0; subgroup < 8; ++subgroup) {
-                    const int lane = 8 * cohort + subgroup;
-                    std::memcpy(wave_output + 8 * lane,
-                                block.qs + 8 * subgroup, 8);
-                    std::memcpy(wave_output + 256 + 4 * lane,
-                                block.qs + 64 + 4 * subgroup, 4);
-                }
-            }
-        }
-    }
-}
-
-cudaError_t iq3_xxs_gemv2_wim64_x1(
-    const uint8_t *gate_weights, const uint8_t *up_weights,
-    const void *workspace, float *gate_y, float *up_y, int y_id,
-    int rows, int cols, cudaStream_t stream) {
-    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
-        y_id < 0 || !valid_geometry(rows, cols, 1))
-        return cudaErrorInvalidValue;
-    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
-    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
-    const auto *xscale = reinterpret_cast<const float *>(
-        reinterpret_cast<const uint8_t *>(workspace) + aligned);
-    return cols == 4096
-        ? launch_iq3_wim64_pair_x1<16>(gate_weights, up_weights, xq, xscale,
-                                       gate_y, up_y, y_id, rows, stream)
-        : launch_iq3_wim64_pair_x1<8>(gate_weights, up_weights, xq, xscale,
-                                      gate_y, up_y, y_id, rows, stream);
 }
 
 cudaError_t iq4_xs_gemv_rows(

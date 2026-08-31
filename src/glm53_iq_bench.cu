@@ -189,7 +189,6 @@ int main(int argc, char **argv) {
     const std::vector<uint8_t> up_weights = read_slice(path, up_offset, iq3_bytes);
     std::vector<uint8_t> gate_repacked(iq3_bytes), up_repacked(iq3_bytes);
     std::vector<uint8_t> gate_wim32(iq3_bytes), up_wim32(iq3_bytes);
-    std::vector<uint8_t> gate_wim64(iq3_bytes), up_wim64(iq3_bytes);
     insignia::glm53::iq3_xxs_repack_cpu(gate.weights.data(), gate_repacked.data(),
                                          gate_rows, gate_cols);
     insignia::glm53::iq3_xxs_repack_cpu(up_weights.data(), up_repacked.data(),
@@ -198,10 +197,6 @@ int main(int argc, char **argv) {
         gate.weights.data(), gate_wim32.data(), gate_rows, gate_cols);
     insignia::glm53::iq3_xxs_repack_wim32_cpu(
         up_weights.data(), up_wim32.data(), gate_rows, gate_cols);
-    insignia::glm53::iq3_xxs_repack_wim64_cpu(
-        gate.weights.data(), gate_wim64.data(), gate_rows, gate_cols);
-    insignia::glm53::iq3_xxs_repack_wim64_cpu(
-        up_weights.data(), up_wim64.data(), gate_rows, gate_cols);
     MatrixFixture down{"IQ4_XS down", down_rows, down_cols,
                        insignia::glm53::kIQ4XSBlockBytes, iq4_bytes,
                        read_slice(path, down_offset, iq4_bytes)};
@@ -263,8 +258,6 @@ int main(int argc, char **argv) {
     auto *up_repacked_device = device_copy(up_repacked);
     auto *gate_wim32_device = device_copy(gate_wim32);
     auto *up_wim32_device = device_copy(up_wim32);
-    auto *gate_wim64_device = device_copy(gate_wim64);
-    auto *up_wim64_device = device_copy(up_wim64);
     auto *up_output_device = device_alloc<float>(size_t(kTokens) * gate_rows);
     auto *gate_prefill_device = device_copy(gate_prefill);
     auto *down_prefill_device = device_copy(down_prefill);
@@ -377,36 +370,6 @@ int main(int argc, char **argv) {
                       pair_up_metrics.cosine < 0.99980;
         }
     }
-
-    check(insignia::glm53::iq_quantize_activation_rows(
-              gate.x_device, gate.cols, row_ids, 1, gate.workspace),
-          "prepare WIM64 paired IQ3 correctness");
-    check(insignia::glm53::iq3_xxs_gemv2_wim64_x1(
-              gate_wim64_device, up_wim64_device, gate.workspace,
-              gate.output_device, up_output_device, out_ids[0],
-              gate.rows, gate.cols),
-          "WIM64 paired IQ3 correctness");
-    check(cudaDeviceSynchronize(), "WIM64 paired IQ3 synchronize");
-    std::vector<float> wim64_gate(size_t(kTokens) * gate.rows);
-    std::vector<float> wim64_up(size_t(kTokens) * gate.rows);
-    check(cudaMemcpy(wim64_gate.data(), gate.output_device,
-                     wim64_gate.size() * sizeof(float), cudaMemcpyDeviceToHost),
-          "copy WIM64 paired IQ3 gate");
-    check(cudaMemcpy(wim64_up.data(), up_output_device,
-                     wim64_up.size() * sizeof(float), cudaMemcpyDeviceToHost),
-          "copy WIM64 paired IQ3 up");
-    const Metrics wim64_gate_metrics = compare(
-        gather(wim64_gate, out_ids, 1, gate.rows),
-        select_reference(gate.reference, row_ids, 1, gate.rows));
-    const Metrics wim64_up_metrics = compare(
-        gather(wim64_up, out_ids, 1, gate.rows),
-        select_reference(up_reference, row_ids, 1, gate.rows));
-    print_metrics("IQ3 pair wim64 gate", wim64_gate_metrics);
-    print_metrics("IQ3 pair wim64 up", wim64_up_metrics);
-    failed |= wim64_gate_metrics.relative > 2.0e-2 ||
-              wim64_gate_metrics.cosine < 0.99980 ||
-              wim64_up_metrics.relative > 2.0e-2 ||
-              wim64_up_metrics.cosine < 0.99980;
 
     check(insignia::glm53::iq3_xxs_gemm_prefill32(
               gate.weights_device, gate_prefill_device, kPrefillTokens,
@@ -576,28 +539,16 @@ int main(int argc, char **argv) {
                       1, gate.output_device, up_output_device, out_ids,
                       gate.rows, gate.cols), "timed x1 paired WIM32 IQ3 gate/up");
         };
-        const auto launch_gate_up_pair_wim64_x1 = [&] {
-            check(insignia::glm53::iq3_xxs_gemv2_wim64_x1(
-                      gate_wim64_device, up_wim64_device, gate.workspace,
-                      gate.output_device, up_output_device, out_ids[0],
-                      gate.rows, gate.cols),
-                  "timed x1 paired WIM64 IQ3 gate/up");
-        };
         const float gate_up_x1_us = benchmark_us(launch_gate_up_x1);
         const float gate_up_pair_x1_us = benchmark_us(launch_gate_up_pair_x1);
         const float gate_up_pair_wim32_x1_us =
             benchmark_us(launch_gate_up_pair_wim32_x1);
-        const float gate_up_pair_wim64_x1_us =
-            benchmark_us(launch_gate_up_pair_wim64_x1);
         std::printf("IQ3 gate+up x1 sequential/pair repacked %8.3f/%8.3f us %.3fx\n",
                     gate_up_x1_us, gate_up_pair_x1_us,
                     gate_up_x1_us / gate_up_pair_x1_us);
-        std::printf("IQ3 gate+up x1 pair repacked/WIM32/WIM64 "
-                    "%8.3f/%8.3f/%8.3f us %.3fx/%.3fx\n",
+        std::printf("IQ3 gate+up x1 pair repacked/WIM32 %8.3f/%8.3f us %.3fx\n",
                     gate_up_pair_x1_us, gate_up_pair_wim32_x1_us,
-                    gate_up_pair_wim64_x1_us,
-                    gate_up_pair_x1_us / gate_up_pair_wim32_x1_us,
-                    gate_up_pair_x1_us / gate_up_pair_wim64_x1_us);
+                    gate_up_pair_x1_us / gate_up_pair_wim32_x1_us);
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "restore x8 gate benchmark workspace");
@@ -667,7 +618,7 @@ int main(int argc, char **argv) {
                                  cudaMemcpyDeviceToHost),
                       "copy resident expert baseline");
 
-                const auto launch_optimized_pipeline_wim32 = [&] {
+                const auto launch_optimized_pipeline = [&] {
                     check(insignia::glm53::iq_quantize_activation_rows(
                               gate.x_device, gate.cols, row_ids, 1,
                               gate.workspace),
@@ -683,24 +634,7 @@ int main(int argc, char **argv) {
                               out_ids[0], down.rows, down.cols, 32),
                           "timed optimized resident fused down");
                 };
-                const auto launch_optimized_pipeline_wim64 = [&] {
-                    check(insignia::glm53::iq_quantize_activation_rows(
-                              gate.x_device, gate.cols, row_ids, 1,
-                              gate.workspace),
-                          "timed WIM64 resident hidden quantize");
-                    check(insignia::glm53::iq3_xxs_gemv2_wim64_x1(
-                              gate_wim64_device, up_wim64_device,
-                              gate.workspace, gate.output_device,
-                              up_output_device, out_ids[0], gate.rows,
-                              gate.cols),
-                          "timed optimized resident WIM64 pair");
-                    check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
-                              down.weights_device, gate.output_device,
-                              up_output_device, out_ids[0], down.output_device,
-                              out_ids[0], down.rows, down.cols, 32),
-                          "timed WIM64 resident fused down");
-                };
-                launch_optimized_pipeline_wim32();
+                launch_optimized_pipeline();
                 check(cudaDeviceSynchronize(),
                       "optimized resident expert synchronize");
                 std::vector<float> resident_optimized(
@@ -716,31 +650,12 @@ int main(int argc, char **argv) {
                               resident_metrics);
                 failed |= resident_metrics.maximum != 0.0;
 
-                launch_optimized_pipeline_wim64();
-                check(cudaDeviceSynchronize(),
-                      "WIM64 resident expert synchronize");
-                check(cudaMemcpy(resident_optimized.data(),
-                                 down.output_device,
-                                 resident_optimized.size() * sizeof(float),
-                                 cudaMemcpyDeviceToHost),
-                      "copy WIM64 resident expert");
-                const Metrics resident_wim64_metrics = compare(
-                    gather(resident_optimized, out_ids, 1, down.rows),
-                    gather(resident_baseline, out_ids, 1, down.rows));
-                print_metrics("IQ3/IQ4 WIM64 resident x1",
-                              resident_wim64_metrics);
-                failed |= resident_wim64_metrics.maximum != 0.0;
-
-                const float optimized_wim32_us =
-                    benchmark_us(launch_optimized_pipeline_wim32);
-                const float optimized_wim64_us =
-                    benchmark_us(launch_optimized_pipeline_wim64);
-                std::printf("IQ3/IQ4 resident expert x1 old/WIM32/WIM64 "
-                            "%8.3f/%8.3f/%8.3f us %.3fx/%.3fx\n",
-                            pipeline_us, optimized_wim32_us,
-                            optimized_wim64_us,
-                            pipeline_us / optimized_wim32_us,
-                            pipeline_us / optimized_wim64_us);
+                const float optimized_pipeline_us =
+                    benchmark_us(launch_optimized_pipeline);
+                std::printf("IQ3/IQ4 resident expert x1 old/optimized "
+                            "%8.3f/%8.3f us %.3fx\n",
+                            pipeline_us, optimized_pipeline_us,
+                            pipeline_us / optimized_pipeline_us);
             }
         }
 
@@ -970,7 +885,6 @@ int main(int argc, char **argv) {
     cudaFree(up_device); cudaFree(up_output_device);
     cudaFree(gate_repacked_device); cudaFree(up_repacked_device);
     cudaFree(gate_wim32_device); cudaFree(up_wim32_device);
-    cudaFree(gate_wim64_device); cudaFree(up_wim64_device);
     cudaFree(gate_prefill_device); cudaFree(down_prefill_device);
     cudaFree(gate_prefill_output_device); cudaFree(down_prefill_output_device);
     return failed ? 3 : 0;

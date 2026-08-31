@@ -1,0 +1,312 @@
+#include "insignia_glm53_iq.cuh"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr int kTokens = insignia::glm53::kIQMaxRows;
+
+[[noreturn]] void die(const char *message) {
+    std::fprintf(stderr, "%s\n", message);
+    std::exit(1);
+}
+
+void check(cudaError_t status, const char *what) {
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(status));
+        std::exit(2);
+    }
+}
+
+std::vector<uint8_t> read_slice(const char *path, uint64_t offset, size_t bytes) {
+    std::FILE *file = std::fopen(path, "rb");
+    if (!file) die("cannot open GGUF shard");
+    if (fseeko(file, static_cast<off_t>(offset), SEEK_SET))
+        die("cannot seek to GGUF tensor");
+    std::vector<uint8_t> result(bytes);
+    if (std::fread(result.data(), 1, bytes, file) != bytes)
+        die("short GGUF tensor read");
+    std::fclose(file);
+    return result;
+}
+
+template <typename T>
+T *device_copy(const std::vector<T> &source) {
+    T *device = nullptr;
+    check(cudaMalloc(&device, source.size() * sizeof(T)), "cudaMalloc");
+    check(cudaMemcpy(device, source.data(), source.size() * sizeof(T),
+                     cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+    return device;
+}
+
+template <typename T>
+T *device_alloc(size_t count) {
+    T *device = nullptr;
+    check(cudaMalloc(&device, count * sizeof(T)), "cudaMalloc");
+    return device;
+}
+
+using Decoder = void (*)(const uint8_t *, float *, int);
+
+std::vector<float> cpu_reference(const std::vector<uint8_t> &weights,
+                                 int rows, int cols, int block_bytes,
+                                 Decoder decoder,
+                                 const std::vector<float> &activations) {
+    const size_t row_bytes = size_t(cols / insignia::glm53::kIQBlockWeights) *
+                             block_bytes;
+    std::vector<float> output(size_t(kTokens) * rows);
+    std::vector<float> dequantized(cols);
+    for (int row = 0; row < rows; ++row) {
+        decoder(weights.data() + size_t(row) * row_bytes,
+                dequantized.data(), cols);
+        for (int token = 0; token < kTokens; ++token) {
+            double sum = 0.0;
+            const float *x = activations.data() + size_t(token) * cols;
+            for (int col = 0; col < cols; ++col)
+                sum += double(dequantized[col]) * x[col];
+            output[size_t(token) * rows + row] = float(sum);
+        }
+    }
+    return output;
+}
+
+struct Metrics {
+    double mse;
+    double relative;
+    double cosine;
+    double maximum;
+};
+
+Metrics compare(const std::vector<float> &actual,
+                const std::vector<float> &reference) {
+    if (actual.size() != reference.size()) die("metric vector length mismatch");
+    double error2 = 0.0, actual2 = 0.0, reference2 = 0.0, dot = 0.0;
+    double maximum = 0.0;
+    for (size_t index = 0; index < actual.size(); ++index) {
+        const double a = actual[index];
+        const double r = reference[index];
+        const double error = a - r;
+        error2 += error * error;
+        actual2 += a * a;
+        reference2 += r * r;
+        dot += a * r;
+        maximum = std::max(maximum, std::abs(error));
+    }
+    return {error2 / actual.size(), std::sqrt(error2 / reference2),
+            dot / std::sqrt(actual2 * reference2), maximum};
+}
+
+void print_metrics(const char *name, const Metrics &metrics) {
+    std::printf("%-22s mse %.7g rel %.7g cos %.10f max %.7g\n", name,
+                metrics.mse, metrics.relative, metrics.cosine, metrics.maximum);
+}
+
+std::vector<float> gather(const std::vector<float> &storage,
+                          const int *ids, int count, int rows) {
+    std::vector<float> result(size_t(count) * rows);
+    for (int token = 0; token < count; ++token)
+        std::copy_n(storage.data() + size_t(ids[token]) * rows, rows,
+                    result.data() + size_t(token) * rows);
+    return result;
+}
+
+std::vector<float> select_reference(const std::vector<float> &reference,
+                                    const int *ids, int count, int rows) {
+    return gather(reference, ids, count, rows);
+}
+
+template <typename Launch>
+float benchmark_us(Launch launch, int warmup = 200, int iterations = 2000) {
+    cudaEvent_t begin, end;
+    check(cudaEventCreate(&begin), "cudaEventCreate begin");
+    check(cudaEventCreate(&end), "cudaEventCreate end");
+    for (int i = 0; i < warmup; ++i) launch();
+    check(cudaDeviceSynchronize(), "benchmark warmup");
+    check(cudaEventRecord(begin), "cudaEventRecord begin");
+    for (int i = 0; i < iterations; ++i) launch();
+    check(cudaEventRecord(end), "cudaEventRecord end");
+    check(cudaEventSynchronize(end), "cudaEventSynchronize");
+    float elapsed_ms = 0.0f;
+    check(cudaEventElapsedTime(&elapsed_ms, begin, end), "cudaEventElapsedTime");
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    return elapsed_ms * 1000.0f / iterations;
+}
+
+struct MatrixFixture {
+    const char *name;
+    int rows;
+    int cols;
+    int block_bytes;
+    size_t expert_bytes;
+    std::vector<uint8_t> weights;
+    std::vector<float> activations;
+    std::vector<float> reference;
+    uint8_t *weights_device{};
+    float *x_device{};
+    float *output_device{};
+    void *workspace{};
+};
+
+}  // namespace
+
+int main(int argc, char **argv) {
+    if (argc < 5) {
+        std::fprintf(stderr,
+            "usage: %s SHARD.gguf IQ3_GATE_OFFSET IQ3_UP_OFFSET IQ4_DOWN_OFFSET [--bench]\n",
+            argv[0]);
+        return 64;
+    }
+    const char *path = argv[1];
+    const uint64_t gate_offset = std::strtoull(argv[2], nullptr, 0);
+    const uint64_t up_offset = std::strtoull(argv[3], nullptr, 0);
+    const uint64_t down_offset = std::strtoull(argv[4], nullptr, 0);
+    const bool run_benchmark = argc > 5 && std::string(argv[5]) == "--bench";
+    constexpr int gate_rows = 2048, gate_cols = 4096;
+    constexpr int down_rows = 4096, down_cols = 2048;
+    constexpr size_t iq3_bytes = size_t(gate_rows) * (gate_cols / 256) *
+                                 insignia::glm53::kIQ3XXSBlockBytes;
+    constexpr size_t iq4_bytes = size_t(down_rows) * (down_cols / 256) *
+                                 insignia::glm53::kIQ4XSBlockBytes;
+    std::printf("real expert slices: IQ3_XXS %.4f MiB, IQ4_XS %.4f MiB\n",
+                double(iq3_bytes) / (1024.0 * 1024.0),
+                double(iq4_bytes) / (1024.0 * 1024.0));
+
+    MatrixFixture gate{"IQ3_XXS gate", gate_rows, gate_cols,
+                       insignia::glm53::kIQ3XXSBlockBytes, iq3_bytes,
+                       read_slice(path, gate_offset, iq3_bytes)};
+    const std::vector<uint8_t> up_weights = read_slice(path, up_offset, iq3_bytes);
+    MatrixFixture down{"IQ4_XS down", down_rows, down_cols,
+                       insignia::glm53::kIQ4XSBlockBytes, iq4_bytes,
+                       read_slice(path, down_offset, iq4_bytes)};
+
+    std::mt19937 rng(0x40703u);
+    std::normal_distribution<float> normal(0.0f, 0.19f);
+    for (MatrixFixture *fixture : {&gate, &down}) {
+        fixture->activations.resize(size_t(kTokens) * fixture->cols);
+        for (int token = 0; token < kTokens; ++token) {
+            for (int col = 0; col < fixture->cols; ++col) {
+                float value = normal(rng);
+                if ((col + token * 137) % 521 == 0) value *= 9.0f;
+                fixture->activations[size_t(token) * fixture->cols + col] = value;
+            }
+        }
+    }
+    gate.reference = cpu_reference(gate.weights, gate.rows, gate.cols,
+                                   gate.block_bytes,
+                                   insignia::glm53::iq3_xxs_dequantize_row_cpu,
+                                   gate.activations);
+    down.reference = cpu_reference(down.weights, down.rows, down.cols,
+                                   down.block_bytes,
+                                   insignia::glm53::iq4_xs_dequantize_row_cpu,
+                                   down.activations);
+
+    for (MatrixFixture *fixture : {&gate, &down}) {
+        fixture->weights_device = device_copy(fixture->weights);
+        fixture->x_device = device_copy(fixture->activations);
+        fixture->output_device = device_alloc<float>(size_t(kTokens) * fixture->rows);
+        check(cudaMalloc(&fixture->workspace,
+                         insignia::glm53::iq_workspace_rows_bytes(
+                             fixture->cols, kTokens)),
+              "cudaMalloc IQ workspace");
+    }
+    auto *up_device = device_copy(up_weights);
+    auto *up_output_device = device_alloc<float>(size_t(kTokens) * gate_rows);
+    const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
+    const int out_ids[kTokens] = {3, 7, 1, 6, 0, 5, 2, 4};
+    bool failed = false;
+
+    for (MatrixFixture *fixture : {&gate, &down}) {
+        for (int count = 1; count <= kTokens; ++count) {
+            check(cudaMemset(fixture->output_device, 0x7f,
+                             size_t(kTokens) * fixture->rows * sizeof(float)),
+                  "poison IQ output");
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      fixture->x_device, fixture->cols, row_ids, count,
+                      fixture->workspace), "iq_quantize_activation_rows");
+            if (fixture == &gate)
+                check(insignia::glm53::iq3_xxs_gemv_rows(
+                          fixture->weights_device, fixture->workspace, count,
+                          fixture->output_device, out_ids, fixture->rows,
+                          fixture->cols), "iq3_xxs_gemv_rows");
+            else
+                check(insignia::glm53::iq4_xs_gemv_rows(
+                          fixture->weights_device, fixture->workspace, count,
+                          fixture->output_device, out_ids, fixture->rows,
+                          fixture->cols), "iq4_xs_gemv_rows");
+            check(cudaDeviceSynchronize(), "IQ correctness synchronize");
+            std::vector<float> storage(size_t(kTokens) * fixture->rows);
+            check(cudaMemcpy(storage.data(), fixture->output_device,
+                             storage.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                  "copy IQ output");
+            const Metrics metrics = compare(
+                gather(storage, out_ids, count, fixture->rows),
+                select_reference(fixture->reference, row_ids, count, fixture->rows));
+            char label[48];
+            std::snprintf(label, sizeof(label), "%s x%d", fixture->name, count);
+            print_metrics(label, metrics);
+            failed |= metrics.relative > 2.0e-2 || metrics.cosine < 0.99980;
+        }
+    }
+
+    if (run_benchmark) {
+        std::puts("serialized CUDA-event timings (weights resident in VRAM):");
+        check(insignia::glm53::iq_quantize_activation_rows(
+                  gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
+              "prepare gate benchmark");
+        check(insignia::glm53::iq_quantize_activation_rows(
+                  down.x_device, down.cols, row_ids, kTokens, down.workspace),
+              "prepare down benchmark");
+        for (int count : {1, 2, 4, 8}) {
+            const auto launch_gate = [&] {
+                check(insignia::glm53::iq3_xxs_gemv_rows(
+                          gate.weights_device, gate.workspace, count,
+                          gate.output_device, out_ids, gate.rows, gate.cols),
+                      "timed IQ3 gate");
+            };
+            const auto launch_down = [&] {
+                check(insignia::glm53::iq4_xs_gemv_rows(
+                          down.weights_device, down.workspace, count,
+                          down.output_device, out_ids, down.rows, down.cols),
+                      "timed IQ4 down");
+            };
+            const float gate_us = benchmark_us(launch_gate);
+            const float down_us = benchmark_us(launch_down);
+            std::printf("IQ3_XXS x%d %8.3f us %7.1f GB/s | "
+                        "IQ4_XS x%d %8.3f us %7.1f GB/s\n",
+                        count, gate_us, double(iq3_bytes) / (gate_us * 1000.0),
+                        count, down_us, double(iq4_bytes) / (down_us * 1000.0));
+        }
+        const auto launch_gate_up = [&] {
+            check(insignia::glm53::iq3_xxs_gemv_rows(
+                      gate.weights_device, gate.workspace, kTokens,
+                      gate.output_device, out_ids, gate.rows, gate.cols),
+                  "timed IQ3 gate");
+            check(insignia::glm53::iq3_xxs_gemv_rows(
+                      up_device, gate.workspace, kTokens,
+                      up_output_device, out_ids, gate.rows, gate.cols),
+                  "timed IQ3 up");
+        };
+        const float gate_up_us = benchmark_us(launch_gate_up);
+        std::printf("IQ3_XXS gate+up x8 separate %8.3f us %7.1f GB/s\n",
+                    gate_up_us, double(2 * iq3_bytes) / (gate_up_us * 1000.0));
+    } else {
+        std::puts("timing skipped; pass --bench only on an uncontended glm-box run");
+    }
+
+    for (MatrixFixture *fixture : {&gate, &down}) {
+        cudaFree(fixture->weights_device); cudaFree(fixture->x_device);
+        cudaFree(fixture->output_device); cudaFree(fixture->workspace);
+    }
+    cudaFree(up_device); cudaFree(up_output_device);
+    return failed ? 3 : 0;
+}

@@ -58,45 +58,6 @@ __device__ __align__(128) uint32_t kIQ3GridDevice[256] = {
 #include "insignia_iq3xxs_grid.inc"
 };
 
-__device__ __align__(128) uint32_t kIQ3NegativeGridDevice[256];
-
-__global__ void initialize_iq3_negative_grid_kernel() {
-    const int index = threadIdx.x;
-    if (index < 256)
-        kIQ3NegativeGridDevice[index] = __vneg4(kIQ3GridDevice[index]);
-}
-
-__device__ __forceinline__ uint32_t iq3_prmt_sign_bytes(uint32_t carrier) {
-    uint32_t result;
-    asm("prmt.b32 %0, %1, 0, 0xba98;" : "=r"(result) : "r"(carrier));
-    return result;
-}
-
-template <uint32_t Constant, uint32_t Truth>
-__device__ __forceinline__ uint32_t iq3_lop3_constant_first(
-    uint32_t middle, uint32_t last) {
-    uint32_t result;
-    asm("lop3.b32 %0, %1, %2, %3, %4;"
-        : "=r"(result)
-        : "n"(Constant), "r"(middle), "r"(last), "n"(Truth));
-    return result;
-}
-
-__device__ __forceinline__ void iq3_carrier_masks(
-    uint32_t sign7, uint32_t &low, uint32_t &high) {
-    const uint32_t base = sign7 * 0x01020408u;
-    low = iq3_prmt_sign_bytes(base << 4);
-    high = iq3_prmt_sign_bytes(base + __popc(sign7) * 0x80000000u);
-}
-
-__device__ __forceinline__ uint32_t iq3_apply_negative_grid(
-    uint32_t negative_values, uint32_t negative_mask) {
-    const uint32_t middle =
-        iq3_lop3_constant_first<0x04040404u, 0x45u>(negative_mask,
-                                                    negative_values);
-    return iq3_lop3_constant_first<0x07070707u, 0x56u>(negative_mask, middle);
-}
-
 __device__ __forceinline__ uint32_t load_u32_any(const uint8_t *pointer) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
     const auto *aligned = reinterpret_cast<const uint32_t *>(address & ~uintptr_t(3));
@@ -567,98 +528,6 @@ void iq3_xxs_wim32_rows_kernel(
         if (!lane)
             output[static_cast<size_t>(out.ids[r]) *
                        gridDim.x * WARPS_PER_MATRIX + row] = sums[r];
-    }
-}
-
-template <int SIGN_MODE>
-__device__ __forceinline__ void decode_iq3_pair_sign_candidate(
-    uint32_t pair_indices, uint32_t auxiliary, int pair,
-    uint32_t &decoded0, uint32_t &decoded1) {
-    const int shift = 8 * (2 * (pair & 1));
-    const uint32_t code0 = (pair_indices >> shift) & 255u;
-    const uint32_t code1 = (pair_indices >> (shift + 8)) & 255u;
-    const uint32_t sign7 = (auxiliary >> (7 * pair)) & 127u;
-    uint32_t low_mask, high_mask;
-    iq3_carrier_masks(sign7, low_mask, high_mask);
-    if constexpr (SIGN_MODE == 1) {
-        const uint32_t grid0 = __ldg(kIQ3GridDevice + code0);
-        const uint32_t grid1 = __ldg(kIQ3GridDevice + code1);
-        decoded0 = __vsub4(grid0 ^ low_mask, low_mask);
-        decoded1 = __vsub4(grid1 ^ high_mask, high_mask);
-    } else if constexpr (SIGN_MODE == 2) {
-        const uint32_t grid0 = __ldg(kIQ3GridDevice + code0);
-        const uint32_t grid1 = __ldg(kIQ3GridDevice + code1);
-        const uint32_t negative0 = __vneg4(grid0);
-        const uint32_t negative1 = __vneg4(grid1);
-        decoded0 = (grid0 & ~low_mask) | (negative0 & low_mask);
-        decoded1 = (grid1 & ~high_mask) | (negative1 & high_mask);
-    } else {
-        const uint32_t grid0 = __ldg(kIQ3NegativeGridDevice + code0);
-        const uint32_t grid1 = __ldg(kIQ3NegativeGridDevice + code1);
-        decoded0 = iq3_apply_negative_grid(grid0, low_mask);
-        decoded1 = iq3_apply_negative_grid(grid1, high_mask);
-    }
-}
-
-template <int SIGN_MODE>
-__global__ __launch_bounds__(128, 4) void iq3_xxs_wim32_sign_pair_x1_kernel(
-    const uint8_t *__restrict__ gate_weights,
-    const uint8_t *__restrict__ up_weights,
-    const uint32_t *__restrict__ xq,
-    const float *__restrict__ xscale,
-    float *__restrict__ gate_y,
-    float *__restrict__ up_y,
-    int y_id) {
-    constexpr int kBlocks = 16;
-    constexpr int kWarpsPerMatrix = 2;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int matrix = warp / kWarpsPerMatrix;
-    const int matrix_warp = warp - matrix * kWarpsPerMatrix;
-    const int cohort = lane >> 3;
-    const int row = blockIdx.x * kWarpsPerMatrix + matrix_warp;
-    constexpr int row_bytes = kBlocks * kIQ3XXSBlockBytes;
-    const uint8_t *matrix_weights = matrix ? up_weights : gate_weights;
-    const uint8_t *row_weights =
-        matrix_weights + static_cast<size_t>(row) * row_bytes;
-    const auto *scales = reinterpret_cast<const __half *>(row_weights);
-    float sum = 0.0f;
-#pragma unroll
-    for (int wave = 0; wave < kBlocks / 4; ++wave) {
-        const int block_id = 4 * wave + cohort;
-        const uint8_t *wave_words =
-            row_weights + 2 * kBlocks + 384 * wave + 4 * lane;
-        const uint32_t indices0 =
-            __ldcs(reinterpret_cast<const uint32_t *>(wave_words));
-        const uint32_t indices1 =
-            __ldcs(reinterpret_cast<const uint32_t *>(wave_words + 128));
-        const uint32_t aux =
-            __ldcs(reinterpret_cast<const uint32_t *>(wave_words + 256));
-        uint32_t decoded[8];
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
-            decode_iq3_pair_sign_candidate<SIGN_MODE>(
-                pair_indices, aux, pair,
-                decoded[2 * pair + 0], decoded[2 * pair + 1]);
-        }
-        const int activation_group = 32 * wave + lane;
-        const uint32_t *activation = xq + activation_group * 8;
-        int dot = 0;
-#pragma unroll
-        for (int word = 0; word < 8; ++word)
-            dot = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot);
-        const float weight_scale = __half2float(scales[block_id]) *
-                                   (0.25f + 0.5f * float(aux >> 28));
-        sum = fmaf(float(dot), weight_scale * xscale[activation_group], sum);
-    }
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    if (!lane) {
-        float *output = matrix ? up_y : gate_y;
-        output[static_cast<size_t>(y_id) * gridDim.x * kWarpsPerMatrix + row] =
-            sum;
     }
 }
 
@@ -1707,45 +1576,6 @@ cudaError_t iq3_xxs_gemv2_wim32_rows(
         return cudaErrorInvalidValue;
     return dispatch_iq3_wim32<true>(gate_weights, up_weights, workspace, count,
                                     gate_y, up_y, y_ids, rows, cols, stream);
-}
-
-cudaError_t iq3_xxs_prepare_sign_candidates(cudaStream_t stream) {
-    initialize_iq3_negative_grid_kernel<<<1, 256, 0, stream>>>();
-    return cudaPeekAtLastError();
-}
-
-cudaError_t iq3_xxs_gemv2_wim32_sign_x1(
-    const uint8_t *gate_weights, const uint8_t *up_weights,
-    const void *workspace, float *gate_y, float *up_y, int y_id,
-    int rows, int cols, int sign_mode, cudaStream_t stream) {
-    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
-        y_id < 0 || rows <= 0 || (rows & 1) || cols != 4096 ||
-        sign_mode < 1 || sign_mode > 3)
-        return cudaErrorInvalidValue;
-    constexpr size_t aligned = 4096;
-    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
-    const auto *xscale = reinterpret_cast<const float *>(
-        reinterpret_cast<const uint8_t *>(workspace) + aligned);
-    const dim3 grid(rows / 2);
-    const dim3 block(128);
-    switch (sign_mode) {
-        case 1:
-            iq3_xxs_wim32_sign_pair_x1_kernel<1>
-                <<<grid, block, 0, stream>>>(gate_weights, up_weights, xq,
-                                              xscale, gate_y, up_y, y_id);
-            break;
-        case 2:
-            iq3_xxs_wim32_sign_pair_x1_kernel<2>
-                <<<grid, block, 0, stream>>>(gate_weights, up_weights, xq,
-                                              xscale, gate_y, up_y, y_id);
-            break;
-        default:
-            iq3_xxs_wim32_sign_pair_x1_kernel<3>
-                <<<grid, block, 0, stream>>>(gate_weights, up_weights, xq,
-                                              xscale, gate_y, up_y, y_id);
-            break;
-    }
-    return cudaPeekAtLastError();
 }
 
 cudaError_t iq4_xs_gemv_rows(

@@ -188,10 +188,15 @@ int main(int argc, char **argv) {
                        read_slice(path, gate_offset, iq3_bytes)};
     const std::vector<uint8_t> up_weights = read_slice(path, up_offset, iq3_bytes);
     std::vector<uint8_t> gate_repacked(iq3_bytes), up_repacked(iq3_bytes);
+    std::vector<uint8_t> gate_wim32(iq3_bytes), up_wim32(iq3_bytes);
     insignia::glm53::iq3_xxs_repack_cpu(gate.weights.data(), gate_repacked.data(),
                                          gate_rows, gate_cols);
     insignia::glm53::iq3_xxs_repack_cpu(up_weights.data(), up_repacked.data(),
                                          gate_rows, gate_cols);
+    insignia::glm53::iq3_xxs_repack_wim32_cpu(
+        gate.weights.data(), gate_wim32.data(), gate_rows, gate_cols);
+    insignia::glm53::iq3_xxs_repack_wim32_cpu(
+        up_weights.data(), up_wim32.data(), gate_rows, gate_cols);
     MatrixFixture down{"IQ4_XS down", down_rows, down_cols,
                        insignia::glm53::kIQ4XSBlockBytes, iq4_bytes,
                        read_slice(path, down_offset, iq4_bytes)};
@@ -251,6 +256,8 @@ int main(int argc, char **argv) {
     auto *up_device = device_copy(up_weights);
     auto *gate_repacked_device = device_copy(gate_repacked);
     auto *up_repacked_device = device_copy(up_repacked);
+    auto *gate_wim32_device = device_copy(gate_wim32);
+    auto *up_wim32_device = device_copy(up_wim32);
     auto *up_output_device = device_alloc<float>(size_t(kTokens) * gate_rows);
     auto *gate_prefill_device = device_copy(gate_prefill);
     auto *down_prefill_device = device_copy(down_prefill);
@@ -317,8 +324,13 @@ int main(int argc, char **argv) {
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, count, gate.workspace),
               "prepare paired IQ3 correctness");
-        for (int repacked = 0; repacked < 2; ++repacked) {
-            check(repacked
+        for (int layout = 0; layout < 3; ++layout) {
+            check(layout == 2
+                      ? insignia::glm53::iq3_xxs_gemv2_wim32_rows(
+                            gate_wim32_device, up_wim32_device,
+                            gate.workspace, count, gate.output_device,
+                            up_output_device, out_ids, gate.rows, gate.cols)
+                      : layout == 1
                       ? insignia::glm53::iq3_xxs_gemv2_repacked_rows(
                             gate_repacked_device, up_repacked_device,
                             gate.workspace, count, gate.output_device,
@@ -345,9 +357,11 @@ int main(int argc, char **argv) {
                 select_reference(up_reference, row_ids, count, gate.rows));
             char gate_label[64], up_label[64];
             std::snprintf(gate_label, sizeof(gate_label),
-                          "IQ3 pair%s gate x%d", repacked ? " rep" : "", count);
+                          "IQ3 pair%s gate x%d",
+                          layout == 2 ? " wim" : layout == 1 ? " rep" : "", count);
             std::snprintf(up_label, sizeof(up_label),
-                          "IQ3 pair%s up x%d", repacked ? " rep" : "", count);
+                          "IQ3 pair%s up x%d",
+                          layout == 2 ? " wim" : layout == 1 ? " rep" : "", count);
             print_metrics(gate_label, pair_gate_metrics);
             print_metrics(up_label, pair_up_metrics);
             failed |= pair_gate_metrics.relative > 2.0e-2 ||
@@ -412,12 +426,21 @@ int main(int argc, char **argv) {
                           gate.output_device, out_ids, gate.rows, gate.cols),
                       "timed repacked IQ3 gate");
             };
+            const auto launch_gate_wim32 = [&] {
+                check(insignia::glm53::iq3_xxs_gemv_wim32_rows(
+                          gate_wim32_device, gate.workspace, count,
+                          gate.output_device, out_ids, gate.rows, gate.cols),
+                      "timed WIM32 IQ3 gate");
+            };
             const float gate_us = benchmark_us(launch_gate);
             const float gate_repacked_us = benchmark_us(launch_gate_repacked);
+            const float gate_wim32_us = benchmark_us(launch_gate_wim32);
             const float down_us = benchmark_us(launch_down);
-            std::printf("IQ3 raw/repacked x%d %8.3f/%8.3f us %.3fx | "
+            std::printf("IQ3 raw/repacked/WIM32 x%d %8.3f/%8.3f/%8.3f us "
+                        "%.3fx/%.3fx | "
                         "IQ4_XS x%d %8.3f us %7.1f GB/s\n",
-                        count, gate_us, gate_repacked_us, gate_us / gate_repacked_us,
+                        count, gate_us, gate_repacked_us, gate_wim32_us,
+                        gate_us / gate_repacked_us, gate_us / gate_wim32_us,
                         count, down_us, double(iq4_bytes) / (down_us * 1000.0));
         }
         const auto launch_gate_up = [&] {
@@ -453,11 +476,30 @@ int main(int argc, char **argv) {
                       gate.rows, gate.cols),
                   "timed paired repacked IQ3 gate/up");
         };
+        const auto launch_gate_up_wim32 = [&] {
+            check(insignia::glm53::iq3_xxs_gemv_wim32_rows(
+                      gate_wim32_device, gate.workspace, kTokens,
+                      gate.output_device, out_ids, gate.rows, gate.cols),
+                  "timed WIM32 IQ3 gate");
+            check(insignia::glm53::iq3_xxs_gemv_wim32_rows(
+                      up_wim32_device, gate.workspace, kTokens,
+                      up_output_device, out_ids, gate.rows, gate.cols),
+                  "timed WIM32 IQ3 up");
+        };
+        const auto launch_gate_up_pair_wim32 = [&] {
+            check(insignia::glm53::iq3_xxs_gemv2_wim32_rows(
+                      gate_wim32_device, up_wim32_device, gate.workspace,
+                      kTokens, gate.output_device, up_output_device, out_ids,
+                      gate.rows, gate.cols), "timed paired WIM32 IQ3 gate/up");
+        };
         const float gate_up_us = benchmark_us(launch_gate_up);
         const float gate_up_repacked_us = benchmark_us(launch_gate_up_repacked);
         const float gate_up_pair_us = benchmark_us(launch_gate_up_pair);
         const float gate_up_pair_repacked_us =
             benchmark_us(launch_gate_up_pair_repacked);
+        const float gate_up_wim32_us = benchmark_us(launch_gate_up_wim32);
+        const float gate_up_pair_wim32_us =
+            benchmark_us(launch_gate_up_pair_wim32);
         std::printf("IQ3 gate+up x8 raw/repacked %8.3f/%8.3f us %.3fx\n",
                     gate_up_us, gate_up_repacked_us,
                     gate_up_us / gate_up_repacked_us);
@@ -466,6 +508,11 @@ int main(int argc, char **argv) {
                     gate_up_us, gate_up_pair_us, gate_up_us / gate_up_pair_us,
                     gate_up_repacked_us, gate_up_pair_repacked_us,
                     gate_up_repacked_us / gate_up_pair_repacked_us);
+        std::printf("IQ3 gate+up x8 sequential/pair WIM32 %8.3f/%8.3f us %.3fx "
+                    "(vs repacked pair %.3fx)\n",
+                    gate_up_wim32_us, gate_up_pair_wim32_us,
+                    gate_up_wim32_us / gate_up_pair_wim32_us,
+                    gate_up_pair_repacked_us / gate_up_pair_wim32_us);
 
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, 1, gate.workspace),
@@ -486,11 +533,22 @@ int main(int argc, char **argv) {
                       1, gate.output_device, up_output_device, out_ids,
                       gate.rows, gate.cols), "timed x1 paired IQ3 gate/up");
         };
+        const auto launch_gate_up_pair_wim32_x1 = [&] {
+            check(insignia::glm53::iq3_xxs_gemv2_wim32_rows(
+                      gate_wim32_device, up_wim32_device, gate.workspace,
+                      1, gate.output_device, up_output_device, out_ids,
+                      gate.rows, gate.cols), "timed x1 paired WIM32 IQ3 gate/up");
+        };
         const float gate_up_x1_us = benchmark_us(launch_gate_up_x1);
         const float gate_up_pair_x1_us = benchmark_us(launch_gate_up_pair_x1);
+        const float gate_up_pair_wim32_x1_us =
+            benchmark_us(launch_gate_up_pair_wim32_x1);
         std::printf("IQ3 gate+up x1 sequential/pair repacked %8.3f/%8.3f us %.3fx\n",
                     gate_up_x1_us, gate_up_pair_x1_us,
                     gate_up_x1_us / gate_up_pair_x1_us);
+        std::printf("IQ3 gate+up x1 pair repacked/WIM32 %8.3f/%8.3f us %.3fx\n",
+                    gate_up_pair_x1_us, gate_up_pair_wim32_x1_us,
+                    gate_up_pair_x1_us / gate_up_pair_wim32_x1_us);
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "restore x8 gate benchmark workspace");
@@ -775,6 +833,7 @@ int main(int argc, char **argv) {
     }
     cudaFree(up_device); cudaFree(up_output_device);
     cudaFree(gate_repacked_device); cudaFree(up_repacked_device);
+    cudaFree(gate_wim32_device); cudaFree(up_wim32_device);
     cudaFree(gate_prefill_device); cudaFree(down_prefill_device);
     cudaFree(gate_prefill_output_device); cudaFree(down_prefill_output_device);
     return failed ? 3 : 0;

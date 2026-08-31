@@ -123,6 +123,37 @@ cudaError_t iq3_xxs_gemv2_repacked_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Byte-neutral wave-interleaved matrix layout (WIM32).  Per four-block wave,
+// the two index words and auxiliary words become three contiguous 128-byte
+// warp fields.  This is a row-local byte permutation and preserves all math.
+void iq3_xxs_repack_wim32_cpu(
+    const uint8_t *source,
+    uint8_t *destination,
+    int rows,
+    int cols);
+
+cudaError_t iq3_xxs_gemv_wim32_rows(
+    const uint8_t *weights,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
+cudaError_t iq3_xxs_gemv2_wim32_rows(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const void *workspace,
+    int count,
+    float *gate_y,
+    float *up_y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // IQ4_XS uses a nonlinear 16-entry nibble codebook and eight signed scales per
 // 256 values.  The same warp/block map is used so exception layers can be
 // dispatched without a generic matrix engine.

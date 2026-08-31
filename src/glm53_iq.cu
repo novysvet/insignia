@@ -191,8 +191,8 @@ __global__ __launch_bounds__(128, 4) void iq_quantize_swiglu_x32_rows_kernel(
     }
 }
 
-template <int R, int BLOCKS, bool REPACKED>
-__global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
+template <int R, int BLOCKS, bool REPACKED, int WARPS>
+__global__ __launch_bounds__(WARPS * 32, 16 / WARPS) void iq3_xxs_rows_kernel(
     const uint8_t *__restrict__ weights,
     const uint32_t *__restrict__ xq,
     const float *__restrict__ xscale,
@@ -203,7 +203,7 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
     const int warp = threadIdx.x >> 5;
     const int cohort = lane >> 3;
     const int subgroup = lane & 7;
-    const int row = blockIdx.x * 8 + warp;
+    const int row = blockIdx.x * WARPS + warp;
     constexpr int row_bytes = BLOCKS * kIQ3XXSBlockBytes;
     const uint8_t *row_weights = weights + static_cast<size_t>(row) * row_bytes;
     float sums[R] = {};
@@ -294,7 +294,7 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
         for (int offset = 16; offset; offset >>= 1)
             sums[r] += __shfl_down_sync(0xffffffffu, sums[r], offset);
         if (!lane)
-            y[static_cast<size_t>(out.ids[r]) * gridDim.x * 8 + row] = sums[r];
+            y[static_cast<size_t>(out.ids[r]) * gridDim.x * WARPS + row] = sums[r];
     }
 }
 
@@ -358,13 +358,13 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     }
 }
 
-template <int R, int BLOCKS, bool REPACKED>
+template <int R, int BLOCKS, bool REPACKED, int WARPS = 8>
 cudaError_t launch_iq3(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
                        IQRowOut out, int rows, cudaStream_t stream) {
-    iq3_xxs_rows_kernel<R, BLOCKS, REPACKED>
-        <<<rows / 8, 256, 0, stream>>>(weights, xq, xscale,
-                                      words_per_row, y, out);
+    iq3_xxs_rows_kernel<R, BLOCKS, REPACKED, WARPS>
+        <<<rows / WARPS, WARPS * 32, 0, stream>>>(weights, xq, xscale,
+                                                  words_per_row, y, out);
     return cudaPeekAtLastError();
 }
 
@@ -381,6 +381,14 @@ cudaError_t launch_iq4(const uint8_t *weights, const uint32_t *xq,
 bool valid_geometry(int rows, int cols, int count) {
     return rows > 0 && (rows & 7) == 0 && (cols == 2048 || cols == 4096) &&
            count > 0 && count <= kIQMaxRows;
+}
+
+bool iq3_narrow_r1_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("INSIGNIA_GLM53_IQ3_R1_WARPS");
+        return value && value[0] == '2';
+    }();
+    return enabled;
 }
 
 template <bool REPACKED>
@@ -401,7 +409,23 @@ cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
             : launch_iq3<R, 8, REPACKED>(                                          \
                   weights, xq, xscale, int(aligned / 4), y, out, rows, stream)
     switch (count) {
-        INSIGNIA_IQ3_CASE(1); INSIGNIA_IQ3_CASE(2);
+        case 1:
+            if (iq3_narrow_r1_enabled())
+                return cols == 4096
+                    ? launch_iq3<1, 16, REPACKED, 2>(
+                          weights, xq, xscale, int(aligned / 4), y, out,
+                          rows, stream)
+                    : launch_iq3<1, 8, REPACKED, 2>(
+                          weights, xq, xscale, int(aligned / 4), y, out,
+                          rows, stream);
+            return cols == 4096
+                ? launch_iq3<1, 16, REPACKED>(
+                      weights, xq, xscale, int(aligned / 4), y, out,
+                      rows, stream)
+                : launch_iq3<1, 8, REPACKED>(
+                      weights, xq, xscale, int(aligned / 4), y, out,
+                      rows, stream);
+        INSIGNIA_IQ3_CASE(2);
         INSIGNIA_IQ3_CASE(3); INSIGNIA_IQ3_CASE(4);
         INSIGNIA_IQ3_CASE(5); INSIGNIA_IQ3_CASE(6);
         INSIGNIA_IQ3_CASE(7); INSIGNIA_IQ3_CASE(8);

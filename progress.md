@@ -1,5 +1,36 @@
 # progress
 
+### 2026-09-01 - Native IQ3/IQ4 decode and tensor-core prefill
+
+`UD-Q3_K_XL` was byte-inventoried before dispatch work. Despite its name,
+51.49% of tensor payload is IQ3_XXS and 35.73% is IQ4_XS; literal Q3_K is only
+1.41% and belongs to the parked MTP gate/up. Live blocks 3--44 normally use
+IQ3_XXS gate/up plus IQ4_XS down. See
+`audits/s13-q3-k-xl-format-research.md`.
+
+Native packed kernels now cover IQ3_XXS and IQ4_XS with Q8-per-32 activation
+DP4A for one through eight rows. A byte-neutral IQ3 row layout separates FP16
+scales, code indices, and sign/scale planes, fixing the 98-byte AoS alignment
+without spending extra SSD/RAM/VRAM bytes. Two-row streaming decode improves
+the aligned median 12.791->11.081 us (1.154x); a two-warp scalar CTA improves
+10.046->8.414 us (1.194x). Real-tensor x1/x8 cosine is 0.999981/0.999979 for
+IQ3 and 0.999972/0.999978 for IQ4.
+
+A format-specific 32-token prefill path expands 16x32 tiles to FP16 shared
+memory and feeds Ada HMMA. IQ3 uses 128 expansion lanes; IQ4 uses 64. Against
+four serialized x8 Q8 launches including activation quantization, seven-run
+medians are 121.681->91.668 us for IQ3 (1.327x) and 119.963->67.711 us for
+IQ4 (1.772x). Prefill is also more accurate: IQ3/IQ4 relative L2 is
+0.0002911/0.0002916 with cosine 0.9999999576/0.9999999575. A shared IQ3 grid
+and a 16 KiB sign-folded grid were measured and deleted after regressions.
+Full evidence is in `audits/s13-q3-kernel-wave.md`.
+
+The production GLM engine is not yet switched: it still expects the NVFP4
+compact-record schema. The Q3-K-XL downloader has final shards 1, 2, and 4 and
+is resuming shard 3. Typed GGUF repacking, Q6_K exception kernels, Q8_0
+shared/dense handling, routed gather/scatter integration, and full-model
+PPL/cosine/throughput gates remain.
+
 ### 2026-08-31 - 4070 Ti SUPER resume, certificate wave, and Q3_K_XL staging
 
 `glm53-dflash2-4070ti-super` was fast-forwarded from `eb83212` to the complete

@@ -212,6 +212,10 @@ int main(int argc, char **argv) {
                                    gate.block_bytes,
                                    insignia::glm53::iq3_xxs_dequantize_row_cpu,
                                    gate.activations, kTokens);
+    const std::vector<float> up_reference = cpu_reference(
+        up_weights, gate.rows, gate.cols, gate.block_bytes,
+        insignia::glm53::iq3_xxs_dequantize_row_cpu,
+        gate.activations, kTokens);
     down.reference = cpu_reference(down.weights, down.rows, down.cols,
                                    down.block_bytes,
                                    insignia::glm53::iq4_xs_dequantize_row_cpu,
@@ -309,6 +313,50 @@ int main(int argc, char **argv) {
     print_metrics("IQ3 repacked x8", repacked_metrics);
     failed |= repacked_metrics.relative > 2.0e-2 || repacked_metrics.cosine < 0.99980;
 
+    for (int count : {1, kTokens}) {
+        check(insignia::glm53::iq_quantize_activation_rows(
+                  gate.x_device, gate.cols, row_ids, count, gate.workspace),
+              "prepare paired IQ3 correctness");
+        for (int repacked = 0; repacked < 2; ++repacked) {
+            check(repacked
+                      ? insignia::glm53::iq3_xxs_gemv2_repacked_rows(
+                            gate_repacked_device, up_repacked_device,
+                            gate.workspace, count, gate.output_device,
+                            up_output_device, out_ids, gate.rows, gate.cols)
+                      : insignia::glm53::iq3_xxs_gemv2_rows(
+                            gate.weights_device, up_device, gate.workspace,
+                            count, gate.output_device, up_output_device,
+                            out_ids, gate.rows, gate.cols),
+                  "paired IQ3 correctness");
+            check(cudaDeviceSynchronize(), "paired IQ3 synchronize");
+            std::vector<float> pair_gate(size_t(kTokens) * gate.rows);
+            std::vector<float> pair_up(size_t(kTokens) * gate.rows);
+            check(cudaMemcpy(pair_gate.data(), gate.output_device,
+                             pair_gate.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost), "copy paired IQ3 gate");
+            check(cudaMemcpy(pair_up.data(), up_output_device,
+                             pair_up.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost), "copy paired IQ3 up");
+            const Metrics pair_gate_metrics = compare(
+                gather(pair_gate, out_ids, count, gate.rows),
+                select_reference(gate.reference, row_ids, count, gate.rows));
+            const Metrics pair_up_metrics = compare(
+                gather(pair_up, out_ids, count, gate.rows),
+                select_reference(up_reference, row_ids, count, gate.rows));
+            char gate_label[64], up_label[64];
+            std::snprintf(gate_label, sizeof(gate_label),
+                          "IQ3 pair%s gate x%d", repacked ? " rep" : "", count);
+            std::snprintf(up_label, sizeof(up_label),
+                          "IQ3 pair%s up x%d", repacked ? " rep" : "", count);
+            print_metrics(gate_label, pair_gate_metrics);
+            print_metrics(up_label, pair_up_metrics);
+            failed |= pair_gate_metrics.relative > 2.0e-2 ||
+                      pair_gate_metrics.cosine < 0.99980 ||
+                      pair_up_metrics.relative > 2.0e-2 ||
+                      pair_up_metrics.cosine < 0.99980;
+        }
+    }
+
     check(insignia::glm53::iq3_xxs_gemm_prefill32(
               gate.weights_device, gate_prefill_device, kPrefillTokens,
               gate_prefill_output_device, gate.rows, gate.cols),
@@ -390,13 +438,62 @@ int main(int argc, char **argv) {
             check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
                       up_repacked_device, gate.workspace, kTokens,
                       up_output_device, out_ids, gate.rows, gate.cols),
-                  "timed repacked IQ3 up");
+                      "timed repacked IQ3 up");
+        };
+        const auto launch_gate_up_pair = [&] {
+            check(insignia::glm53::iq3_xxs_gemv2_rows(
+                      gate.weights_device, up_device, gate.workspace, kTokens,
+                      gate.output_device, up_output_device, out_ids,
+                      gate.rows, gate.cols), "timed paired IQ3 gate/up");
+        };
+        const auto launch_gate_up_pair_repacked = [&] {
+            check(insignia::glm53::iq3_xxs_gemv2_repacked_rows(
+                      gate_repacked_device, up_repacked_device, gate.workspace,
+                      kTokens, gate.output_device, up_output_device, out_ids,
+                      gate.rows, gate.cols),
+                  "timed paired repacked IQ3 gate/up");
         };
         const float gate_up_us = benchmark_us(launch_gate_up);
         const float gate_up_repacked_us = benchmark_us(launch_gate_up_repacked);
+        const float gate_up_pair_us = benchmark_us(launch_gate_up_pair);
+        const float gate_up_pair_repacked_us =
+            benchmark_us(launch_gate_up_pair_repacked);
         std::printf("IQ3 gate+up x8 raw/repacked %8.3f/%8.3f us %.3fx\n",
                     gate_up_us, gate_up_repacked_us,
                     gate_up_us / gate_up_repacked_us);
+        std::printf("IQ3 gate+up x8 sequential/pair raw %8.3f/%8.3f us %.3fx | "
+                    "repacked %8.3f/%8.3f us %.3fx\n",
+                    gate_up_us, gate_up_pair_us, gate_up_us / gate_up_pair_us,
+                    gate_up_repacked_us, gate_up_pair_repacked_us,
+                    gate_up_repacked_us / gate_up_pair_repacked_us);
+
+        check(insignia::glm53::iq_quantize_activation_rows(
+                  gate.x_device, gate.cols, row_ids, 1, gate.workspace),
+              "prepare x1 paired benchmark");
+        const auto launch_gate_up_x1 = [&] {
+            check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
+                      gate_repacked_device, gate.workspace, 1,
+                      gate.output_device, out_ids, gate.rows, gate.cols),
+                  "timed x1 repacked IQ3 gate");
+            check(insignia::glm53::iq3_xxs_gemv_repacked_rows(
+                      up_repacked_device, gate.workspace, 1,
+                      up_output_device, out_ids, gate.rows, gate.cols),
+                  "timed x1 repacked IQ3 up");
+        };
+        const auto launch_gate_up_pair_x1 = [&] {
+            check(insignia::glm53::iq3_xxs_gemv2_repacked_rows(
+                      gate_repacked_device, up_repacked_device, gate.workspace,
+                      1, gate.output_device, up_output_device, out_ids,
+                      gate.rows, gate.cols), "timed x1 paired IQ3 gate/up");
+        };
+        const float gate_up_x1_us = benchmark_us(launch_gate_up_x1);
+        const float gate_up_pair_x1_us = benchmark_us(launch_gate_up_pair_x1);
+        std::printf("IQ3 gate+up x1 sequential/pair repacked %8.3f/%8.3f us %.3fx\n",
+                    gate_up_x1_us, gate_up_pair_x1_us,
+                    gate_up_x1_us / gate_up_pair_x1_us);
+        check(insignia::glm53::iq_quantize_activation_rows(
+                  gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
+              "restore x8 gate benchmark workspace");
 
         void *gate_prefill_workspace[4]{};
         void *down_prefill_workspace[4]{};

@@ -79,6 +79,18 @@ cudaError_t iq3_xxs_gemv_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+cudaError_t iq3_xxs_gemv2_rows(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const void *workspace,
+    int count,
+    float *gate_y,
+    float *up_y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // Byte-size-neutral IQ3 sidecar layout.  Each output row stores all FP16
 // super-scales first, followed by all 64-byte codebook-index planes and all
 // 32-byte sign/scale planes.  It turns the awkward 98-byte GGUF stride into
@@ -94,6 +106,18 @@ cudaError_t iq3_xxs_gemv_repacked_rows(
     const void *workspace,
     int count,
     float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
+cudaError_t iq3_xxs_gemv2_repacked_rows(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const void *workspace,
+    int count,
+    float *gate_y,
+    float *up_y,
     const int *y_ids,
     int rows,
     int cols,

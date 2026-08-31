@@ -320,6 +320,118 @@ __global__ __launch_bounds__(WARPS * 32, 16 / WARPS) void iq3_xxs_rows_kernel(
     }
 }
 
+template <int R, int BLOCKS, bool REPACKED, int WARPS_PER_MATRIX>
+__global__ __launch_bounds__(WARPS_PER_MATRIX * 64, 8 / WARPS_PER_MATRIX)
+void iq3_xxs_pair_rows_kernel(
+    const uint8_t *__restrict__ gate_weights,
+    const uint8_t *__restrict__ up_weights,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    int words_per_row,
+    float *__restrict__ gate_y,
+    float *__restrict__ up_y,
+    IQRowOut out) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int matrix = warp / WARPS_PER_MATRIX;
+    const int matrix_warp = warp - matrix * WARPS_PER_MATRIX;
+    const int cohort = lane >> 3;
+    const int subgroup = lane & 7;
+    const int row = blockIdx.x * WARPS_PER_MATRIX + matrix_warp;
+    constexpr int row_bytes = BLOCKS * kIQ3XXSBlockBytes;
+    const uint8_t *matrix_weights = matrix ? up_weights : gate_weights;
+    const uint8_t *row_weights =
+        matrix_weights + static_cast<size_t>(row) * row_bytes;
+    float sums[R] = {};
+#pragma unroll
+    for (int wave = 0; wave < BLOCKS / 4; ++wave) {
+        const int block_id = 4 * wave + cohort;
+        const uint8_t *indices;
+        const uint8_t *auxiliary;
+        float d;
+        if constexpr (REPACKED) {
+            const auto *scales = reinterpret_cast<const __half *>(row_weights);
+            indices = row_weights + 2 * BLOCKS + block_id * 64 + subgroup * 8;
+            auxiliary = row_weights + 66 * BLOCKS + block_id * 32 + subgroup * 4;
+            d = __half2float(scales[block_id]);
+        } else {
+            const IQ3XXSBlock &block =
+                reinterpret_cast<const IQ3XXSBlock *>(row_weights)[block_id];
+            indices = block.qs + 8 * subgroup;
+            auxiliary = block.qs + 64 + 4 * subgroup;
+            d = __half2float(block.d);
+        }
+        const uint32_t indices0 = REPACKED
+            ? __ldcs(reinterpret_cast<const uint32_t *>(indices + 0))
+            : load_u32_any(indices + 0);
+        const uint32_t indices1 = REPACKED
+            ? __ldcs(reinterpret_cast<const uint32_t *>(indices + 4))
+            : load_u32_any(indices + 4);
+        const uint32_t aux = REPACKED
+            ? __ldcs(reinterpret_cast<const uint32_t *>(auxiliary))
+            : load_u32_any(auxiliary);
+        const int activation_group = block_id * 8 + subgroup;
+        const float weight_scale = d * (0.25f + 0.5f * float(aux >> 28));
+        if constexpr (R == 2) {
+            int dots[R] = {};
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+                uint32_t decoded0, decoded1;
+                decode_iq3_pair(pair_indices, aux, pair, decoded0, decoded1);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const uint32_t *activation =
+                        xq + static_cast<size_t>(r) * words_per_row +
+                        activation_group * 8 + 2 * pair;
+                    dots[r] = __dp4a(int(decoded0), int(__ldg(activation + 0)),
+                                     dots[r]);
+                    dots[r] = __dp4a(int(decoded1), int(__ldg(activation + 1)),
+                                     dots[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                           activation_group];
+                sums[r] = fmaf(float(dots[r]), weight_scale * scale, sums[r]);
+            }
+        } else {
+            uint32_t decoded[8];
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+                decode_iq3_pair(pair_indices, aux, pair,
+                                decoded[2 * pair + 0], decoded[2 * pair + 1]);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t *activation =
+                    xq + static_cast<size_t>(r) * words_per_row +
+                    activation_group * 8;
+                int dot = 0;
+#pragma unroll
+                for (int word = 0; word < 8; ++word)
+                    dot = __dp4a(int(decoded[word]), int(__ldg(activation + word)),
+                                 dot);
+                const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                           activation_group];
+                sums[r] = fmaf(float(dot), weight_scale * scale, sums[r]);
+            }
+        }
+    }
+    float *output = matrix ? up_y : gate_y;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            sums[r] += __shfl_down_sync(0xffffffffu, sums[r], offset);
+        if (!lane)
+            output[static_cast<size_t>(out.ids[r]) *
+                       gridDim.x * WARPS_PER_MATRIX + row] = sums[r];
+    }
+}
+
 template <int R, int BLOCKS, bool ACCUMULATE>
 __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     const IQ4XSBlock *__restrict__ weights,
@@ -719,6 +831,20 @@ cudaError_t launch_iq3(const uint8_t *weights, const uint32_t *xq,
     return cudaPeekAtLastError();
 }
 
+template <int R, int BLOCKS, bool REPACKED, int WARPS_PER_MATRIX = 4>
+cudaError_t launch_iq3_pair(const uint8_t *gate_weights,
+                            const uint8_t *up_weights,
+                            const uint32_t *xq, const float *xscale,
+                            int words_per_row, float *gate_y, float *up_y,
+                            IQRowOut out, int rows, cudaStream_t stream) {
+    constexpr int threads = 2 * WARPS_PER_MATRIX * 32;
+    iq3_xxs_pair_rows_kernel<R, BLOCKS, REPACKED, WARPS_PER_MATRIX>
+        <<<rows / WARPS_PER_MATRIX, threads, 0, stream>>>(
+            gate_weights, up_weights, xq, xscale, words_per_row,
+            gate_y, up_y, out);
+    return cudaPeekAtLastError();
+}
+
 template <int R, int BLOCKS, bool ACCUMULATE>
 cudaError_t launch_iq4(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
@@ -777,6 +903,45 @@ cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
         default: return cudaErrorInvalidValue;
     }
 #undef INSIGNIA_IQ3_CASE
+}
+
+template <bool REPACKED>
+cudaError_t dispatch_iq3_pair(const uint8_t *gate_weights,
+                              const uint8_t *up_weights,
+                              const void *workspace, int count,
+                              float *gate_y, float *up_y, const int *y_ids,
+                              int rows, int cols, cudaStream_t stream) {
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+    IQRowOut out{};
+    for (int r = 0; r < count; ++r) out.ids[r] = y_ids[r];
+#define INSIGNIA_IQ3_PAIR_CASE(R)                                                 \
+    case R:                                                                       \
+        return cols == 4096                                                       \
+            ? launch_iq3_pair<R, 16, REPACKED>(                                  \
+                  gate_weights, up_weights, xq, xscale, int(aligned / 4),         \
+                  gate_y, up_y, out, rows, stream)                                \
+            : launch_iq3_pair<R, 8, REPACKED>(                                   \
+                  gate_weights, up_weights, xq, xscale, int(aligned / 4),         \
+                  gate_y, up_y, out, rows, stream)
+    switch (count) {
+        case 1:
+            return cols == 4096
+                ? launch_iq3_pair<1, 16, REPACKED, 2>(
+                      gate_weights, up_weights, xq, xscale, int(aligned / 4),
+                      gate_y, up_y, out, rows, stream)
+                : launch_iq3_pair<1, 8, REPACKED, 2>(
+                      gate_weights, up_weights, xq, xscale, int(aligned / 4),
+                      gate_y, up_y, out, rows, stream);
+        INSIGNIA_IQ3_PAIR_CASE(2);
+        INSIGNIA_IQ3_PAIR_CASE(3); INSIGNIA_IQ3_PAIR_CASE(4);
+        INSIGNIA_IQ3_PAIR_CASE(5); INSIGNIA_IQ3_PAIR_CASE(6);
+        INSIGNIA_IQ3_PAIR_CASE(7); INSIGNIA_IQ3_PAIR_CASE(8);
+        default: return cudaErrorInvalidValue;
+    }
+#undef INSIGNIA_IQ3_PAIR_CASE
 }
 
 template <bool ACCUMULATE>
@@ -961,6 +1126,18 @@ cudaError_t iq3_xxs_gemv_rows(
                                rows, cols, stream);
 }
 
+cudaError_t iq3_xxs_gemv2_rows(
+    const uint8_t *gate_weights, const uint8_t *up_weights,
+    const void *workspace, int count, float *gate_y, float *up_y,
+    const int *y_ids, int rows, int cols, cudaStream_t stream) {
+    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
+        !y_ids || !valid_geometry(rows, cols, count))
+        return cudaErrorInvalidValue;
+    return dispatch_iq3_pair<false>(gate_weights, up_weights, workspace,
+                                    count, gate_y, up_y, y_ids,
+                                    rows, cols, stream);
+}
+
 void iq3_xxs_repack_cpu(const uint8_t *source, uint8_t *destination,
                         int rows, int cols) {
     const int blocks = cols / kIQBlockWeights;
@@ -986,6 +1163,18 @@ cudaError_t iq3_xxs_gemv_repacked_rows(
         return cudaErrorInvalidValue;
     return dispatch_iq3<true>(weights, workspace, count, y, y_ids,
                               rows, cols, stream);
+}
+
+cudaError_t iq3_xxs_gemv2_repacked_rows(
+    const uint8_t *gate_weights, const uint8_t *up_weights,
+    const void *workspace, int count, float *gate_y, float *up_y,
+    const int *y_ids, int rows, int cols, cudaStream_t stream) {
+    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
+        !y_ids || !valid_geometry(rows, cols, count))
+        return cudaErrorInvalidValue;
+    return dispatch_iq3_pair<true>(gate_weights, up_weights, workspace,
+                                   count, gate_y, up_y, y_ids,
+                                   rows, cols, stream);
 }
 
 cudaError_t iq4_xs_gemv_rows(

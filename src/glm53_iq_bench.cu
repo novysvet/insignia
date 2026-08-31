@@ -592,6 +592,42 @@ int main(int argc, char **argv) {
             print_metrics(label, fused_metrics);
             failed |= fused_metrics.maximum != 0.0;
         }
+        constexpr float kFusedCombine = 0.37109375f;
+        check(cudaMemset(down.output_device, 0,
+                         size_t(kTokens) * down.rows * sizeof(float)),
+              "clear IQ4 accumulation baseline");
+        check(insignia::glm53::iq_quantize_swiglu_rows(
+                  gate.output_device, up_output_device, down.cols,
+                  out_ids, 1, down.workspace),
+              "prepare IQ4 accumulation baseline activation");
+        check(insignia::glm53::iq4_xs_gemv_acc_rows(
+                  down.weights_device, down.workspace, 1,
+                  down.output_device, out_ids, &kFusedCombine,
+                  down.rows, down.cols), "IQ4 accumulation baseline");
+        check(cudaDeviceSynchronize(), "IQ4 accumulation baseline synchronize");
+        std::vector<float> accumulation_baseline(size_t(kTokens) * down.rows);
+        check(cudaMemcpy(accumulation_baseline.data(), down.output_device,
+                         accumulation_baseline.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy IQ4 accumulation baseline");
+        check(cudaMemset(down.output_device, 0,
+                         size_t(kTokens) * down.rows * sizeof(float)),
+              "clear fused IQ4 accumulation");
+        check(insignia::glm53::iq4_xs_swiglu_gemv_acc_fused_x1(
+                  down.weights_device, gate.output_device, up_output_device,
+                  out_ids[0], down.output_device, out_ids[0], kFusedCombine,
+                  down.rows, down.cols), "fused IQ4 accumulation");
+        check(cudaDeviceSynchronize(), "fused IQ4 accumulation synchronize");
+        std::vector<float> accumulation_output(size_t(kTokens) * down.rows);
+        check(cudaMemcpy(accumulation_output.data(), down.output_device,
+                         accumulation_output.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy fused IQ4 accumulation");
+        const Metrics accumulation_metrics = compare(
+            gather(accumulation_output, out_ids, 1, down.rows),
+            gather(accumulation_baseline, out_ids, 1, down.rows));
+        print_metrics("IQ4 fused accumulate", accumulation_metrics);
+        failed |= accumulation_metrics.maximum != 0.0;
         const auto launch_swiglu_down_x1 = [&] {
             check(insignia::glm53::iq_quantize_swiglu_rows(
                       gate.output_device, up_output_device, down.cols,

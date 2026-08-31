@@ -139,6 +139,12 @@ int main(int argc, char **argv) {
         if (index % 521 == 0) value *= 9.0f;
         activations[index] = value;
     }
+    std::vector<float> gate(size_t(kTokens) * kCols);
+    std::vector<float> up(size_t(kTokens) * kCols);
+    for (size_t index = 0; index < gate.size(); ++index) {
+        gate[index] = normal(rng);
+        up[index] = normal(rng);
+    }
     const std::vector<float> reference =
         cpu_reference(weights, activations, kTokens);
     std::vector<float> prefill(size_t(kPrefillTokens) * kCols);
@@ -151,6 +157,8 @@ int main(int argc, char **argv) {
         cpu_reference(weights, prefill, kPrefillTokens);
     auto *weights_device = device_copy(weights);
     auto *x_device = device_copy(activations);
+    auto *gate_device = device_copy(gate);
+    auto *up_device = device_copy(up);
     auto *y_device = device_alloc<float>(size_t(kTokens) * kRows);
     auto *prefill_device = device_copy(prefill);
     auto *prefill_output_device =
@@ -188,6 +196,68 @@ int main(int argc, char **argv) {
                     metrics.cosine, metrics.maximum);
         failed |= metrics.relative > 2.0e-2 || metrics.cosine < 0.99980;
     }
+    check(insignia::glm53::iq_quantize_swiglu_rows(
+              gate_device, up_device, kCols, row_ids, 1, workspace),
+          "quantize Q6 fused SwiGLU baseline");
+    check(insignia::glm53::q6_k_gemv_rows(
+              weights_device, workspace, 1, y_device, out_ids,
+              kRows, kCols), "Q6 fused SwiGLU baseline");
+    check(cudaDeviceSynchronize(), "Q6 fused baseline synchronize");
+    std::vector<float> fused_baseline(kRows);
+    check(cudaMemcpy(fused_baseline.data(),
+                     y_device + size_t(out_ids[0]) * kRows,
+                     fused_baseline.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy Q6 fused baseline");
+    for (int rows_per_cta : {16, 32, 64}) {
+        check(insignia::glm53::q6_k_swiglu_gemv_fused_x1(
+                  weights_device, gate_device, up_device, row_ids[0],
+                  y_device, out_ids[0], kRows, kCols, rows_per_cta),
+              "Q6 fused SwiGLU/down correctness");
+        check(cudaDeviceSynchronize(), "Q6 fused SwiGLU/down synchronize");
+        std::vector<float> fused_output(kRows);
+        check(cudaMemcpy(fused_output.data(),
+                         y_device + size_t(out_ids[0]) * kRows,
+                         fused_output.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost), "copy Q6 fused output");
+        const Metrics metrics = compare(fused_output, fused_baseline);
+        std::printf("Q6_K fused SwiGLU r%d mse %.7g rel %.7g cos %.10f max %.7g\n",
+                    rows_per_cta, metrics.mse, metrics.relative,
+                    metrics.cosine, metrics.maximum);
+        failed |= metrics.maximum != 0.0;
+    }
+    constexpr float kCombine = 0.37109375f;
+    check(cudaMemset(y_device, 0, size_t(kTokens) * kRows * sizeof(float)),
+          "clear Q6 accumulation baseline");
+    check(insignia::glm53::iq_quantize_swiglu_rows(
+              gate_device, up_device, kCols, row_ids, 1, workspace),
+          "quantize Q6 accumulation baseline");
+    check(insignia::glm53::q6_k_gemv_acc_rows(
+              weights_device, workspace, 1, y_device, out_ids, &kCombine,
+              kRows, kCols), "Q6 accumulation baseline");
+    check(cudaDeviceSynchronize(), "Q6 accumulation baseline synchronize");
+    std::vector<float> accumulation_baseline(kRows);
+    check(cudaMemcpy(accumulation_baseline.data(),
+                     y_device + size_t(out_ids[0]) * kRows,
+                     accumulation_baseline.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy Q6 accumulation baseline");
+    check(cudaMemset(y_device, 0, size_t(kTokens) * kRows * sizeof(float)),
+          "clear Q6 fused accumulation");
+    check(insignia::glm53::q6_k_swiglu_gemv_acc_fused_x1(
+              weights_device, gate_device, up_device, row_ids[0], y_device,
+              out_ids[0], kCombine, kRows, kCols),
+          "Q6 fused accumulation correctness");
+    check(cudaDeviceSynchronize(), "Q6 fused accumulation synchronize");
+    std::vector<float> accumulation_output(kRows);
+    check(cudaMemcpy(accumulation_output.data(),
+                     y_device + size_t(out_ids[0]) * kRows,
+                     accumulation_output.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy Q6 fused accumulation");
+    const Metrics accumulation_metrics =
+        compare(accumulation_output, accumulation_baseline);
+    std::printf("Q6_K fused accumulation mse %.7g rel %.7g cos %.10f max %.7g\n",
+                accumulation_metrics.mse, accumulation_metrics.relative,
+                accumulation_metrics.cosine, accumulation_metrics.maximum);
+    failed |= accumulation_metrics.maximum != 0.0;
     check(insignia::glm53::q6_k_gemm_prefill32(
               weights_device, prefill_device, kPrefillTokens,
               prefill_output_device, kRows, kCols), "Q6_K WMMA32");
@@ -216,6 +286,33 @@ int main(int argc, char **argv) {
             std::printf("Q6_K down x%d %8.3f us %7.1f GB/s\n", count,
                         microseconds, double(kExpertBytes) / (microseconds * 1000.0));
         }
+        const auto launch_swiglu_down_x1 = [&] {
+            check(insignia::glm53::iq_quantize_swiglu_rows(
+                      gate_device, up_device, kCols, row_ids, 1, workspace),
+                  "timed Q6 SwiGLU quantize");
+            check(insignia::glm53::q6_k_gemv_rows(
+                      weights_device, workspace, 1, y_device, out_ids,
+                      kRows, kCols), "timed Q6 SwiGLU down");
+        };
+        const float swiglu_down_x1_us = benchmark_us(launch_swiglu_down_x1);
+        float fused_swiglu_down_us[3]{};
+        int fused_index = 0;
+        for (int rows_per_cta : {16, 32, 64}) {
+            const auto launch_fused = [&] {
+                check(insignia::glm53::q6_k_swiglu_gemv_fused_x1(
+                          weights_device, gate_device, up_device, row_ids[0],
+                          y_device, out_ids[0], kRows, kCols, rows_per_cta),
+                      "timed fused Q6 SwiGLU/down");
+            };
+            fused_swiglu_down_us[fused_index++] = benchmark_us(launch_fused);
+        }
+        std::printf("Q6_K SwiGLU+down x1 separate/r16/r32/r64 "
+                    "%8.3f/%8.3f/%8.3f/%8.3f us speedups %.3fx/%.3fx/%.3fx\n",
+                    swiglu_down_x1_us, fused_swiglu_down_us[0],
+                    fused_swiglu_down_us[1], fused_swiglu_down_us[2],
+                    swiglu_down_x1_us / fused_swiglu_down_us[0],
+                    swiglu_down_x1_us / fused_swiglu_down_us[1],
+                    swiglu_down_x1_us / fused_swiglu_down_us[2]);
         const auto launch_q8_pipeline32 = [&] {
             for (int batch = 0; batch < 4; ++batch) {
                 check(insignia::glm53::iq_quantize_activation_rows(
@@ -245,6 +342,8 @@ int main(int argc, char **argv) {
     }
     cudaFree(weights_device);
     cudaFree(x_device);
+    cudaFree(gate_device);
+    cudaFree(up_device);
     cudaFree(y_device);
     cudaFree(prefill_device);
     cudaFree(prefill_output_device);

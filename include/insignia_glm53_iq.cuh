@@ -162,6 +162,18 @@ cudaError_t iq4_xs_swiglu_gemv_fused_x1(
     int rows_per_cta,
     cudaStream_t stream = nullptr);
 
+cudaError_t iq4_xs_swiglu_gemv_acc_fused_x1(
+    const uint8_t *weights,
+    const float *gate,
+    const float *up,
+    int input_id,
+    float *y,
+    int output_id,
+    float combine,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // Q6_K exception path used by the routed down projections in blocks 11, 12,
 // and 44.  It reconstructs the split low-4/high-2 bitplanes directly into
 // signed DP4A operands and applies the two per-16 scales inside each Q8-per-32
@@ -183,6 +195,30 @@ cudaError_t q6_k_gemv_acc_rows(
     float *y,
     const int *y_ids,
     const float *combine,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
+cudaError_t q6_k_swiglu_gemv_fused_x1(
+    const uint8_t *weights,
+    const float *gate,
+    const float *up,
+    int input_id,
+    float *y,
+    int output_id,
+    int rows,
+    int cols,
+    int rows_per_cta,
+    cudaStream_t stream = nullptr);
+
+cudaError_t q6_k_swiglu_gemv_acc_fused_x1(
+    const uint8_t *weights,
+    const float *gate,
+    const float *up,
+    int input_id,
+    float *y,
+    int output_id,
+    float combine,
     int rows,
     int cols,
     cudaStream_t stream = nullptr);

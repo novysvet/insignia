@@ -220,34 +220,78 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
         const uint32_t aux = REPACKED
             ? __ldcs(reinterpret_cast<const uint32_t *>(auxiliary))
             : load_u32_any(auxiliary);
-        uint32_t decoded[8];
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            const uint32_t indices = pair < 2 ? indices0 : indices1;
-            const int shift = 8 * (2 * (pair & 1));
-            const uint32_t code0 = (indices >> shift) & 255u;
-            const uint32_t code1 = (indices >> (shift + 8)) & 255u;
-            const uint32_t grid0 = SHARED_GRID ? shared_grid[code0]
-                                               : __ldg(kIQ3GridDevice + code0);
-            const uint32_t grid1 = SHARED_GRID ? shared_grid[code1]
-                                               : __ldg(kIQ3GridDevice + code1);
-            const uint32_t signs = unpack_iq_signs((aux >> (7 * pair)) & 127u);
-            decoded[2 * pair + 0] = apply_iq3_signs(grid0, signs, 0x08040201u);
-            decoded[2 * pair + 1] = apply_iq3_signs(grid1, signs, 0x80402010u);
-        }
         const int activation_group = block_id * 8 + subgroup;
         const float weight_scale = d * (0.25f + 0.5f * float(aux >> 28));
+        if constexpr (R <= 2) {
+            // The scalar/small-block decode path is occupancy-sensitive on Ada.
+            // Consume each signed codebook pair immediately so the compiler
+            // keeps two decoded words instead of the whole eight-word block.
+            // DP4A order within every row is unchanged.
+            int dots[R] = {};
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const uint32_t *activation = xq + static_cast<size_t>(r) * words_per_row +
-                                         activation_group * 8;
-            int dot = 0;
+            for (int pair = 0; pair < 4; ++pair) {
+                const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+                const int shift = 8 * (2 * (pair & 1));
+                const uint32_t code0 = (pair_indices >> shift) & 255u;
+                const uint32_t code1 = (pair_indices >> (shift + 8)) & 255u;
+                const uint32_t grid0 = SHARED_GRID ? shared_grid[code0]
+                                                   : __ldg(kIQ3GridDevice + code0);
+                const uint32_t grid1 = SHARED_GRID ? shared_grid[code1]
+                                                   : __ldg(kIQ3GridDevice + code1);
+                const uint32_t signs = unpack_iq_signs((aux >> (7 * pair)) & 127u);
+                const uint32_t decoded0 =
+                    apply_iq3_signs(grid0, signs, 0x08040201u);
+                const uint32_t decoded1 =
+                    apply_iq3_signs(grid1, signs, 0x80402010u);
 #pragma unroll
-            for (int word = 0; word < 8; ++word)
-                dot = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot);
-            const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
-                                       activation_group];
-            sums[r] = fmaf(float(dot), weight_scale * scale, sums[r]);
+                for (int r = 0; r < R; ++r) {
+                    const uint32_t *activation =
+                        xq + static_cast<size_t>(r) * words_per_row +
+                        activation_group * 8 + 2 * pair;
+                    dots[r] = __dp4a(int(decoded0), int(__ldg(activation + 0)),
+                                     dots[r]);
+                    dots[r] = __dp4a(int(decoded1), int(__ldg(activation + 1)),
+                                     dots[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                           activation_group];
+                sums[r] = fmaf(float(dots[r]), weight_scale * scale, sums[r]);
+            }
+        } else {
+            uint32_t decoded[8];
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+                const int shift = 8 * (2 * (pair & 1));
+                const uint32_t code0 = (pair_indices >> shift) & 255u;
+                const uint32_t code1 = (pair_indices >> (shift + 8)) & 255u;
+                const uint32_t grid0 = SHARED_GRID ? shared_grid[code0]
+                                                   : __ldg(kIQ3GridDevice + code0);
+                const uint32_t grid1 = SHARED_GRID ? shared_grid[code1]
+                                                   : __ldg(kIQ3GridDevice + code1);
+                const uint32_t signs = unpack_iq_signs((aux >> (7 * pair)) & 127u);
+                decoded[2 * pair + 0] =
+                    apply_iq3_signs(grid0, signs, 0x08040201u);
+                decoded[2 * pair + 1] =
+                    apply_iq3_signs(grid1, signs, 0x80402010u);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t *activation =
+                    xq + static_cast<size_t>(r) * words_per_row +
+                    activation_group * 8;
+                int dot = 0;
+#pragma unroll
+                for (int word = 0; word < 8; ++word)
+                    dot = __dp4a(int(decoded[word]), int(__ldg(activation + word)),
+                                 dot);
+                const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                           activation_group];
+                sums[r] = fmaf(float(dot), weight_scale * scale, sums[r]);
+            }
         }
     }
 #pragma unroll

@@ -154,6 +154,23 @@ cudaError_t iq3_xxs_gemv2_wim32_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Decode x1 compute-for-bandwidth arm: redundantly quantize the 4096-wide
+// hidden row in every gate/up CTA, retain Q8 values in shared memory, and reuse
+// them across 2/4/8/16 output rows per matrix.  This removes the standalone
+// hidden quantizer launch and the global Q8 workspace round-trip.
+cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const float *x,
+    int x_id,
+    float *gate_y,
+    float *up_y,
+    int y_id,
+    int rows,
+    int cols,
+    int rows_per_matrix,
+    cudaStream_t stream = nullptr);
+
 // IQ4_XS uses a nonlinear 16-entry nibble codebook and eight signed scales per
 // 256 values.  The same warp/block map is used so exception layers can be
 // dispatched without a generic matrix engine.

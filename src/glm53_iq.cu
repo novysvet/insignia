@@ -531,6 +531,104 @@ void iq3_xxs_wim32_rows_kernel(
     }
 }
 
+template <int WARPS_PER_MATRIX>
+__global__ __launch_bounds__(WARPS_PER_MATRIX * 64,
+                             WARPS_PER_MATRIX == 2 ? 4 :
+                             WARPS_PER_MATRIX == 4 ? 2 : 1)
+void iq3_xxs_wim32_fused_quant_pair_x1_kernel(
+    const uint8_t *__restrict__ gate_weights,
+    const uint8_t *__restrict__ up_weights,
+    const float *__restrict__ x,
+    int x_id,
+    float *__restrict__ gate_y,
+    float *__restrict__ up_y,
+    int y_id) {
+    constexpr int kBlocks = 16;
+    __shared__ __align__(128) uint32_t shared_xq[128 * 8];
+    __shared__ __align__(128) float shared_xscale[128];
+    const int thread = threadIdx.x;
+    if (thread < 128) {
+        const float4 *source = reinterpret_cast<const float4 *>(
+            x + static_cast<size_t>(x_id) * 4096 + thread * 32);
+        float values[32];
+        float maximum = 0.0f;
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            const float4 value = __ldg(source + word);
+            values[4 * word + 0] = value.x;
+            values[4 * word + 1] = value.y;
+            values[4 * word + 2] = value.z;
+            values[4 * word + 3] = value.w;
+            maximum = fmaxf(maximum,
+                            fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                  fmaxf(fabsf(value.z), fabsf(value.w))));
+        }
+        const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+        shared_xscale[thread] = maximum * (1.0f / 127.0f);
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            uint32_t packed = 0;
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte)
+                packed |= uint32_t(uint8_t(__float2int_rn(
+                              values[4 * word + byte] * inverse))) <<
+                          (8 * byte);
+            shared_xq[thread * 8 + word] = packed;
+        }
+    }
+    __syncthreads();
+
+    const int lane = thread & 31;
+    const int warp = thread >> 5;
+    const int matrix = warp / WARPS_PER_MATRIX;
+    const int matrix_warp = warp - matrix * WARPS_PER_MATRIX;
+    const int cohort = lane >> 3;
+    const int row = blockIdx.x * WARPS_PER_MATRIX + matrix_warp;
+    constexpr int row_bytes = kBlocks * kIQ3XXSBlockBytes;
+    const uint8_t *matrix_weights = matrix ? up_weights : gate_weights;
+    const uint8_t *row_weights =
+        matrix_weights + static_cast<size_t>(row) * row_bytes;
+    const auto *scales = reinterpret_cast<const __half *>(row_weights);
+    float sum = 0.0f;
+#pragma unroll
+    for (int wave = 0; wave < kBlocks / 4; ++wave) {
+        const int block_id = 4 * wave + cohort;
+        const uint8_t *wave_words =
+            row_weights + 2 * kBlocks + 384 * wave + 4 * lane;
+        const uint32_t indices0 =
+            __ldcs(reinterpret_cast<const uint32_t *>(wave_words));
+        const uint32_t indices1 =
+            __ldcs(reinterpret_cast<const uint32_t *>(wave_words + 128));
+        const uint32_t aux =
+            __ldcs(reinterpret_cast<const uint32_t *>(wave_words + 256));
+        uint32_t decoded[8];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+            decode_iq3_pair(pair_indices, aux, pair,
+                            decoded[2 * pair + 0], decoded[2 * pair + 1]);
+        }
+        const int activation_group = 32 * wave + lane;
+        const uint32_t *activation = shared_xq + activation_group * 8;
+        int dot = 0;
+#pragma unroll
+        for (int word = 0; word < 8; ++word)
+            dot = __dp4a(int(decoded[word]), int(activation[word]), dot);
+        const float weight_scale = __half2float(scales[block_id]) *
+                                   (0.25f + 0.5f * float(aux >> 28));
+        sum = fmaf(float(dot),
+                   weight_scale * shared_xscale[activation_group], sum);
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (!lane) {
+        float *output = matrix ? up_y : gate_y;
+        output[static_cast<size_t>(y_id) * gridDim.x * WARPS_PER_MATRIX + row] =
+            sum;
+    }
+}
+
 template <int R, int BLOCKS, bool ACCUMULATE>
 __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     const IQ4XSBlock *__restrict__ weights,
@@ -1576,6 +1674,45 @@ cudaError_t iq3_xxs_gemv2_wim32_rows(
         return cudaErrorInvalidValue;
     return dispatch_iq3_wim32<true>(gate_weights, up_weights, workspace, count,
                                     gate_y, up_y, y_ids, rows, cols, stream);
+}
+
+cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
+    const uint8_t *gate_weights, const uint8_t *up_weights,
+    const float *x, int x_id, float *gate_y, float *up_y, int y_id,
+    int rows, int cols, int rows_per_matrix, cudaStream_t stream) {
+    if (!gate_weights || !up_weights || !x || !gate_y || !up_y ||
+        x_id < 0 || y_id < 0 || rows <= 0 || cols != 4096 ||
+        (rows_per_matrix != 2 && rows_per_matrix != 4 &&
+         rows_per_matrix != 8 && rows_per_matrix != 16) ||
+        rows % rows_per_matrix)
+        return cudaErrorInvalidValue;
+    switch (rows_per_matrix) {
+        case 2:
+            iq3_xxs_wim32_fused_quant_pair_x1_kernel<2>
+                <<<rows / 2, 128, 0, stream>>>(
+                    gate_weights, up_weights, x, x_id,
+                    gate_y, up_y, y_id);
+            break;
+        case 4:
+            iq3_xxs_wim32_fused_quant_pair_x1_kernel<4>
+                <<<rows / 4, 256, 0, stream>>>(
+                    gate_weights, up_weights, x, x_id,
+                    gate_y, up_y, y_id);
+            break;
+        case 8:
+            iq3_xxs_wim32_fused_quant_pair_x1_kernel<8>
+                <<<rows / 8, 512, 0, stream>>>(
+                    gate_weights, up_weights, x, x_id,
+                    gate_y, up_y, y_id);
+            break;
+        default:
+            iq3_xxs_wim32_fused_quant_pair_x1_kernel<16>
+                <<<rows / 16, 1024, 0, stream>>>(
+                    gate_weights, up_weights, x, x_id,
+                    gate_y, up_y, y_id);
+            break;
+    }
+    return cudaPeekAtLastError();
 }
 
 cudaError_t iq4_xs_gemv_rows(

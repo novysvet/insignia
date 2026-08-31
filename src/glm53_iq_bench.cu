@@ -549,6 +549,85 @@ int main(int argc, char **argv) {
         std::printf("IQ3 gate+up x1 pair repacked/WIM32 %8.3f/%8.3f us %.3fx\n",
                     gate_up_pair_x1_us, gate_up_pair_wim32_x1_us,
                     gate_up_pair_x1_us / gate_up_pair_wim32_x1_us);
+
+        launch_gate_up_pair_wim32_x1();
+        check(cudaDeviceSynchronize(),
+              "fused hidden-quant gate/up baseline synchronize");
+        std::vector<float> fused_quant_gate_baseline(
+            size_t(kTokens) * gate.rows);
+        std::vector<float> fused_quant_up_baseline(
+            size_t(kTokens) * gate.rows);
+        check(cudaMemcpy(fused_quant_gate_baseline.data(), gate.output_device,
+                         fused_quant_gate_baseline.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy fused hidden-quant gate baseline");
+        check(cudaMemcpy(fused_quant_up_baseline.data(), up_output_device,
+                         fused_quant_up_baseline.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy fused hidden-quant up baseline");
+        float fused_hidden_quant_us[4]{};
+        int fused_hidden_index = 0;
+        for (int rows_per_matrix : {2, 4, 8, 16}) {
+            check(insignia::glm53::iq3_xxs_gemv2_wim32_fused_quant_x1(
+                      gate_wim32_device, up_wim32_device, gate.x_device,
+                      row_ids[0], gate.output_device, up_output_device,
+                      out_ids[0], gate.rows, gate.cols, rows_per_matrix),
+                  "fused hidden-quant gate/up correctness");
+            check(cudaDeviceSynchronize(),
+                  "fused hidden-quant gate/up synchronize");
+            std::vector<float> fused_quant_gate(size_t(kTokens) * gate.rows);
+            std::vector<float> fused_quant_up(size_t(kTokens) * gate.rows);
+            check(cudaMemcpy(fused_quant_gate.data(), gate.output_device,
+                             fused_quant_gate.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost),
+                  "copy fused hidden-quant gate");
+            check(cudaMemcpy(fused_quant_up.data(), up_output_device,
+                             fused_quant_up.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost),
+                  "copy fused hidden-quant up");
+            const Metrics fused_gate_metrics = compare(
+                gather(fused_quant_gate, out_ids, 1, gate.rows),
+                gather(fused_quant_gate_baseline, out_ids, 1, gate.rows));
+            const Metrics fused_up_metrics = compare(
+                gather(fused_quant_up, out_ids, 1, gate.rows),
+                gather(fused_quant_up_baseline, out_ids, 1, gate.rows));
+            char gate_label[64], up_label[64];
+            std::snprintf(gate_label, sizeof(gate_label),
+                          "IQ3 fused hiddenQ r%d gate", rows_per_matrix);
+            std::snprintf(up_label, sizeof(up_label),
+                          "IQ3 fused hiddenQ r%d up", rows_per_matrix);
+            print_metrics(gate_label, fused_gate_metrics);
+            print_metrics(up_label, fused_up_metrics);
+            failed |= fused_gate_metrics.maximum != 0.0 ||
+                      fused_up_metrics.maximum != 0.0;
+            const auto launch_fused_hidden_quant = [&] {
+                check(insignia::glm53::iq3_xxs_gemv2_wim32_fused_quant_x1(
+                          gate_wim32_device, up_wim32_device, gate.x_device,
+                          row_ids[0], gate.output_device, up_output_device,
+                          out_ids[0], gate.rows, gate.cols, rows_per_matrix),
+                      "timed fused hidden-quant gate/up");
+            };
+            fused_hidden_quant_us[fused_hidden_index++] =
+                benchmark_us(launch_fused_hidden_quant);
+        }
+        const auto launch_separate_hidden_quant_pair = [&] {
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      gate.x_device, gate.cols, row_ids, 1, gate.workspace),
+                  "timed separate hidden quantize");
+            launch_gate_up_pair_wim32_x1();
+        };
+        const float separate_hidden_quant_pair_us =
+            benchmark_us(launch_separate_hidden_quant_pair);
+        std::printf("IQ3 hiddenQ+gate/up x1 separate/fused-r2/r4/r8/r16 "
+                    "%8.3f/%8.3f/%8.3f/%8.3f/%8.3f us speedups "
+                    "%.3fx/%.3fx/%.3fx/%.3fx\n",
+                    separate_hidden_quant_pair_us,
+                    fused_hidden_quant_us[0], fused_hidden_quant_us[1],
+                    fused_hidden_quant_us[2], fused_hidden_quant_us[3],
+                    separate_hidden_quant_pair_us / fused_hidden_quant_us[0],
+                    separate_hidden_quant_pair_us / fused_hidden_quant_us[1],
+                    separate_hidden_quant_pair_us / fused_hidden_quant_us[2],
+                    separate_hidden_quant_pair_us / fused_hidden_quant_us[3]);
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "restore x8 gate benchmark workspace");

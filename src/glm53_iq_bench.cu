@@ -14,6 +14,7 @@
 namespace {
 
 constexpr int kTokens = insignia::glm53::kIQMaxRows;
+constexpr int kPrefillTokens = 32;
 
 [[noreturn]] void die(const char *message) {
     std::fprintf(stderr, "%s\n", message);
@@ -60,15 +61,16 @@ using Decoder = void (*)(const uint8_t *, float *, int);
 std::vector<float> cpu_reference(const std::vector<uint8_t> &weights,
                                  int rows, int cols, int block_bytes,
                                  Decoder decoder,
-                                 const std::vector<float> &activations) {
+                                 const std::vector<float> &activations,
+                                 int tokens) {
     const size_t row_bytes = size_t(cols / insignia::glm53::kIQBlockWeights) *
                              block_bytes;
-    std::vector<float> output(size_t(kTokens) * rows);
+    std::vector<float> output(size_t(tokens) * rows);
     std::vector<float> dequantized(cols);
     for (int row = 0; row < rows; ++row) {
         decoder(weights.data() + size_t(row) * row_bytes,
                 dequantized.data(), cols);
-        for (int token = 0; token < kTokens; ++token) {
+        for (int token = 0; token < tokens; ++token) {
             double sum = 0.0;
             const float *x = activations.data() + size_t(token) * cols;
             for (int col = 0; col < cols; ++col)
@@ -209,11 +211,29 @@ int main(int argc, char **argv) {
     gate.reference = cpu_reference(gate.weights, gate.rows, gate.cols,
                                    gate.block_bytes,
                                    insignia::glm53::iq3_xxs_dequantize_row_cpu,
-                                   gate.activations);
+                                   gate.activations, kTokens);
     down.reference = cpu_reference(down.weights, down.rows, down.cols,
                                    down.block_bytes,
                                    insignia::glm53::iq4_xs_dequantize_row_cpu,
-                                   down.activations);
+                                   down.activations, kTokens);
+
+    std::vector<float> gate_prefill(size_t(kPrefillTokens) * gate.cols);
+    std::vector<float> down_prefill(size_t(kPrefillTokens) * down.cols);
+    for (std::vector<float> *values : {&gate_prefill, &down_prefill}) {
+        for (size_t index = 0; index < values->size(); ++index) {
+            float value = normal(rng);
+            if (index % 521 == 0) value *= 9.0f;
+            (*values)[index] = value;
+        }
+    }
+    const std::vector<float> gate_prefill_reference = cpu_reference(
+        gate.weights, gate.rows, gate.cols, gate.block_bytes,
+        insignia::glm53::iq3_xxs_dequantize_row_cpu, gate_prefill,
+        kPrefillTokens);
+    const std::vector<float> down_prefill_reference = cpu_reference(
+        down.weights, down.rows, down.cols, down.block_bytes,
+        insignia::glm53::iq4_xs_dequantize_row_cpu, down_prefill,
+        kPrefillTokens);
 
     for (MatrixFixture *fixture : {&gate, &down}) {
         fixture->weights_device = device_copy(fixture->weights);
@@ -228,8 +248,15 @@ int main(int argc, char **argv) {
     auto *gate_repacked_device = device_copy(gate_repacked);
     auto *up_repacked_device = device_copy(up_repacked);
     auto *up_output_device = device_alloc<float>(size_t(kTokens) * gate_rows);
+    auto *gate_prefill_device = device_copy(gate_prefill);
+    auto *down_prefill_device = device_copy(down_prefill);
+    auto *gate_prefill_output_device =
+        device_alloc<float>(size_t(kPrefillTokens) * gate.rows);
+    auto *down_prefill_output_device =
+        device_alloc<float>(size_t(kPrefillTokens) * down.rows);
     const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
     const int out_ids[kTokens] = {3, 7, 1, 6, 0, 5, 2, 4};
+    const int linear_ids[kTokens] = {0, 1, 2, 3, 4, 5, 6, 7};
     bool failed = false;
 
     for (MatrixFixture *fixture : {&gate, &down}) {
@@ -281,6 +308,34 @@ int main(int argc, char **argv) {
         select_reference(gate.reference, row_ids, kTokens, gate.rows));
     print_metrics("IQ3 repacked x8", repacked_metrics);
     failed |= repacked_metrics.relative > 2.0e-2 || repacked_metrics.cosine < 0.99980;
+
+    check(insignia::glm53::iq3_xxs_gemm_prefill32(
+              gate.weights_device, gate_prefill_device, kPrefillTokens,
+              gate_prefill_output_device, gate.rows, gate.cols),
+          "iq3_xxs_gemm_prefill32");
+    check(insignia::glm53::iq4_xs_gemm_prefill32(
+              down.weights_device, down_prefill_device, kPrefillTokens,
+              down_prefill_output_device, down.rows, down.cols),
+          "iq4_xs_gemm_prefill32");
+    check(cudaDeviceSynchronize(), "WMMA32 correctness synchronize");
+    std::vector<float> gate_prefill_output(size_t(kPrefillTokens) * gate.rows);
+    std::vector<float> down_prefill_output(size_t(kPrefillTokens) * down.rows);
+    check(cudaMemcpy(gate_prefill_output.data(), gate_prefill_output_device,
+                     gate_prefill_output.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy IQ3 WMMA32 output");
+    check(cudaMemcpy(down_prefill_output.data(), down_prefill_output_device,
+                     down_prefill_output.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy IQ4 WMMA32 output");
+    const Metrics gate_wmma_metrics =
+        compare(gate_prefill_output, gate_prefill_reference);
+    const Metrics down_wmma_metrics =
+        compare(down_prefill_output, down_prefill_reference);
+    print_metrics("IQ3 WMMA prefill32", gate_wmma_metrics);
+    print_metrics("IQ4 WMMA prefill32", down_wmma_metrics);
+    failed |= gate_wmma_metrics.relative > 2.0e-2 ||
+              gate_wmma_metrics.cosine < 0.99980 ||
+              down_wmma_metrics.relative > 2.0e-2 ||
+              down_wmma_metrics.cosine < 0.99980;
 
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
@@ -342,6 +397,114 @@ int main(int argc, char **argv) {
         std::printf("IQ3 gate+up x8 raw/repacked %8.3f/%8.3f us %.3fx\n",
                     gate_up_us, gate_up_repacked_us,
                     gate_up_us / gate_up_repacked_us);
+
+        void *gate_prefill_workspace[4]{};
+        void *down_prefill_workspace[4]{};
+        for (int batch = 0; batch < 4; ++batch) {
+            check(cudaMalloc(&gate_prefill_workspace[batch],
+                             insignia::glm53::iq_workspace_rows_bytes(
+                                 gate.cols, kTokens)),
+                  "cudaMalloc gate prefill workspace");
+            check(cudaMalloc(&down_prefill_workspace[batch],
+                             insignia::glm53::iq_workspace_rows_bytes(
+                                 down.cols, kTokens)),
+                  "cudaMalloc down prefill workspace");
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      gate_prefill_device + size_t(batch * kTokens) * gate.cols,
+                      gate.cols, linear_ids, kTokens,
+                      gate_prefill_workspace[batch]),
+                  "prepare gate prefill Q8");
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      down_prefill_device + size_t(batch * kTokens) * down.cols,
+                      down.cols, linear_ids, kTokens,
+                      down_prefill_workspace[batch]),
+                  "prepare down prefill Q8");
+        }
+        check(cudaDeviceSynchronize(), "prepare prefill benchmark");
+        const auto launch_gate_q8_compute32 = [&] {
+            for (int batch = 0; batch < 4; ++batch)
+                check(insignia::glm53::iq3_xxs_gemv_rows(
+                          gate.weights_device, gate_prefill_workspace[batch],
+                          kTokens,
+                          gate_prefill_output_device +
+                              size_t(batch * kTokens) * gate.rows,
+                          linear_ids, gate.rows, gate.cols),
+                      "timed gate Q8 compute32");
+        };
+        const auto launch_down_q8_compute32 = [&] {
+            for (int batch = 0; batch < 4; ++batch)
+                check(insignia::glm53::iq4_xs_gemv_rows(
+                          down.weights_device, down_prefill_workspace[batch],
+                          kTokens,
+                          down_prefill_output_device +
+                              size_t(batch * kTokens) * down.rows,
+                          linear_ids, down.rows, down.cols),
+                      "timed down Q8 compute32");
+        };
+        const auto launch_gate_q8_pipeline32 = [&] {
+            for (int batch = 0; batch < 4; ++batch) {
+                check(insignia::glm53::iq_quantize_activation_rows(
+                          gate_prefill_device +
+                              size_t(batch * kTokens) * gate.cols,
+                          gate.cols, linear_ids, kTokens,
+                          gate_prefill_workspace[batch]),
+                      "timed gate Q8 quantize32");
+                check(insignia::glm53::iq3_xxs_gemv_rows(
+                          gate.weights_device, gate_prefill_workspace[batch],
+                          kTokens,
+                          gate_prefill_output_device +
+                              size_t(batch * kTokens) * gate.rows,
+                          linear_ids, gate.rows, gate.cols),
+                      "timed gate Q8 pipeline32");
+            }
+        };
+        const auto launch_down_q8_pipeline32 = [&] {
+            for (int batch = 0; batch < 4; ++batch) {
+                check(insignia::glm53::iq_quantize_activation_rows(
+                          down_prefill_device +
+                              size_t(batch * kTokens) * down.cols,
+                          down.cols, linear_ids, kTokens,
+                          down_prefill_workspace[batch]),
+                      "timed down Q8 quantize32");
+                check(insignia::glm53::iq4_xs_gemv_rows(
+                          down.weights_device, down_prefill_workspace[batch],
+                          kTokens,
+                          down_prefill_output_device +
+                              size_t(batch * kTokens) * down.rows,
+                          linear_ids, down.rows, down.cols),
+                      "timed down Q8 pipeline32");
+            }
+        };
+        const auto launch_gate_wmma32 = [&] {
+            check(insignia::glm53::iq3_xxs_gemm_prefill32(
+                      gate.weights_device, gate_prefill_device,
+                      kPrefillTokens, gate_prefill_output_device,
+                      gate.rows, gate.cols), "timed gate WMMA32");
+        };
+        const auto launch_down_wmma32 = [&] {
+            check(insignia::glm53::iq4_xs_gemm_prefill32(
+                      down.weights_device, down_prefill_device,
+                      kPrefillTokens, down_prefill_output_device,
+                      down.rows, down.cols), "timed down WMMA32");
+        };
+        const float gate_q8_compute32_us = benchmark_us(launch_gate_q8_compute32);
+        const float gate_q8_pipeline32_us = benchmark_us(launch_gate_q8_pipeline32);
+        const float gate_wmma32_us = benchmark_us(launch_gate_wmma32);
+        const float down_q8_compute32_us = benchmark_us(launch_down_q8_compute32);
+        const float down_q8_pipeline32_us = benchmark_us(launch_down_q8_pipeline32);
+        const float down_wmma32_us = benchmark_us(launch_down_wmma32);
+        std::printf("IQ3 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
+                    "%.3fx pipe speedup\n",
+                    gate_q8_compute32_us, gate_q8_pipeline32_us, gate_wmma32_us,
+                    gate_q8_pipeline32_us / gate_wmma32_us);
+        std::printf("IQ4 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
+                    "%.3fx pipe speedup\n",
+                    down_q8_compute32_us, down_q8_pipeline32_us, down_wmma32_us,
+                    down_q8_pipeline32_us / down_wmma32_us);
+        for (int batch = 0; batch < 4; ++batch) {
+            cudaFree(gate_prefill_workspace[batch]);
+            cudaFree(down_prefill_workspace[batch]);
+        }
     } else {
         std::puts("timing skipped; pass --bench only on an uncontended glm-box run");
     }
@@ -352,5 +515,7 @@ int main(int argc, char **argv) {
     }
     cudaFree(up_device); cudaFree(up_output_device);
     cudaFree(gate_repacked_device); cudaFree(up_repacked_device);
+    cudaFree(gate_prefill_device); cudaFree(down_prefill_device);
+    cudaFree(gate_prefill_output_device); cudaFree(down_prefill_output_device);
     return failed ? 3 : 0;
 }

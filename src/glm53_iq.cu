@@ -2,6 +2,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <bit>
 #include <cstddef>
@@ -358,6 +359,146 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     }
 }
 
+// Prefill is a different machine from decode.  Each CTA owns sixteen output
+// rows and thirty-two routed tokens.  It expands one 16x16 weight tile to FP16
+// once, then two warps reuse it through HMMA.  The expert payload is therefore
+// read once per 32 tokens instead of once per eight-token GEMV launch.
+template <int BLOCKS>
+__global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
+    const uint8_t *__restrict__ weights,
+    const float *__restrict__ x,
+    float *__restrict__ y,
+    int rows,
+    int cols) {
+    using namespace nvcuda;
+    __shared__ __align__(128) __half shared_a[16 * 16];
+    __shared__ __align__(128) __half shared_b[2][16 * 16];
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5;
+    const int row_start = blockIdx.x * 16;
+    const int token_start = blockIdx.y * 32;
+    constexpr int row_bytes = BLOCKS * kIQ3XXSBlockBytes;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+
+    for (int k0 = 0; k0 < cols; k0 += 16) {
+        // 64 threads each decode one four-value IQ3 codeword.  Four codewords
+        // cover the 16-wide K tile for one output row.
+        const int local_row = thread >> 2;
+        const int local_code = thread & 3;
+        const int block_id = k0 >> 8;
+        const int subgroup = (k0 >> 5) & 7;
+        const int half_group = (k0 >> 4) & 1;
+        const auto &block = reinterpret_cast<const IQ3XXSBlock *>(
+            weights + static_cast<size_t>(row_start + local_row) * row_bytes)[block_id];
+        const uint32_t auxiliary = load_u32_any(block.qs + 64 + 4 * subgroup);
+        const int pair = 2 * half_group + (local_code >> 1);
+        const int side = local_code & 1;
+        const uint32_t code = block.qs[8 * subgroup + 2 * pair + side];
+        const uint32_t sign8 =
+            unpack_iq_sign8((auxiliary >> (7 * pair)) & 127u);
+        const uint32_t signs = sign8 * 0x01010101u;
+        const uint32_t decoded = apply_iq3_signs(
+            __ldg(kIQ3GridDevice + code), signs,
+            side ? 0x80402010u : 0x08040201u);
+        const float scale = __half2float(block.d) *
+                            (0.25f + 0.5f * float(auxiliary >> 28));
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte) {
+            const int8_t value = int8_t(decoded >> (8 * byte));
+            shared_a[local_row * 16 + 4 * local_code + byte] =
+                __float2half_rn(float(value) * scale);
+        }
+
+        // The input tile is stored exactly in the col-major layout expected by
+        // matrix_b: [K, token].  Each thread converts eight FP32 activations.
+#pragma unroll
+        for (int item = thread; item < 32 * 16; item += 64) {
+            const int local_token = item >> 4;
+            const int local_k = item & 15;
+            shared_b[local_token >> 4][local_k + (local_token & 15) * 16] =
+                __float2half_rn(x[static_cast<size_t>(token_start + local_token) * cols +
+                                   k0 + local_k]);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                       wmma::row_major> a_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                       wmma::col_major> b_fragment;
+        wmma::load_matrix_sync(a_fragment, shared_a, 16);
+        wmma::load_matrix_sync(b_fragment, shared_b[warp], 16);
+        wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(
+        y + static_cast<size_t>(token_start + warp * 16) * rows + row_start,
+        accumulator, rows, wmma::mem_col_major);
+}
+
+template <int BLOCKS>
+__global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
+    const IQ4XSBlock *__restrict__ weights,
+    const float *__restrict__ x,
+    float *__restrict__ y,
+    int rows,
+    int cols) {
+    using namespace nvcuda;
+    __shared__ __align__(128) __half shared_a[16 * 16];
+    __shared__ __align__(128) __half shared_b[2][16 * 16];
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5;
+    const int row_start = blockIdx.x * 16;
+    const int token_start = blockIdx.y * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+
+    for (int k0 = 0; k0 < cols; k0 += 16) {
+        const int local_row = thread >> 2;
+        const int local_word = thread & 3;
+        const int block_id = k0 >> 8;
+        const int subgroup = (k0 >> 5) & 7;
+        const int half_group = (k0 >> 4) & 1;
+        const IQ4XSBlock &block =
+            weights[static_cast<size_t>(row_start + local_row) * BLOCKS + block_id];
+        const int low =
+            (block.scales_l[subgroup >> 1] >> (4 * (subgroup & 1))) & 15;
+        const int high = (block.scales_h >> (2 * subgroup)) & 3;
+        const float scale = __half2float(block.d) *
+                            float((low | (high << 4)) - 32);
+        const int2 decoded8 = iq4_lookup8(__ldcs(
+            reinterpret_cast<const uint32_t *>(block.qs + 16 * subgroup) +
+            local_word));
+        const uint32_t decoded = uint32_t(half_group ? decoded8.y : decoded8.x);
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte) {
+            const int8_t value = int8_t(decoded >> (8 * byte));
+            shared_a[local_row * 16 + 4 * local_word + byte] =
+                __float2half_rn(float(value) * scale);
+        }
+#pragma unroll
+        for (int item = thread; item < 32 * 16; item += 64) {
+            const int local_token = item >> 4;
+            const int local_k = item & 15;
+            shared_b[local_token >> 4][local_k + (local_token & 15) * 16] =
+                __float2half_rn(x[static_cast<size_t>(token_start + local_token) * cols +
+                                   k0 + local_k]);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                       wmma::row_major> a_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                       wmma::col_major> b_fragment;
+        wmma::load_matrix_sync(a_fragment, shared_a, 16);
+        wmma::load_matrix_sync(b_fragment, shared_b[warp], 16);
+        wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(
+        y + static_cast<size_t>(token_start + warp * 16) * rows + row_start,
+        accumulator, rows, wmma::mem_col_major);
+}
+
 template <int R, int BLOCKS, bool REPACKED, int WARPS = 8>
 cudaError_t launch_iq3(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
@@ -383,14 +524,6 @@ bool valid_geometry(int rows, int cols, int count) {
            count > 0 && count <= kIQMaxRows;
 }
 
-bool iq3_narrow_r1_enabled() {
-    static const bool enabled = [] {
-        const char *value = std::getenv("INSIGNIA_GLM53_IQ3_R1_WARPS");
-        return value && value[0] == '2';
-    }();
-    return enabled;
-}
-
 template <bool REPACKED>
 cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
                          int count, float *y, const int *y_ids,
@@ -410,19 +543,11 @@ cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
                   weights, xq, xscale, int(aligned / 4), y, out, rows, stream)
     switch (count) {
         case 1:
-            if (iq3_narrow_r1_enabled())
-                return cols == 4096
-                    ? launch_iq3<1, 16, REPACKED, 2>(
-                          weights, xq, xscale, int(aligned / 4), y, out,
-                          rows, stream)
-                    : launch_iq3<1, 8, REPACKED, 2>(
-                          weights, xq, xscale, int(aligned / 4), y, out,
-                          rows, stream);
             return cols == 4096
-                ? launch_iq3<1, 16, REPACKED>(
+                ? launch_iq3<1, 16, REPACKED, 2>(
                       weights, xq, xscale, int(aligned / 4), y, out,
                       rows, stream)
-                : launch_iq3<1, 8, REPACKED>(
+                : launch_iq3<1, 8, REPACKED, 2>(
                       weights, xq, xscale, int(aligned / 4), y, out,
                       rows, stream);
         INSIGNIA_IQ3_CASE(2);
@@ -475,6 +600,36 @@ size_t iq_workspace_rows_bytes(int cols, int count) {
     const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
     return static_cast<size_t>(count) *
            (aligned + static_cast<size_t>(cols / kIQActivationGroup) * sizeof(float));
+}
+
+cudaError_t iq3_xxs_gemm_prefill32(
+    const uint8_t *weights, const float *x, int tokens, float *y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!weights || !x || !y || rows <= 0 || (rows & 15) ||
+        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
+        return cudaErrorInvalidValue;
+    if (cols == 4096)
+        iq3_xxs_wmma32_kernel<16><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
+            weights, x, y, rows, cols);
+    else
+        iq3_xxs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
+            weights, x, y, rows, cols);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t iq4_xs_gemm_prefill32(
+    const uint8_t *weights, const float *x, int tokens, float *y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!weights || !x || !y || rows <= 0 || (rows & 15) ||
+        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
+        return cudaErrorInvalidValue;
+    if (cols == 4096)
+        iq4_xs_wmma32_kernel<16><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
+            reinterpret_cast<const IQ4XSBlock *>(weights), x, y, rows, cols);
+    else
+        iq4_xs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
+            reinterpret_cast<const IQ4XSBlock *>(weights), x, y, rows, cols);
+    return cudaPeekAtLastError();
 }
 
 cudaError_t iq_quantize_activation_rows(

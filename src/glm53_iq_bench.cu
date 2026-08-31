@@ -713,6 +713,20 @@ int main(int argc, char **argv) {
                               out_ids[0], down.rows, down.cols, 32),
                           "timed optimized resident fused down");
                 };
+                const auto launch_double_fused_pipeline = [&] {
+                    check(insignia::glm53::
+                              iq3_xxs_gemv2_wim32_fused_quant_x1(
+                                  gate_wim32_device, up_wim32_device,
+                                  gate.x_device, row_ids[0],
+                                  gate.output_device, up_output_device,
+                                  out_ids[0], gate.rows, gate.cols, 8),
+                          "timed double-fused resident gate/up");
+                    check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                              down.weights_device, gate.output_device,
+                              up_output_device, out_ids[0], down.output_device,
+                              out_ids[0], down.rows, down.cols, 32),
+                          "timed double-fused resident down");
+                };
                 launch_optimized_pipeline();
                 check(cudaDeviceSynchronize(),
                       "optimized resident expert synchronize");
@@ -729,12 +743,32 @@ int main(int argc, char **argv) {
                               resident_metrics);
                 failed |= resident_metrics.maximum != 0.0;
 
+                launch_double_fused_pipeline();
+                check(cudaDeviceSynchronize(),
+                      "double-fused resident expert synchronize");
+                check(cudaMemcpy(resident_optimized.data(),
+                                 down.output_device,
+                                 resident_optimized.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost),
+                      "copy double-fused resident expert");
+                const Metrics double_fused_metrics = compare(
+                    gather(resident_optimized, out_ids, 1, down.rows),
+                    gather(resident_baseline, out_ids, 1, down.rows));
+                print_metrics("IQ3/IQ4 double-fused x1",
+                              double_fused_metrics);
+                failed |= double_fused_metrics.maximum != 0.0;
+
                 const float optimized_pipeline_us =
                     benchmark_us(launch_optimized_pipeline);
-                std::printf("IQ3/IQ4 resident expert x1 old/optimized "
-                            "%8.3f/%8.3f us %.3fx\n",
+                const float double_fused_pipeline_us =
+                    benchmark_us(launch_double_fused_pipeline);
+                std::printf("IQ3/IQ4 resident expert x1 "
+                            "old/WIM32/double-fused "
+                            "%8.3f/%8.3f/%8.3f us %.3fx/%.3fx\n",
                             pipeline_us, optimized_pipeline_us,
-                            pipeline_us / optimized_pipeline_us);
+                            double_fused_pipeline_us,
+                            pipeline_us / optimized_pipeline_us,
+                            pipeline_us / double_fused_pipeline_us);
             }
         }
 

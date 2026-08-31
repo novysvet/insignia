@@ -711,6 +711,23 @@ int main(int argc, char **argv) {
                               out_ids[0], down.rows, down.cols, 32),
                           "timed optimized resident fused down");
                 };
+                const auto launch_sign1_pipeline = [&] {
+                    check(insignia::glm53::iq_quantize_activation_rows(
+                              gate.x_device, gate.cols, row_ids, 1,
+                              gate.workspace),
+                          "timed sign1 resident hidden quantize");
+                    check(insignia::glm53::iq3_xxs_gemv2_wim32_sign_x1(
+                              gate_wim32_device, up_wim32_device,
+                              gate.workspace, gate.output_device,
+                              up_output_device, out_ids[0], gate.rows,
+                              gate.cols, 1),
+                          "timed sign1 resident pair");
+                    check(insignia::glm53::iq4_xs_swiglu_gemv_fused_x1(
+                              down.weights_device, gate.output_device,
+                              up_output_device, out_ids[0], down.output_device,
+                              out_ids[0], down.rows, down.cols, 32),
+                          "timed sign1 resident fused down");
+                };
                 launch_optimized_pipeline();
                 check(cudaDeviceSynchronize(),
                       "optimized resident expert synchronize");
@@ -727,12 +744,31 @@ int main(int argc, char **argv) {
                               resident_metrics);
                 failed |= resident_metrics.maximum != 0.0;
 
+                launch_sign1_pipeline();
+                check(cudaDeviceSynchronize(),
+                      "sign1 resident expert synchronize");
+                check(cudaMemcpy(resident_optimized.data(),
+                                 down.output_device,
+                                 resident_optimized.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost),
+                      "copy sign1 resident expert");
+                const Metrics sign1_resident_metrics = compare(
+                    gather(resident_optimized, out_ids, 1, down.rows),
+                    gather(resident_baseline, out_ids, 1, down.rows));
+                print_metrics("IQ3/IQ4 sign1 resident x1",
+                              sign1_resident_metrics);
+                failed |= sign1_resident_metrics.maximum != 0.0;
+
                 const float optimized_pipeline_us =
                     benchmark_us(launch_optimized_pipeline);
-                std::printf("IQ3/IQ4 resident expert x1 old/optimized "
-                            "%8.3f/%8.3f us %.3fx\n",
+                const float sign1_pipeline_us =
+                    benchmark_us(launch_sign1_pipeline);
+                std::printf("IQ3/IQ4 resident expert x1 old/WIM32/sign1 "
+                            "%8.3f/%8.3f/%8.3f us %.3fx/%.3fx\n",
                             pipeline_us, optimized_pipeline_us,
-                            pipeline_us / optimized_pipeline_us);
+                            sign1_pipeline_us,
+                            pipeline_us / optimized_pipeline_us,
+                            pipeline_us / sign1_pipeline_us);
             }
         }
 

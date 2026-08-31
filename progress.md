@@ -52,14 +52,31 @@ policy (K=32, regret .001, eight joint actions), whose existing ArXivLean-40
 result is 1.678->2.491 tok/s (+48.4%) at PPL +0.86%.
 `INSIGNIA_WEB_SPEED_PROFILE=exact` is the exact verification rollback.
 
-The public `UD-Q3_K_XL` four-shard GGUF download writes only to
-`/var/lib/insignia/glm53-q3-k-xl`.  Both the Windows Scheduled Task and a
-transient systemd unit were cleanly stopped after 15--22 seconds; neither was
-an OOM.  A direct one-worker HF resume stays alive through the SSH transport.
-Dry-run reports one complete shard and three remaining files (145.1 GB logical)
-on top of a 93 GiB partial cache; 342 GiB remained free.  The exact HF include
-is `UD-Q3_K_XL/*`.  Treat the box's SSD as contended while the foreground
-resume is active.
+The failed Q3 staging run exposed a host-capacity bug: Arch's dynamic VHD grew
+to 662,358,196,224 bytes while Windows `C:` fell to 8.96 MiB free, the virtual
+block device went offline, and ext4 remounted read-only.  The Samsung 990 EVO
+Plus remained healthy.  Offline `e2fsck` repaired only journal bookkeeping;
+the second no-write pass and the full 12,096-record XPR1-v2 validator passed.
+After the user-authorized NVFP4-store purge, two trim/compact passes reduced
+the VHD to 135,119,503,360 bytes.  Hibernation is restored, Windows `C:` has
+511,844,757,504 bytes free, and Arch has 892,628,439,040 bytes available.  See
+`audits/s12-glm-box-wsl-disk-full-incident.md`.
+
+Remote work now has a proper Arch endpoint.  `ssh glm-box-wsl` reaches a
+key-only sshd through a Tailscale-only Windows port proxy; `ssh glm-box`
+remains the independent Windows recovery/Git control plane.  A single logon
+lifecycle task keeps WSL alive, while all project jobs run natively under
+Arch `tmux`.  The detached-session persistence probe passed.  Per-job Windows
+Scheduled Tasks and nested `wsl.exe` launch chains are retired.  See
+`ops/GLM_BOX_REMOTE.md`.
+
+The public `UD-Q3_K_XL` four-shard GGUF resume writes only to
+`/var/lib/insignia/glm53-q3-k-xl`.  `ops/glm-box-q3-download.sh` uses the
+official HF CLI with one worker, a process lock, a dry-run remaining-byte
+calculation, continuous host/guest capacity guards, and exact four-shard
+completion verification.  The current resumable tree is 94 GiB: shard four is
+complete and the dry run reports 145.1 GB across the other three.  The exact
+HF include is `UD-Q3_K_XL/*`.
 
 The incoming Ada dispatch, DFlash capture, KDA shadowing, anytime WSL A/B,
 teacher-forcing/free-run, causal residual, joint adaptive compute, and anytime

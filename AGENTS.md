@@ -100,8 +100,10 @@ under WSL2 for the GLM path:
 
 **glm-box (remote, where the big cache lives):**
 
-- Reach: `ssh glm-box` (→ `desktop-hlvh09q` over Tailscale, user `PC`, key
-  auth). Windows OpenSSH + Tailscale are auto-start services.
+- Reach: `ssh glm-box-wsl` is the normal Arch data plane (root, key-only,
+  Tailscale-only port 2222); use `ssh glm-box` only as the independent Windows
+  control/recovery plane (user `PC`).  Long jobs run in Arch `tmux`, never in
+  per-job Windows Scheduled Tasks.  See `ops/GLM_BOX_REMOTE.md`.
 - GPU: NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB VRAM, driver 610.47,
   **overclocked: +150 MHz core (~2.95–2.97 GHz sustained) and +2000 MHz
   memory (12.251 GHz effective, ~800 GB/s observed)**. Verified stable
@@ -234,10 +236,13 @@ checks. Wait for coherent token parity before claiming the engine is correct.
 - `.gitattributes` forces LF on `*.sh` — Windows checkouts CRLF-break bash
   otherwise.
 - **Remote workflow**: edit locally → commit → `git push origin
-  glm53-dflash2-4070ti-super` → `ssh glm-box` → `git -C
-  C:\coding\Insignia-glm53-dflash2 pull --ff-only` → build/run inside
-  `wsl -d Arch`. **Never touch `C:\coding\Insignia` on glm-box — it is a stale
-  dirty snapshot kept deliberately.**
+  glm53-dflash2-4070ti-super` → update the Windows worktree with `ssh glm-box
+  git.exe -C C:/coding/Insignia-glm53-dflash2 pull --ff-only` → build/run
+  directly with `ssh glm-box-wsl` (use `tmux` for persistent work).  The
+  checkout appears in Arch at `/mnt/c/coding/Insignia-glm53-dflash2`; its
+  Windows-format worktree pointer means Linux Git must not update it.  **Never
+  touch `C:\coding\Insignia` on glm-box — it is a stale dirty snapshot kept
+  deliberately.**
 - Env knobs are the A/B surface (`INSIGNIA_GLM53_*`): expert tier
   (`EXPERT_CACHE_MB`), FP8 residency (`Q8_BUDGET_MB`), BF16 residency
   (`VRAM_BUDGET_MB`), readers (`READERS`), speculative mode (`DFLASH2`,

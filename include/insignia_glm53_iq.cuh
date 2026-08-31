@@ -29,8 +29,7 @@ cudaError_t iq3_xxs_gemm_prefill32(
     float *y,
     int rows,
     int cols,
-    cudaStream_t stream = nullptr,
-    int cta_threads = 128);
+    cudaStream_t stream = nullptr);
 
 cudaError_t iq4_xs_gemm_prefill32(
     const uint8_t *weights,

@@ -337,20 +337,6 @@ int main(int argc, char **argv) {
               down_wmma_metrics.relative > 2.0e-2 ||
               down_wmma_metrics.cosine < 0.99980;
 
-    check(insignia::glm53::iq3_xxs_gemm_prefill32(
-              gate.weights_device, gate_prefill_device, kPrefillTokens,
-              gate_prefill_output_device, gate.rows, gate.cols, nullptr, 64),
-          "iq3_xxs_gemm_prefill32 two-warp");
-    check(cudaDeviceSynchronize(), "two-warp WMMA32 correctness synchronize");
-    check(cudaMemcpy(gate_prefill_output.data(), gate_prefill_output_device,
-                     gate_prefill_output.size() * sizeof(float),
-                     cudaMemcpyDeviceToHost), "copy two-warp IQ3 WMMA32 output");
-    const Metrics gate_wmma64_metrics =
-        compare(gate_prefill_output, gate_prefill_reference);
-    print_metrics("IQ3 WMMA64 prefill32", gate_wmma64_metrics);
-    failed |= gate_wmma64_metrics.relative > 2.0e-2 ||
-              gate_wmma64_metrics.cosine < 0.99980;
-
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
         check(insignia::glm53::iq_quantize_activation_rows(
@@ -495,12 +481,6 @@ int main(int argc, char **argv) {
                       kPrefillTokens, gate_prefill_output_device,
                       gate.rows, gate.cols), "timed gate WMMA32");
         };
-        const auto launch_gate_wmma64 = [&] {
-            check(insignia::glm53::iq3_xxs_gemm_prefill32(
-                      gate.weights_device, gate_prefill_device,
-                      kPrefillTokens, gate_prefill_output_device,
-                      gate.rows, gate.cols, nullptr, 64), "timed gate WMMA64");
-        };
         const auto launch_down_wmma32 = [&] {
             check(insignia::glm53::iq4_xs_gemm_prefill32(
                       down.weights_device, down_prefill_device,
@@ -510,7 +490,6 @@ int main(int argc, char **argv) {
         const float gate_q8_compute32_us = benchmark_us(launch_gate_q8_compute32);
         const float gate_q8_pipeline32_us = benchmark_us(launch_gate_q8_pipeline32);
         const float gate_wmma32_us = benchmark_us(launch_gate_wmma32);
-        const float gate_wmma64_us = benchmark_us(launch_gate_wmma64);
         const float down_q8_compute32_us = benchmark_us(launch_down_q8_compute32);
         const float down_q8_pipeline32_us = benchmark_us(launch_down_q8_pipeline32);
         const float down_wmma32_us = benchmark_us(launch_down_wmma32);
@@ -518,9 +497,6 @@ int main(int argc, char **argv) {
                     "%.3fx pipe speedup\n",
                     gate_q8_compute32_us, gate_q8_pipeline32_us, gate_wmma32_us,
                     gate_q8_pipeline32_us / gate_wmma32_us);
-        std::printf("IQ3 prefill32 WMMA128/WMMA64 %8.3f/%8.3f us %.3fx\n",
-                    gate_wmma32_us, gate_wmma64_us,
-                    gate_wmma32_us / gate_wmma64_us);
         std::printf("IQ4 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
                     "%.3fx pipe speedup\n",
                     down_q8_compute32_us, down_q8_pipeline32_us, down_wmma32_us,

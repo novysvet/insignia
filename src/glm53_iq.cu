@@ -478,8 +478,8 @@ __global__ __launch_bounds__(256, 2) void q6_k_rows_kernel(
 // rows and thirty-two routed tokens.  It expands one 16x16 weight tile to FP16
 // once, then two warps reuse it through HMMA.  The expert payload is therefore
 // read once per 32 tokens instead of once per eight-token GEMV launch.
-template <int BLOCKS, int THREADS>
-__global__ __launch_bounds__(THREADS, 512 / THREADS) void iq3_xxs_wmma32_kernel(
+template <int BLOCKS>
+__global__ __launch_bounds__(128, 4) void iq3_xxs_wmma32_kernel(
     const uint8_t *__restrict__ weights,
     const float *__restrict__ x,
     float *__restrict__ y,
@@ -502,7 +502,7 @@ __global__ __launch_bounds__(THREADS, 512 / THREADS) void iq3_xxs_wmma32_kernel(
         const int block_id = k0 >> 8;
         const int subgroup = (k0 >> 5) & 7;
 #pragma unroll
-        for (int slot = thread; slot < 16 * 8; slot += THREADS) {
+        for (int slot = thread; slot < 16 * 8; slot += 128) {
             const int local_row = slot >> 3;
             const int local_code = slot & 7;
             const auto &block = reinterpret_cast<const IQ3XXSBlock *>(
@@ -535,7 +535,7 @@ __global__ __launch_bounds__(THREADS, 512 / THREADS) void iq3_xxs_wmma32_kernel(
         // The input tile is stored exactly in the col-major layout expected by
         // matrix_b: [K, token].  Each thread converts eight FP32 activations.
 #pragma unroll
-        for (int item = thread; item < 32 * 32; item += THREADS) {
+        for (int item = thread; item < 32 * 32; item += 128) {
             const int local_token = item >> 5;
             const int local_k = item & 31;
             shared_b[local_token >> 4][local_k + (local_token & 15) * 32] =
@@ -855,27 +855,16 @@ size_t iq_workspace_rows_bytes(int cols, int count) {
 
 cudaError_t iq3_xxs_gemm_prefill32(
     const uint8_t *weights, const float *x, int tokens, float *y,
-    int rows, int cols, cudaStream_t stream, int cta_threads) {
+    int rows, int cols, cudaStream_t stream) {
     if (!weights || !x || !y || rows <= 0 || (rows & 15) ||
-        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096) ||
-        (cta_threads != 64 && cta_threads != 128))
+        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
         return cudaErrorInvalidValue;
-    const dim3 grid(rows / 16, tokens / 32);
-    if (cols == 4096) {
-        if (cta_threads == 64)
-            iq3_xxs_wmma32_kernel<16, 64><<<grid, 64, 0, stream>>>(
-                weights, x, y, rows, cols);
-        else
-            iq3_xxs_wmma32_kernel<16, 128><<<grid, 128, 0, stream>>>(
-                weights, x, y, rows, cols);
-    } else {
-        if (cta_threads == 64)
-            iq3_xxs_wmma32_kernel<8, 64><<<grid, 64, 0, stream>>>(
-                weights, x, y, rows, cols);
-        else
-            iq3_xxs_wmma32_kernel<8, 128><<<grid, 128, 0, stream>>>(
-                weights, x, y, rows, cols);
-    }
+    if (cols == 4096)
+        iq3_xxs_wmma32_kernel<16><<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
+            weights, x, y, rows, cols);
+    else
+        iq3_xxs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
+            weights, x, y, rows, cols);
     return cudaPeekAtLastError();
 }
 

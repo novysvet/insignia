@@ -6,6 +6,24 @@
 
 namespace insignia::glm53 {
 
+// Device-resident XPR1-v2 scale plane. The packed nibble stream names fifteen
+// exact E4M3 bytes plus escape symbol 15; escapes are consumed in logical
+// symbol order. The exclusive prefix has one entry per 256 packed bytes plus
+// a sentinel. Host staging validates the complete directory before this
+// unchecked hot-path view is exposed to a kernel.
+struct alignas(16) Nvfp4PackedScaleView {
+    const uint8_t *packed;
+    const uint8_t *escapes;
+    const uint8_t *codebook;
+    const uint32_t *prefix;
+    uint32_t logical_symbols;
+    uint32_t escape_count;
+    uint32_t prefix_entries;
+    uint32_t packed_block_bytes;
+    uint32_t escape_symbol;
+};
+static_assert(sizeof(Nvfp4PackedScaleView) == 64);
+
 // Workspace contains Q8 activations plus one FP32 scale per NVFP4 block.
 size_t nvfp4_workspace_bytes(int cols);
 
@@ -203,6 +221,84 @@ cudaError_t nvfp4_gemv2_dp4a_quantized_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Count-specialized exact multi-row kernels. `count` is compiled into the
+// accumulator array and `cta_warps` selects a four- or eight-warp output tile.
+// These preserve every row's group order and final warp reduction; callers
+// must still replay expert results in router order when required.
+cudaError_t nvfp4_gemv_dp4a_quantized_rows_fixed(
+    const uint8_t *weights,
+    const uint8_t *scales,
+    float global_scale,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    int cta_warps,
+    cudaStream_t stream = nullptr);
+cudaError_t nvfp4_gemv2_dp4a_quantized_rows_fixed(
+    const uint8_t *weights_a,
+    const uint8_t *scales_a,
+    float global_scale_a,
+    const uint8_t *weights_b,
+    const uint8_t *scales_b,
+    float global_scale_b,
+    const void *workspace,
+    int count,
+    float *y_a,
+    float *y_b,
+    const int *y_ids,
+    int rows,
+    int cols,
+    int cta_warps,
+    cudaStream_t stream = nullptr);
+
+// Executes directly from an exact XPR1-v2 packed scale plane. This is useful
+// for packed VRAM slots: it removes the three-plane expansion launch and cuts
+// scale traffic in half while preserving the DP4A/FP32 accumulation DAG.
+cudaError_t nvfp4_gemv_dp4a_quantized_rows_packed(
+    const uint8_t *weights,
+    Nvfp4PackedScaleView scales,
+    float global_scale,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    int cta_warps,
+    cudaStream_t stream = nullptr);
+cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+    const uint8_t *weights,
+    Nvfp4PackedScaleView scales,
+    float global_scale,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    const float *combine,
+    int rows,
+    int cols,
+    int cta_warps,
+    cudaStream_t stream = nullptr);
+cudaError_t nvfp4_gemv2_dp4a_quantized_rows_packed(
+    const uint8_t *weights_a,
+    Nvfp4PackedScaleView scales_a,
+    float global_scale_a,
+    const uint8_t *weights_b,
+    Nvfp4PackedScaleView scales_b,
+    float global_scale_b,
+    const void *workspace,
+    int count,
+    float *y_a,
+    float *y_b,
+    const int *y_ids,
+    int rows,
+    int cols,
+    int cta_warps,
+    cudaStream_t stream = nullptr);
+
 // GLM-5.3's dimensions are part of the ABI: 4 residual streams are baked into
 // the mHC kernels and never parameterized.  Widths default to the Flash
 // geometry (hidden 4096, 64 KDA heads of 128, MLA heads 64 of 256) so the
@@ -214,6 +310,7 @@ constexpr int kKdaHeads = 64;
 constexpr int kKdaHeadDim = 128;
 constexpr int kMlaHeadDim = 256;
 constexpr int kMlaMaxContext = 262144;
+constexpr int kMlaExactPrefixRows = 256;
 constexpr int kMlaLatentDim = 512;
 constexpr int kMlaLatentGroupSize = 64;
 constexpr int kMlaLatentGroups = kMlaLatentDim / kMlaLatentGroupSize;
@@ -422,7 +519,14 @@ cudaError_t mla_decode_latent_fp8_absorb(
 // Approximate Ada decode path for long contexts. q_eff is quantized once per
 // head, then one CTA shares each latent tile across eight heads and evaluates
 // scores with m16n8k32 E4M3 tensor-core MMA. qeff_* are caller-owned scratch
-// [heads,latent_dim] and [heads,latent_dim/64]. The partial ABI is unchanged.
+// [heads,latent_dim], [heads,latent_dim/64], and optionally FP32
+// [heads,latent_dim]. When exact_prefix, qeff_f32, and exact_prefix_partial are
+// non-null, keys 0..255 are replayed from FP32 and merged before the FP8
+// suffix. parallel_exact_prefix selects the ordered 16-key FP32 speed arm and
+// requires exact_prefix_partial [heads,16,latent_dim+2]; false selects the
+// scalar FP32 diagnostic and requires exact_prefix_partial == nullptr. The
+// diagnostic also evaluates suffix rows 256..511 with scalar arithmetic, so it
+// is not an operation-order reference for the shipping H8 suffix.
 cudaError_t mla_decode_latent_cross_head_fp8_absorb(
     const float *query,
     const float *latent,
@@ -438,6 +542,10 @@ cudaError_t mla_decode_latent_cross_head_fp8_absorb(
     int heads = kKdaHeads,
     int head_dim = kMlaHeadDim,
     int latent_dim = kMlaLatentDim,
+    const float *exact_prefix = nullptr,
+    float *qeff_f32 = nullptr,
+    float *exact_prefix_partial = nullptr,
+    bool parallel_exact_prefix = false,
     cudaStream_t stream = nullptr);
 
 // Prefill `tokens` queries [tokens,heads,head_dim] against the latent
@@ -481,6 +589,8 @@ cudaError_t mla_prefill_latent_fp8_absorb(
 // Approximate H4 x Q8 long-context prefill counterpart of the cross-head
 // decode path. qeff scratch is token-major. One persistent CTA scans the full
 // causal prefix for each (eight queries, four heads) tile and projects W_uv.
+// exact_prefix/qeff_f32 have the same optional 256-row splice contract as the
+// decode entry point; qeff_f32 is [tokens,heads,latent_dim].
 cudaError_t mla_prefill_latent_cross_head_fp8_absorb(
     const float *query,
     const float *latents,
@@ -496,6 +606,22 @@ cudaError_t mla_prefill_latent_cross_head_fp8_absorb(
     int heads = kKdaHeads,
     int head_dim = kMlaHeadDim,
     int latent_dim = kMlaLatentDim,
+    const float *exact_prefix = nullptr,
+    float *qeff_f32 = nullptr,
     cudaStream_t stream = nullptr);
+
+// Shared production/test dispatch policy. Small verify chunks use repeated
+// decode so they retain the exact prefix without paying the under-filled fused
+// prefill CTA; chunks of at least 16 rows use the persistent prefill kernel.
+inline constexpr bool mla_cross_head_use_fused_prefill(
+    int tokens, int /*position_base*/) {
+    return tokens >= 16;
+}
+
+inline constexpr int mla_exact_prefix_overlap_tokens(
+    int tokens, int position_base) {
+    const int remaining = kMlaExactPrefixRows - position_base;
+    return remaining <= 0 ? 0 : (tokens < remaining ? tokens : remaining);
+}
 
 }  // namespace insignia::glm53

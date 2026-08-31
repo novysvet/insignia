@@ -12,7 +12,8 @@ For every selected theorem the harness:
 * runs exact, Top-6, and Top-6+cache-aware DFlash verification;
 * records cold-process prefill and decode throughput plus complete text;
 * teacher-forces the exact continuation through every arm;
-* reports full-vocabulary cosine, MSE, KL, JS, top-1 agreement, and PPL delta;
+* reports full-vocabulary raw and mean-centered cosine/relative-L2/MSE,
+  KL both ways, JS, top-1 agreement, and PPL delta;
 * marks candidates over the configured PPL budget (3.5% by default) rejected.
 """
 
@@ -37,6 +38,8 @@ DFLASH_RE = re.compile(
     r"(?P<generated>\d+) greedy tokens in (?P<rounds>\d+) DFLASH2-k(?P<verify_k>\d+) "
     r"rounds \((?P<accepted>[0-9.]+) accepted/round, (?P<empty>\d+) empty; "
     r"(?P<ms_token>[0-9.]+) ms/token;")
+SCALAR_RE = re.compile(
+    r"(?P<generated>\d+) greedy tokens? total (?P<total_seconds>[0-9.]+) s")
 PROMPT_RE = re.compile(r"(?P<tokens>\d+)-token prompt (?P<seconds>[0-9.]+) s")
 LEAN_BLOCK_RE = re.compile(r"```(?:lean)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 THEOREM_RE = re.compile(r"(?m)^\s*(?:theorem|lemma)\s+([A-Za-z_][\w.']*)")
@@ -79,6 +82,7 @@ POLICY_ENV = (
     "INSIGNIA_GLM53_FORCE_TOKENS",
     "INSIGNIA_GLM53_FORCE_LOGITS_DUMP",
     "INSIGNIA_GLM53_FORCE_DF_LOGITS_DUMP",
+    "INSIGNIA_GLM53_LOGITS_DUMP",
 )
 
 
@@ -151,10 +155,11 @@ def structural_quality(row: dict[str, Any], text: str) -> dict[str, Any]:
 
 def parse_run(output: str, tokenizer: Tokenizer) -> dict[str, Any]:
     ids_match = GREEDY_RE.search(output)
-    timing = DFLASH_RE.search(output)
+    dflash_timing = DFLASH_RE.search(output)
+    scalar_timing = SCALAR_RE.search(output)
     prompt = PROMPT_RE.search(output)
-    if not ids_match or not timing or not prompt:
-        raise RuntimeError("engine output lacks greedy IDs, DFlash timing, or prompt timing")
+    if not ids_match or not prompt or (not dflash_timing and not scalar_timing):
+        raise RuntimeError("engine output lacks greedy IDs, decode timing, or prompt timing")
     ids = [int(value) for value in ids_match.group(1).split()]
     display_ids = list(ids)
     for stop in (tokenizer.token_to_id("<|im_end|>"), 151643):
@@ -163,16 +168,34 @@ def parse_run(output: str, tokenizer: Tokenizer) -> dict[str, Any]:
     text = tokenizer.decode(display_ids, skip_special_tokens=False)
     prompt_tokens = int(prompt.group("tokens"))
     prompt_seconds = float(prompt.group("seconds"))
+    if dflash_timing:
+        generated = int(dflash_timing.group("generated"))
+        rounds = int(dflash_timing.group("rounds"))
+        verify_k = int(dflash_timing.group("verify_k"))
+        accepted_per_round = float(dflash_timing.group("accepted"))
+        empty_rounds = int(dflash_timing.group("empty"))
+        decode_ms_per_token = float(dflash_timing.group("ms_token"))
+    else:
+        assert scalar_timing is not None
+        generated = int(scalar_timing.group("generated"))
+        total_seconds = float(scalar_timing.group("total_seconds"))
+        if total_seconds < prompt_seconds:
+            raise RuntimeError("scalar total timing is shorter than prompt timing")
+        rounds = generated
+        verify_k = 1
+        accepted_per_round = 1.0
+        empty_rounds = 0
+        decode_ms_per_token = 1000.0 * (total_seconds - prompt_seconds) / generated
     return {
         "ids": ids,
         "text": text,
-        "generated": int(timing.group("generated")),
-        "rounds": int(timing.group("rounds")),
-        "verify_k": int(timing.group("verify_k")),
-        "accepted_per_round": float(timing.group("accepted")),
-        "empty_rounds": int(timing.group("empty")),
-        "decode_ms_per_token": float(timing.group("ms_token")),
-        "decode_tokens_per_second": 1000.0 / float(timing.group("ms_token")),
+        "generated": generated,
+        "rounds": rounds,
+        "verify_k": verify_k,
+        "accepted_per_round": accepted_per_round,
+        "empty_rounds": empty_rounds,
+        "decode_ms_per_token": decode_ms_per_token,
+        "decode_tokens_per_second": 1000.0 / decode_ms_per_token,
         "prompt_tokens": prompt_tokens,
         "prompt_seconds": prompt_seconds,
         "prefill_tokens_per_second": prompt_tokens / prompt_seconds,
@@ -188,19 +211,23 @@ def first_divergence(reference: list[int], candidate: list[int]) -> int | None:
 
 def base_environment(args: argparse.Namespace, policy: str) -> dict[str, str]:
     environment = os.environ.copy()
+    no_dflash = getattr(args, "no_dflash", False)
     for key in POLICY_ENV:
         environment.pop(key, None)
     environment.update({
         "INSIGNIA_GLM53_Q8_BUDGET_MB": str(args.q8_budget_mb),
         "INSIGNIA_GLM53_EXPERT_CACHE_MB": str(args.cache_mb),
         "INSIGNIA_GLM53_READERS": str(args.readers),
-        "INSIGNIA_GLM53_DFLASH2": "1",
-        "INSIGNIA_GLM53_DFLASH2_FP8": str(args.dflash_fp8),
+        "INSIGNIA_GLM53_DFLASH2": "0" if no_dflash else "1",
         "INSIGNIA_GLM53_DF_VERIFY_K": str(args.verify_k),
         "INSIGNIA_GLM53_DF_ADAPTIVE_K": "0",
         "INSIGNIA_GLM53_DF_BATCH_VERIFY": "1",
         **POLICIES[policy],
     })
+    if no_dflash:
+        environment.pop("INSIGNIA_GLM53_DFLASH2_FP8", None)
+    else:
+        environment["INSIGNIA_GLM53_DFLASH2_FP8"] = str(args.dflash_fp8)
     if policy == "top6-cache":
         environment["INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET"] = (
             f"{getattr(args, 'cache_route_regret', .001):g}")
@@ -238,9 +265,17 @@ def run_process(command: list[str], environment: dict[str, str], log: pathlib.Pa
 
 def run_free(args: argparse.Namespace, prompt_file: pathlib.Path,
              tokenizer: Tokenizer, policy: str, case_dir: pathlib.Path) -> dict[str, Any]:
+    environment = base_environment(args, policy)
+    if policy == "exact" and args.quality_tokens:
+        # The exact free trajectory defines the teacher-forced token sequence,
+        # so its first N logit records are already the exact reference. Reusing
+        # them avoids a second N-token whole-model pass (minutes on the local
+        # out-of-core machine) without changing a single evaluated prefix.
+        environment["INSIGNIA_GLM53_LOGITS_DUMP"] = str(
+            case_dir / "exact-quality-logits.f32")
     output, wall = run_process(
         engine_command(args, prompt_file, args.generate),
-        base_environment(args, policy), case_dir / f"{policy}.log", args.timeout)
+        environment, case_dir / f"{policy}.log", args.timeout)
     result = parse_run(output, tokenizer)
     result["wall_seconds"] = wall
     return result
@@ -275,14 +310,20 @@ def parse_comparison(text: str) -> dict[str, Any]:
     ppl_a, ppl_b = float(ppl.group(1)), float(ppl.group(2))
     return {
         "cosine_mean": metric("cos"),
+        "relative_l2_mean": metric("rel_l2"),
         "mse_mean": metric("mse"),
+        "centered_cosine_mean": metric("cos_ctr"),
+        "centered_relative_l2_mean": metric("rel_l2_ctr"),
+        "centered_mse_mean": metric("mse_ctr"),
         "kl_mean": metric("kl"),
+        "kl_reverse_mean": metric("klrev"),
         "js_mean": metric("js"),
         "top1_percent": float(top1.group(1)),
         "top1_matches": int(top1.group(2)),
         "steps": int(top1.group(3)),
         "ppl_exact": ppl_a,
         "ppl_candidate": ppl_b,
+        "ppl_ratio": ppl_b / ppl_a,
         "ppl_delta_fraction": ppl_b / ppl_a - 1.0,
     }
 
@@ -407,6 +448,8 @@ def main() -> None:
                         help="same-token full-vocab comparison length; 0 disables")
     parser.add_argument("--max-ppl-delta", type=float, default=.035)
     parser.add_argument("--verify-k", type=int, default=4)
+    parser.add_argument("--no-dflash", action="store_true",
+                        help="disable DFlash2; compatible only with --policy exact")
     parser.add_argument("--cache-mb", type=int, default=32768)
     parser.add_argument("--q8-budget-mb", type=int, default=10240)
     parser.add_argument("--readers", type=int, default=4)
@@ -428,6 +471,8 @@ def main() -> None:
         parser.error("--generate must be at least 2 for DFlash timing")
     if args.quality_tokens < 0:
         parser.error("--quality-tokens cannot be negative")
+    if args.quality_tokens > args.generate:
+        parser.error("--quality-tokens cannot exceed --generate")
     if args.max_ppl_delta < 0:
         parser.error("--max-ppl-delta cannot be negative")
     if not 0 <= args.prefill_approx_first_layer < 45:
@@ -467,6 +512,8 @@ def main() -> None:
         policies.insert(0, "exact")
     if len(set(policies)) != len(policies):
         parser.error("duplicate --policy")
+    if args.no_dflash and any(policy != "exact" for policy in policies):
+        parser.error("--no-dflash is compatible only with --policy exact")
     args.output.mkdir(parents=True, exist_ok=False)
 
     all_results = []
@@ -482,7 +529,7 @@ def main() -> None:
                 f"exceeds context {args.max_context}")
         prompt_file = case_dir / "prompt.csv"
         prompt_file.write_text(",".join(map(str, prompt_ids)) + "\n", encoding="utf-8")
-        (case_dir / "prompt.txt").write_text(chat_prompt(row) + "\n", encoding="utf-8")
+        (case_dir / "prompt.txt").write_text(chat_prompt(row), encoding="utf-8")
 
         results: dict[str, dict[str, Any]] = {}
         for policy in policies:
@@ -500,8 +547,14 @@ def main() -> None:
                 raise RuntimeError("exact run produced fewer than two quality tokens")
             forced_file = case_dir / "forced.csv"
             forced_file.write_text(",".join(map(str, forced)) + "\n", encoding="utf-8")
-            dumps = {}
+            (case_dir / "forced-input.csv").write_text(
+                ",".join(map(str, prompt_ids + forced[:-1])) + "\n", encoding="utf-8")
+            dumps = {"exact": case_dir / "exact-quality-logits.f32"}
+            if not dumps["exact"].is_file():
+                raise RuntimeError("exact free run did not produce its quality-logit dump")
             for policy in policies:
+                if policy == "exact":
+                    continue
                 print(f"  same-token quality: {policy}", flush=True)
                 dumps[policy] = run_forced(args, prompt_file, forced_file, policy, case_dir)
             for policy in policies:

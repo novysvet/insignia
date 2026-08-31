@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <system_error>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -53,7 +54,8 @@ std::vector<uint8_t> load_file(const std::filesystem::path &path) {
 }  // namespace
 
 ShardedIndex::ShardedIndex(const std::filesystem::path &index_path,
-                           const std::filesystem::path &model_root) {
+                           const std::filesystem::path &model_root,
+                           AlternateShardPolicy alternate_policy) {
     std::vector<uint8_t> bytes = load_file(index_path);
     Reader reader{bytes.data(), bytes.data() + bytes.size()};
     if (reader.string(8) != "IGLMIDX1") throw std::runtime_error("bad GLM-5.3 index magic");
@@ -75,22 +77,52 @@ ShardedIndex::ShardedIndex(const std::filesystem::path &index_path,
     shard_sizes_.reserve(shard_count);
     shard_fds_.reserve(shard_count);
     direct_fds_.reserve(shard_count);
+    try {
     // Optional alternate directory serving individual shards (dual-vhdx
     // striping): a shard present under the override opens from there instead
     // of the model root, spreading expert reads across two host drives.
-    const char *alt_raw = std::getenv("INSIGNIA_GLM53_ALT_SHARD_DIR");
+    const char *alt_raw = alternate_policy == AlternateShardPolicy::disabled
+                              ? nullptr
+                              : std::getenv("INSIGNIA_GLM53_ALT_SHARD_DIR");
     const std::filesystem::path alt_dir = alt_raw ? std::filesystem::path(alt_raw) : std::filesystem::path();
+    if (alternate_policy == AlternateShardPolicy::strict_overlay && alt_dir.empty())
+        throw std::runtime_error(
+            "INSIGNIA_GLM53_STRIPE_INDEX requires INSIGNIA_GLM53_ALT_SHARD_DIR");
+    if (!alt_dir.empty()) {
+        struct stat primary_stat{}, alternate_stat{};
+        if (::stat(model_root.c_str(), &primary_stat) != 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "stat primary model root " + model_root.string());
+        if (::stat(alt_dir.c_str(), &alternate_stat) != 0 || !S_ISDIR(alternate_stat.st_mode))
+            throw std::runtime_error("alternate shard directory is missing: " + alt_dir.string());
+        if (primary_stat.st_dev == alternate_stat.st_dev)
+            throw std::runtime_error(
+                "alternate shard directory is on the primary filesystem; refusing fake striping: " +
+                alt_dir.string());
+    }
     for (uint32_t index = 0; index < shard_count; ++index) {
         const uint16_t length = reader.scalar<uint16_t>();
         const uint64_t expected_size = reader.scalar<uint64_t>();
         std::string name = reader.string(length);
-        std::filesystem::path path = model_root / name;
+        const std::filesystem::path primary = model_root / name;
+        std::filesystem::path path = primary;
+        std::error_code primary_probe;
+        const bool primary_valid =
+            std::filesystem::file_size(primary, primary_probe) == expected_size && !primary_probe;
+        bool use_alt = false;
         if (!alt_dir.empty()) {
             const std::filesystem::path alternate = alt_dir / name;
             std::error_code probe;
-            if (std::filesystem::file_size(alternate, probe) == expected_size && !probe) {
+            const bool alternate_valid =
+                std::filesystem::file_size(alternate, probe) == expected_size && !probe;
+            use_alt = alternate_policy == AlternateShardPolicy::strict_overlay
+                          ? !primary_valid && alternate_valid
+                          : alternate_valid;
+            if (use_alt) {
                 path = alternate;
                 alt_shard_.push_back(1);
+                ++alt_shard_count_;
+                alt_shard_bytes_ += expected_size;
             } else {
                 alt_shard_.push_back(0);
             }
@@ -108,10 +140,16 @@ ShardedIndex::ShardedIndex(const std::filesystem::path &index_path,
         shard_fds_.push_back(fd);
 #ifdef O_DIRECT
         direct_fds_.push_back(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT));
+        if (use_alt && direct_fds_.back() < 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "alternate shard lacks O_DIRECT " + path.string());
 #else
         direct_fds_.push_back(-1);
 #endif
     }
+    if (!alt_dir.empty() && alt_shard_count_ == 0)
+        throw std::runtime_error("alternate shard directory resolved zero indexed shards: " +
+                                 alt_dir.string());
 
     tensors_.reserve(tensor_count);
     for (uint32_t index = 0; index < tensor_count; ++index) {
@@ -132,6 +170,15 @@ ShardedIndex::ShardedIndex(const std::filesystem::path &index_path,
             throw std::runtime_error("duplicate tensor in GLM-5.3 index");
     }
     if (reader.cursor != reader.end) throw std::runtime_error("trailing bytes in GLM-5.3 index");
+    } catch (...) {
+        for (const int fd : shard_fds_)
+            if (fd >= 0) ::close(fd);
+        for (const int fd : direct_fds_)
+            if (fd >= 0) ::close(fd);
+        shard_fds_.clear();
+        direct_fds_.clear();
+        throw;
+    }
 }
 
 ShardedIndex::~ShardedIndex() {

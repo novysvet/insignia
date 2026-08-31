@@ -1,5 +1,150 @@
 # progress
 
+### 2026-08-30 (session 11) - local 4070 SUPER branch; real C:+E: expert overlay
+
+Local work now lives on `codex/glm53-dflash2-4070-super`, forked from the
+4070 Ti SUPER branch.  The dual-SSD path is a fail-closed per-expert overlay:
+C: remains the authoritative compact store, while a companion index maps a
+route/miss-weighted subset of complete expert records to versioned shards on
+the E:-backed ext4 VHDX.  At measured 5.94/2.58 GB/s drive rates, the
+deterministic subset-DP planner selects 3,654 records (87/layer) and assigns
+30.208% of uniform traffic to E:, matching the 30.28% service target.  The
+route analyzer now emits per-(layer,expert) LRU *miss* weights with cache reset
+between prompt traces, so placement does not confuse raw routing frequency
+with bytes that actually reach NVMe.
+
+Mount identity, distinct devices, Windows E: backing space, guest free space,
+mount-loss-safe directory-FD writes, locking, aliases, atomic publication,
+weight provenance, regenerated placement, full hashes, and every remapped
+record byte are checked.  Runtime E-I/O failure either retries the exact C copy
+or aborts under `INSIGNIA_GLM53_STRIPE_REQUIRED=1`; DFlash checkpoint reads are
+never redirected.  Unsafe legacy whole-shard/modulo tools now hard-error.
+Striping tests pass 17/17, shell/Python checks pass, and the Ryzen `znver3`
+local CUDA generator build passes.  A real repack/throughput claim is pending:
+`E:\stripe\stripe.vhdx` is detached and this non-elevated process correctly
+failed before writing.  Run `build\remount-stripe.bat` elevated, then avoid an
+I/O A/B while the new 120 GB GGUF is downloading on E:.
+
+The exact NVFP4 compute-for-bandwidth wave is complete.  All 12,096 expert
+records were relaid in place as the XPR1-v2 packed-scale format and all 36,288
+scale-prefix tables passed a full nibble recount.  Ada now executes the packed
+scale plane directly instead of expanding 512 KiB of E4M3 scale bytes per
+projection.  The direct store, gate/up pair, and weighted-down kernels are
+byte-exact for every active multiplicity B=1..8 in both real expert geometries.
+Three matched whole-model runs give a 3.84% median prompt/prefill win and 2.34%
+three-token wall-time win with full-vocabulary dumps byte-identical; a fresh
+default-vs-rollback probe gives 3.44%.  When
+`INSIGNIA_GLM53_PACKED_EXPERTS` points at XPR1-v2, direct execution is the
+packed-path default and `INSIGNIA_GLM53_PACKED_DIRECT=0` is the exact rollback.
+Packed experts and `INSIGNIA_GLM53_STRIPE_INDEX` are currently mutually
+exclusive and fail closed; dual-SSD overlay runs retain the original
+expert-record layout until the packed index gains stripe support.  The direct
+XPR1 measurements are single-store runs.
+Twenty-one serialized timing pairs specialize the local 4070 SUPER:
+gate/up uses eight CTA warps; down-store uses four except B=3; weighted-down
+uses eight only at B=3--4.  See `audits/s11-nvfp4-direct-execution.md`.
+
+The table-free exact E2M1 decoder was rejected after its initial loaded-system
+win vanished under serialized measurement: 15.443 us versus 12.332 us for the
+shared-table DP4A arm (25.2% slower).  The v2 conversion briefly filled E:;
+only two independently verified stale Git-LFS partial objects were deleted,
+recovering 41.4 GiB without touching either complete model.  New builds and
+benchmark artifacts stay on the C:-backed WSL volume.
+
+DFlash renewal accounting now distinguishes accepted draft tokens from
+committed output tokens, counts plain-greedy tail commits, represents accepted
+length eight, and reports both rewards per round and per second.  The focused
+suite passes 14/14.  The shipped renewal bundle remains a reference solver,
+not a wired production policy; adaptive-k v2 continues to optimize committed
+decode throughput while accepted-draft rate is an explicit diagnostic.
+
+Incoming report triage is frozen in
+`audits/s11-local-stripe-control-triage.md`.  The synthetic adaptive-expert
+package is rejected: its benchmark did not complete, one reconstructed cell
+saved only 1.04% with 97.52% Top-8 fallback and ~470 ms/cycle Python overhead,
+and its cache model omits layer identity.  The retained future seam is a
+request-persistent risk ledger on top of the existing joint union optimizer,
+after >=10k real on-policy rows and aligned free-run labels.  Early-information
+prefetch supports a route-scoped probationary/drain guard; hierarchy
+counterexamples reject scalar separability; the falsifier proof confirms that
+forced-prefix data cannot certify free-run collapse.  The exact-prefix splice
+for long-context cross-head FP8 MLA now replays rows 0--255 from FP32 latents:
+the focused seam is exact at decode and `3.14e-8` relative-L2 at prefill, while
+the 8192 early-retrieval proxy improves from +2.07775% PPL to -0.00019%.  The
+first correct kernel paid +28.91% decode.  Within the explicitly enabled
+cross-head arm (`INSIGNIA_GLM53_MLA_CROSS_HEAD_FP8=1`), its ordered-partial
+FP32 replacement is now the default and cuts that tax to +4.10%: at context 8192 its three-run
+median is 0.5334 ms versus 0.6703 ms for the scalar diagnostic (`20.42%`
+faster) and 0.5124 ms without the splice.  Fast versus scalar is
+`4.465e-7` relative-L2 with zero Top-1 changes; versus the full-FP32 oracle it
+measures MSE `5.097e-9`, relative-L2 `2.188e-3`, cosine `0.999997608`, KL
+`2.538e-9`, JS `6.358e-10`, synthetic PPL `-0.00117%`, and zero Top-1
+changes.  DFlash-sized 1--8-row chunks use repeated spliced decode because it
+beats fused prefill at every tested context; 16+ rows use fused prefill.
+Production dispatch now splits chunks that cross position 256 and passes the
+192+96 regression, eliminating the uninitialized sidecar and hidden all-FP8
+verify paths found by independent review.  The remaining prefill16 tax is
+about +14.0% (2.5104 versus 2.2014 ms).  Set
+`INSIGNIA_GLM53_MLA_PREFIX_PARALLEL=0` only for the scalar diagnostic while the
+cross-head arm is enabled; engine-wide MLA does not enable cross-head FP8.  The
+legacy ops benchmark's unrelated OOM is also fixed: context-8/16 tests no
+longer allocate the 262144-row production ceiling.  See
+`audits/mla-exact-prefix-splice.md`.
+Contextual Belady is also a no-port result: its full selector costs ~92--112 ms
+per 42 layers and loses to LRU by 2.00% in calibrated noise and 3.06% under
+prompt shift; only its demand-reserved-reader and operational-cost accounting
+rules survive.
+
+Problem 11's heterogeneous scheduler is retained only as a future glm-box
+shadow-instrumentation plan; see `audits/s11-heterogeneous-scheduler-deferred.md`.
+Its 44.8982 ms result is synthetic, models one expert rather than GLM's top-8
+union, assumes four independent NVMe servers, and is not an engine speed claim.
+The local transferable pieces are demand priority, queued-read promotion,
+cancellation/duplicate accounting, and the already measured miss-weighted
+dual-drive overlay.  Four-P-core controller affinity and row-local CUDA-event
+scheduling wait for the i7-14700KF box and native-controller parity.
+
+Problem 9's full-vocabulary collision is accepted and permanently reproduced
+by `tools/test_falsifier_v3_collision.py`; see
+`audits/s11-problem9-logit-sketch.md`.  Two worlds have a bit-identical v3
+208-float input and identical Top-32 summaries while JS is 0.691768, centered
+cosine is -0.998642, and selected tail mass changes from `2.54e-13` to
+0.998010.  The delivered TRF-JS schema is not applied: the current model never
+consumes Top-32 values or exact head-JS, the proposed nonlinear control variate
+is absent from its 208 inputs, rotating the key invalidates learned coordinate
+semantics, and the native artifact has no schema/key fingerprint.  On the
+5600X the bounded NumPy prototype took 7.760 ms after shared softmax state
+versus 3.367 ms for cached v3.  The selected first implementation is an exact
+GPU reduction with a 605 KiB persistent device prior, a D2D accepted-row copy,
+and scalar-only D2H, which removes the current extra 619,520-byte transfer and
+spends Ada compute without throwing away vocabulary information.  The
+standalone sm_89 prototype now passes the float64 oracle with worst observed
+absolute field error `9.78e-11`.  On the local 4070 SUPER, seven-run medians
+are 0.232160 ms for the exact pair reduction and 0.272477 ms including the
+619,520-byte prior D2D plus 192-byte pinned D2H, versus 5.612517 ms for the
+existing D2H+CPU path (`20.6x`).  Seven-row DFlash max/log-sum-exp/Top-1 takes
+0.261488 ms plus its 224-byte D2H versus 5.214313 ms for seven CPU scans
+(`19.9x`).  Both reducers are now integrated into the generator's opt-in
+calibration and uncertainty guards: the accepted target row stays in a 605 KiB
+device buffer, exact pair metrics use D2D plus scalar-only D2H, and seven draft
+rows return only compact statistics.  Unit tests and the generator build pass;
+the timings remain focused kernel-path results until an end-to-end decode A/B
+and a 4070 Ti SUPER repeat.
+
+The failed Hugging Face Git-LFS checkout was repaired without a reclone or C:
+temporary storage: the empty Git index was restored, transfer concurrency was
+reduced to one, and worktree materialization completed sequentially.  The
+nominal `UD-IQ3_XXS` model occupies 112.310 GiB without mmproj, but tensor
+metadata reveals a 3.0074-bpw mixture (61.761% IQ2_S, 30.881% IQ3_S), not a
+literal all-IQ3_XXS payload.  The 64-row same-token ArXivLean-40 gate failed:
+PPL 1.1317->1.1804 (+4.303%, above the +3.5% ceiling), raw cosine 0.933472,
+centered cosine 0.889754, Top-1 59/64 (92.19%), and Top-10 overlap 7.59/10.
+See `audits/s11-iq3-quality.md`.  The user authorized deleting the clone after
+the result.  The verified workspace-contained clone was permanently removed,
+raising E: free space from 41.4 to 298.1 GiB (256.8 GiB reclaimed across its
+physical checkout/LFS storage); the two 39,649,280-byte full-vocabulary dumps
+remain on C:.
+
 ### 2026-08-30 (session 10) - learned Falsifier-MoE v1; hard-output gate restored
 
 `audits/s10-falsifier-moe-v1.md` freezes and implements the previously deferred

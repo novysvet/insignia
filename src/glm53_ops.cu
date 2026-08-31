@@ -1411,6 +1411,7 @@ __global__ __launch_bounds__(256, 2) void mla_qeff_fp8_absorb_kernel(
     const uint16_t *__restrict__ kv_b_scales,
     uint8_t *__restrict__ qeff_fp8,
     float *__restrict__ qeff_scales,
+    float *__restrict__ qeff_f32,
     int heads,
     int latent_dim) {
     const int head = blockIdx.x;
@@ -1438,6 +1439,10 @@ __global__ __launch_bounds__(256, 2) void mla_qeff_fp8_absorb_kernel(
     }
     qeff_shared[element] = qe0;
     qeff_shared[element + 256] = qe1;
+    if (qeff_f32) {
+        qeff_f32[size_t(output_row) * latent_dim + element] = qe0;
+        qeff_f32[size_t(output_row) * latent_dim + element + 256] = qe1;
+    }
     __syncthreads();
 
     if (element < kMlaLatentGroups) {
@@ -1504,6 +1509,245 @@ __device__ __forceinline__ uint32_t mla_latent_b_word(
     return word;
 }
 
+// Scalar FP32 diagnostic. Tile zero retains the shipping 512-key boundary:
+// rows 0..255 use the FP32 latent sidecar and unquantized q_eff; rows 256..511
+// use the ordinary FP8 shadow. Because those suffix rows are evaluated here
+// with scalar dequant/FMA rather than H8 MMA, this is not an operation-order
+// reference for the shipping suffix.
+__global__ __launch_bounds__(256) void mla_decode_exact_prefix_scalar_kernel(
+    const float *__restrict__ exact_prefix,
+    const uint8_t *__restrict__ cache,
+    const float *__restrict__ scales,
+    const uint8_t *__restrict__ qeff_fp8,
+    const float *__restrict__ qeff_scales,
+    const float *__restrict__ qeff_f32,
+    float *__restrict__ partial,
+    int position,
+    int tiles) {
+    const int head = blockIdx.x;
+    const int element = threadIdx.x;
+    const int lane = element & 31;
+    const int warp = element >> 5;
+    __shared__ float partial_sum[8];
+    __shared__ float broadcast;
+    __shared__ float latent_scale[kMlaLatentGroups];
+    __shared__ float query_scale[kMlaLatentGroups];
+
+    if (element < kMlaLatentGroups)
+        query_scale[element] =
+            qeff_scales[head * kMlaLatentGroups + element];
+    __syncthreads();
+    const float qe0_exact = qeff_f32[size_t(head) * kMlaLatentDim + element];
+    const float qe1_exact =
+        qeff_f32[size_t(head) * kMlaLatentDim + element + 256];
+    const float qe0_fp8 = fp8_to_float(
+        qeff_fp8[size_t(head) * kMlaLatentDim + element]) *
+        query_scale[element >> 6];
+    const float qe1_fp8 = fp8_to_float(
+        qeff_fp8[size_t(head) * kMlaLatentDim + element + 256]) *
+        query_scale[(element + 256) >> 6];
+
+    float maximum = -3.402823466e38F;
+    float denominator = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const int last = min(position, kMlaDecodeTile - 1);
+    for (int key = 0; key <= last; ++key) {
+        float k0, k1, qe0, qe1;
+        if (key < kMlaExactContext) {
+            k0 = exact_prefix[size_t(key) * kMlaLatentDim + element];
+            k1 = exact_prefix[size_t(key) * kMlaLatentDim + element + 256];
+            qe0 = qe0_exact;
+            qe1 = qe1_exact;
+        } else {
+            if (element < kMlaLatentGroups)
+                latent_scale[element] =
+                    scales[size_t(key) * kMlaLatentGroups + element];
+            __syncthreads();
+            k0 = fp8_to_float(cache[size_t(key) * kMlaLatentDim + element]) *
+                 latent_scale[element >> 6];
+            k1 = fp8_to_float(
+                     cache[size_t(key) * kMlaLatentDim + element + 256]) *
+                 latent_scale[(element + 256) >> 6];
+            qe0 = qe0_fp8;
+            qe1 = qe1_fp8;
+        }
+        const float dot = warp_sum(qe0 * k0 + qe1 * k1);
+        if (!lane) partial_sum[warp] = dot;
+        __syncthreads();
+        if (!element) {
+            float total = 0.0f;
+#pragma unroll
+            for (int index = 0; index < 8; ++index) total += partial_sum[index];
+            broadcast = total * (1.0f / 16.0f);
+        }
+        __syncthreads();
+        const float score = broadcast;
+        const float maximum_new = fmaxf(maximum, score);
+        const float correction = expf(maximum - maximum_new);
+        const float weight = expf(score - maximum_new);
+        maximum = maximum_new;
+        denominator = denominator * correction + weight;
+        acc0 = fmaf(weight, k0, acc0 * correction);
+        acc1 = fmaf(weight, k1, acc1 * correction);
+    }
+
+    float *dst = partial + size_t(head) * tiles * (kMlaLatentDim + 2);
+    if (!element) {
+        dst[0] = maximum;
+        dst[1] = denominator;
+    }
+    dst[2 + element] = acc0;
+    dst[2 + element + 256] = acc1;
+}
+
+constexpr int kMlaExactKeysPerPartial = 16;
+constexpr int kMlaExactPartials = kMlaExactContext / kMlaExactKeysPerPartial;
+
+// Exact FP32 prefix work is split into ordered 16-key partials. A CTA owns
+// eight heads and stages its latent rows once; 128 CTAs expose enough work to
+// fill Ada while preserving per-key online-softmax order inside every partial.
+__global__ __launch_bounds__(256, 2) void mla_decode_exact_prefix_partial_kernel_v2(
+    const float *__restrict__ exact_prefix,
+    const float *__restrict__ qeff_f32,
+    float *__restrict__ prefix_partial) {
+    constexpr int kHeadsPerBlock = 8;
+    extern __shared__ float latent_shared[];
+    __shared__ float score_shared[
+        kHeadsPerBlock * kMlaExactKeysPerPartial];
+    const int thread = threadIdx.x;
+    const int lane = thread & 31;
+    const int warp = thread >> 5;
+    const int chunk = blockIdx.x;
+    const int head0 = blockIdx.y * kHeadsPerBlock;
+    const int key0 = chunk * kMlaExactKeysPerPartial;
+
+    for (int index = thread;
+         index < kMlaExactKeysPerPartial * kMlaLatentDim; index += 256) {
+        const int key = index / kMlaLatentDim;
+        const int dim = index - key * kMlaLatentDim;
+        latent_shared[index] =
+            exact_prefix[size_t(key0 + key) * kMlaLatentDim + dim];
+    }
+    float q_exact[16];
+#pragma unroll
+    for (int index = 0; index < 16; ++index)
+        q_exact[index] = qeff_f32[
+            size_t(head0 + warp) * kMlaLatentDim + lane + index * 32];
+    __syncthreads();
+#pragma unroll
+    for (int key = 0; key < kMlaExactKeysPerPartial; ++key) {
+        float score = 0.0f;
+#pragma unroll
+        for (int index = 0; index < 16; ++index)
+            score = fmaf(q_exact[index],
+                         latent_shared[key * kMlaLatentDim +
+                                       lane + index * 32],
+                         score);
+        score = warp_sum(score);
+        if (!lane)
+            score_shared[warp * kMlaExactKeysPerPartial + key] =
+                score * (1.0f / 16.0f);
+    }
+    __syncthreads();
+
+    float acc0[kHeadsPerBlock] = {};
+    float acc1[kHeadsPerBlock] = {};
+    float row_maximum = -3.402823466e38F;
+    float row_denominator = 0.0f;
+#pragma unroll
+    for (int key = 0; key < kMlaExactKeysPerPartial; ++key) {
+        const float k0 = latent_shared[key * kMlaLatentDim + thread];
+        const float k1 =
+            latent_shared[key * kMlaLatentDim + thread + 256];
+        float correction = 1.0f, weight = 0.0f;
+        if (lane < kHeadsPerBlock) {
+            const float score =
+                score_shared[lane * kMlaExactKeysPerPartial + key];
+            const float maximum_new = fmaxf(row_maximum, score);
+            correction = expf(row_maximum - maximum_new);
+            weight = expf(score - maximum_new);
+            row_maximum = maximum_new;
+            row_denominator = row_denominator * correction + weight;
+        }
+#pragma unroll
+        for (int local_head = 0; local_head < kHeadsPerBlock; ++local_head) {
+            const float head_correction =
+                __shfl_sync(0xffffffffu, correction, local_head);
+            const float head_weight =
+                __shfl_sync(0xffffffffu, weight, local_head);
+            acc0[local_head] = fmaf(
+                head_weight, k0, acc0[local_head] * head_correction);
+            acc1[local_head] = fmaf(
+                head_weight, k1, acc1[local_head] * head_correction);
+        }
+    }
+
+    if (!warp && lane < kHeadsPerBlock) {
+        float *dst = prefix_partial +
+            (size_t(head0 + lane) * kMlaExactPartials + chunk) *
+                (kMlaLatentDim + 2);
+        dst[0] = row_maximum;
+        dst[1] = row_denominator;
+    }
+#pragma unroll
+    for (int local_head = 0; local_head < kHeadsPerBlock; ++local_head) {
+        float *dst = prefix_partial +
+            (size_t(head0 + local_head) * kMlaExactPartials + chunk) *
+                (kMlaLatentDim + 2);
+        dst[2 + thread] = acc0[local_head];
+        dst[2 + thread + 256] = acc1[local_head];
+    }
+}
+
+// Ordered prefix chunks plus the H8 suffix half-tile become the unchanged
+// tile-0 partial consumed by the shipping outer-tile merge.
+__global__ __launch_bounds__(256) void mla_merge_exact_prefix_tile0_kernel(
+    const float *__restrict__ prefix_partial,
+    float *__restrict__ partial,
+    int tiles) {
+    const int head = blockIdx.x;
+    const int element = threadIdx.x;
+    __shared__ float suffix_state[2];
+    const float *prefix = prefix_partial +
+        size_t(head) * kMlaExactPartials * (kMlaLatentDim + 2);
+    float maximum = -3.402823466e38F;
+    float denominator = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < kMlaExactPartials; ++chunk) {
+        const float *src = prefix + size_t(chunk) * (kMlaLatentDim + 2);
+        const float source_maximum = src[0];
+        const float maximum_new = fmaxf(maximum, source_maximum);
+        const float correction = expf(maximum - maximum_new);
+        const float source_correction = expf(source_maximum - maximum_new);
+        maximum = maximum_new;
+        denominator = denominator * correction + src[1] * source_correction;
+        acc0 = fmaf(src[2 + element], source_correction, acc0 * correction);
+        acc1 = fmaf(src[2 + element + 256], source_correction,
+                    acc1 * correction);
+    }
+    float *tile0 = partial + size_t(head) * tiles * (kMlaLatentDim + 2);
+    if (!element) {
+        suffix_state[0] = tile0[0];
+        suffix_state[1] = tile0[1];
+    }
+    __syncthreads();
+    const float source_maximum = suffix_state[0];
+    const float maximum_new = fmaxf(maximum, source_maximum);
+    const float correction = expf(maximum - maximum_new);
+    const float source_correction = expf(source_maximum - maximum_new);
+    denominator = denominator * correction + suffix_state[1] * source_correction;
+    acc0 = fmaf(tile0[2 + element], source_correction, acc0 * correction);
+    acc1 = fmaf(tile0[2 + element + 256], source_correction,
+                acc1 * correction);
+    if (!element) {
+        tile0[0] = maximum_new;
+        tile0[1] = denominator;
+    }
+    tile0[2 + element] = acc0;
+    tile0[2 + element + 256] = acc1;
+}
+
 __global__ __launch_bounds__(256, 2) void mla_decode_cross_head_fp8_partial_kernel(
     const uint8_t *__restrict__ cache,
     const float *__restrict__ scales,
@@ -1511,6 +1755,8 @@ __global__ __launch_bounds__(256, 2) void mla_decode_cross_head_fp8_partial_kern
     const float *__restrict__ qeff_scales,
     float *__restrict__ partial,
     int position,
+    int first_tile,
+    int tile0_skip,
     int tiles) {
     constexpr int kHeadsPerBlock = 8;
     constexpr int kKeysPerMicro = 64;
@@ -1523,10 +1769,12 @@ __global__ __launch_bounds__(256, 2) void mla_decode_cross_head_fp8_partial_kern
     const int thread = threadIdx.x;
     const int lane = thread & 31;
     const int warp = thread >> 5;
-    const int tile = blockIdx.x;
+    const int tile = blockIdx.x + first_tile;
     const int head0 = blockIdx.y * kHeadsPerBlock;
-    const int outer_first = tile * kMlaDecodeTile;
-    const int outer_count = min(kMlaDecodeTile, position + 1 - outer_first);
+    const int skip = tile ? 0 : tile0_skip;
+    const int outer_first = tile * kMlaDecodeTile + skip;
+    const int outer_count =
+        min(kMlaDecodeTile - skip, position + 1 - outer_first);
 
     for (int index = thread; index < kHeadsPerBlock * kMlaLatentDim; index += 256) {
         const int local_head = index / kMlaLatentDim;
@@ -1672,6 +1920,8 @@ __global__ __launch_bounds__(512, 1) void mla_prefill_cross_head_fp8_fused_kerne
     const float *__restrict__ scales,
     const uint8_t *__restrict__ qeff_fp8,
     const float *__restrict__ qeff_scales,
+    const float *__restrict__ qeff_f32,
+    const float *__restrict__ exact_prefix,
     const uint8_t *__restrict__ kv_b_fp8,
     const uint16_t *__restrict__ kv_b_scales,
     float *__restrict__ output,
@@ -1724,7 +1974,74 @@ __global__ __launch_bounds__(512, 1) void mla_prefill_cross_head_fp8_fused_kerne
     float accumulator[kRows] = {};
     float row_maximum = -3.402823466e38F;
     float row_denominator = 0.0f;
-    for (int key0 = 0; key0 <= last_position; key0 += kKeysPerMicro) {
+
+    // The FP32 sidecar is replayed eight logical rows at a time. The first
+    // 16 KiB of the suffix staging slab is dead until the MMA loop begins, so
+    // it doubles as exact-q_eff shared memory without increasing smem.
+    if (exact_prefix) {
+        float *exact_qeff_shared = reinterpret_cast<float *>(storage);
+#pragma unroll
+        for (int row_base = 0; row_base < kRows; row_base += 8) {
+            for (int index = thread; index < 8 * kMlaLatentDim; index += 512) {
+                const int local_row = index / kMlaLatentDim;
+                const int dim = index - local_row * kMlaLatentDim;
+                const int row = row_base + local_row;
+                const int query_local = row / kHeadsPerBlock;
+                const int head_local = row - query_local * kHeadsPerBlock;
+                exact_qeff_shared[index] = query_local < query_count
+                    ? qeff_f32[(size_t(query_base + query_local) * kKdaHeads +
+                                head0 + head_local) * kMlaLatentDim + dim]
+                    : 0.0f;
+            }
+            __syncthreads();
+            for (int key = 0; key < kMlaExactContext; ++key) {
+                if (warp < 8) {
+                    float score = 0.0f;
+                    const float *qrow =
+                        exact_qeff_shared + warp * kMlaLatentDim;
+                    const float *latent =
+                        exact_prefix + size_t(key) * kMlaLatentDim;
+#pragma unroll
+                    for (int dim = lane; dim < kMlaLatentDim; dim += 32)
+                        score = fmaf(qrow[dim], latent[dim], score);
+                    score = warp_sum(score);
+                    if (!lane)
+                        score_shared[row_base + warp] = score * (1.0f / 16.0f);
+                }
+                __syncthreads();
+                const int row = lane;
+                const int query_local = row / kHeadsPerBlock;
+                const bool active = row >= row_base && row < row_base + 8 &&
+                                    query_local < query_count;
+                const float score = active ? score_shared[row] : 0.0f;
+                const float latent_value =
+                    exact_prefix[size_t(key) * kMlaLatentDim + thread];
+                __syncthreads();
+                float correction = 1.0f, weight = 0.0f;
+                if (active) {
+                    const float maximum_new = fmaxf(row_maximum, score);
+                    correction = expf(row_maximum - maximum_new);
+                    weight = expf(score - maximum_new);
+                    row_maximum = maximum_new;
+                    row_denominator = row_denominator * correction + weight;
+                }
+#pragma unroll
+                for (int local_row = 0; local_row < 8; ++local_row) {
+                    const int exact_row = row_base + local_row;
+                    const float row_correction =
+                        __shfl_sync(0xffffffffu, correction, exact_row);
+                    const float row_weight =
+                        __shfl_sync(0xffffffffu, weight, exact_row);
+                    accumulator[exact_row] = fmaf(
+                        row_weight, latent_value,
+                        accumulator[exact_row] * row_correction);
+                }
+            }
+        }
+    }
+
+    const int suffix_first = exact_prefix ? kMlaExactContext : 0;
+    for (int key0 = suffix_first; key0 <= last_position; key0 += kKeysPerMicro) {
         const int valid = min(kKeysPerMicro, last_position + 1 - key0);
         for (int index = thread; index < kKeysPerMicro * kMlaLatentDim; index += 512) {
             const int key = index / kMlaLatentDim;
@@ -2293,27 +2610,61 @@ cudaError_t mla_decode_latent_cross_head_fp8_absorb(
     int heads,
     int head_dim,
     int latent_dim,
+    const float *exact_prefix,
+    float *qeff_f32,
+    float *exact_prefix_partial,
+    bool parallel_exact_prefix,
     cudaStream_t stream) {
     if (position < kMlaExactContext || position >= kMlaMaxContext ||
         heads != kKdaHeads || (heads & 7) || head_dim != kMlaHeadDim ||
         latent_dim != kMlaLatentDim || !query || !latent || !cache || !scales ||
         !kv_b_fp8 || !kv_b_scales || !qeff_fp8 || !qeff_scales ||
-        !partial || !output)
+        !partial || !output || (!!exact_prefix != !!qeff_f32) ||
+        (parallel_exact_prefix != !!exact_prefix_partial) ||
+        (parallel_exact_prefix && !exact_prefix))
         return cudaErrorInvalidValue;
     mla_store_latent_kernel<<<1, latent_dim, 0, stream>>>(
         latent, cache, scales, nullptr, position, latent_dim);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     mla_qeff_fp8_absorb_kernel<<<dim3(heads, 1), 256, 0, stream>>>(
-        query, kv_b_fp8, kv_b_scales, qeff_fp8, qeff_scales, heads, latent_dim);
+        query, kv_b_fp8, kv_b_scales, qeff_fp8, qeff_scales, qeff_f32,
+        heads, latent_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     const int tiles = (position + kMlaDecodeTile) / kMlaDecodeTile;
-    mla_decode_cross_head_fp8_partial_kernel
-        <<<dim3(tiles, heads / 8), 256, 0, stream>>>(
-            cache, scales, qeff_fp8, qeff_scales, partial, position, tiles);
-    status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
+    if (parallel_exact_prefix) {
+        constexpr size_t exact_tile_shared =
+            size_t(kMlaExactKeysPerPartial) * kMlaLatentDim * sizeof(float);
+        mla_decode_exact_prefix_partial_kernel_v2
+            <<<dim3(kMlaExactPartials, heads / 8), 256,
+               exact_tile_shared, stream>>>(
+                exact_prefix, qeff_f32, exact_prefix_partial);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    } else if (exact_prefix) {
+        mla_decode_exact_prefix_scalar_kernel<<<heads, 256, 0, stream>>>(
+            exact_prefix, cache, scales, qeff_fp8, qeff_scales, qeff_f32,
+            partial, position, tiles);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    const int first_tile = exact_prefix && !parallel_exact_prefix ? 1 : 0;
+    if (first_tile < tiles) {
+        mla_decode_cross_head_fp8_partial_kernel
+            <<<dim3(tiles - first_tile, heads / 8), 256, 0, stream>>>(
+                cache, scales, qeff_fp8, qeff_scales, partial, position,
+                first_tile,
+                parallel_exact_prefix ? kMlaExactContext : 0, tiles);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    if (parallel_exact_prefix) {
+        mla_merge_exact_prefix_tile0_kernel<<<heads, 256, 0, stream>>>(
+            exact_prefix_partial, partial, tiles);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
     mla_decode_latent_merge_fp8_absorb_kernel<<<heads, 256, 0, stream>>>(
         kv_b_fp8, kv_b_scales, partial, output, tiles, latent_dim);
     return cudaGetLastError();
@@ -2410,19 +2761,22 @@ cudaError_t mla_prefill_latent_cross_head_fp8_absorb(
     int heads,
     int head_dim,
     int latent_dim,
+    const float *exact_prefix,
+    float *qeff_f32,
     cudaStream_t stream) {
     if (tokens <= 0 || tokens > 128 || position_base < kMlaExactContext ||
         position_base + tokens > kMlaMaxContext || heads != kKdaHeads ||
         (heads & 3) || head_dim != kMlaHeadDim || latent_dim != kMlaLatentDim ||
         !query || !latents || !cache || !scales || !kv_b_fp8 || !kv_b_scales ||
-        !qeff_fp8 || !qeff_scales || !output)
+        !qeff_fp8 || !qeff_scales || !output || (!!exact_prefix != !!qeff_f32))
         return cudaErrorInvalidValue;
     mla_store_latent_kernel<<<tokens, latent_dim, 0, stream>>>(
         latents, cache, scales, nullptr, position_base, latent_dim);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     mla_qeff_fp8_absorb_kernel<<<dim3(heads, tokens), 256, 0, stream>>>(
-        query, kv_b_fp8, kv_b_scales, qeff_fp8, qeff_scales, heads, latent_dim);
+        query, kv_b_fp8, kv_b_scales, qeff_fp8, qeff_scales, qeff_f32,
+        heads, latent_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
 
@@ -2438,8 +2792,8 @@ cudaError_t mla_prefill_latent_cross_head_fp8_absorb(
     if (status != cudaSuccess) return status;
     mla_prefill_cross_head_fp8_fused_kernel
         <<<dim3(heads / 4, (tokens + 7) / 8), 512, shared_bytes, stream>>>(
-            cache, scales, qeff_fp8, qeff_scales, kv_b_fp8, kv_b_scales,
-            output, tokens, position_base);
+            cache, scales, qeff_fp8, qeff_scales, qeff_f32, exact_prefix,
+            kv_b_fp8, kv_b_scales, output, tokens, position_base);
     return cudaGetLastError();
 }
 

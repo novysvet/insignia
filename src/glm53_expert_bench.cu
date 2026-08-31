@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include "insignia_glm53.cuh"
 
@@ -14,11 +15,15 @@
 #include <immintrin.h>
 #endif
 #if !defined(INSIGNIA_GLM53_NO_MAIN)
+#include <algorithm>
 #include <array>
 #include <chrono>
 #endif
 
 namespace {
+
+using namespace nvcuda;
+using insignia::glm53::Nvfp4PackedScaleView;
 
 struct FixtureHeader {
     char magic[8];
@@ -208,6 +213,82 @@ __global__ __launch_bounds__(256) void nvfp4_dp4a_kernel(
     sum = warp_sum(sum);
     if (!lane) y[row] = sum;
 }
+
+#if !defined(INSIGNIA_GLM53_NO_MAIN)
+// Exact arithmetic decoder proposed by the E2M1 embedding proof.  Four code
+// bytes are evaluated lane-wise with CUDA's packed-u8 video intrinsics; the
+// resulting coefficient bytes are identical to c_e2i.  This prototype keeps
+// the DP4A and FP32 reduction DAG unchanged so the benchmark can decide from
+// hardware timing whether deleting the 2 KiB LUT and CTA barrier pays on Ada.
+__device__ __forceinline__ uint32_t decode_e2x4_tablefree(uint32_t codes) {
+    const uint32_t j = codes & 0x07070707u;
+    const uint32_t lo = j & 0x03030303u;
+    const uint32_t high_mag = __vcmpgeu4(j, 0x04040404u);
+    const uint32_t lo_is_three = __vcmpeq4(lo, 0x03030303u);
+    uint32_t correction = lo & high_mag;
+    correction = __vadd4(correction,
+                         lo_is_three & high_mag & 0x02020202u);
+    const uint32_t magnitude = __vadd4(j, correction);
+    const uint32_t negative = __vcmpgeu4(codes, 0x08080808u);
+    return __vsub4(magnitude ^ negative, negative);
+}
+
+__device__ __forceinline__ void unpack_e2_tablefree(
+    uint32_t packed, uint32_t &first, uint32_t &second) {
+    const uint32_t even = packed & 0x0f0f0f0fu;
+    const uint32_t odd = (packed >> 4) & 0x0f0f0f0fu;
+    first = decode_e2x4_tablefree(__byte_perm(even, odd, 0x5140));
+    second = decode_e2x4_tablefree(__byte_perm(even, odd, 0x7362));
+}
+
+__global__ __launch_bounds__(256) void nvfp4_dp4a_tablefree_kernel(
+    const uint32_t *__restrict__ weights,
+    const uint8_t *__restrict__ scales,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    float global_scale) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    const uint32_t *row_weights = weights + static_cast<size_t>(row) * groups * 2;
+    const uint8_t *row_scales = scales + static_cast<size_t>(row) * groups;
+    float sum = 0.0f;
+#pragma unroll 8
+    for (int group = lane; group < groups; group += 32) {
+        const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
+        uint32_t w0, w1, w2, w3;
+        unpack_e2_tablefree(packed.x, w0, w1);
+        unpack_e2_tablefree(packed.y, w2, w3);
+        const uint32_t *xg = xq + group * 4;
+        int dot = __dp4a(int(w0), int(xg[0]), 0);
+        dot = __dp4a(int(w1), int(xg[1]), dot);
+        dot = __dp4a(int(w2), int(xg[2]), dot);
+        dot = __dp4a(int(w3), int(xg[3]), dot);
+        const float scale = 0.5f * c_e4m3[row_scales[group]] * global_scale * xscale[group];
+        sum = fmaf(float(dot), scale, sum);
+    }
+    sum = warp_sum(sum);
+    if (!lane) y[row] = sum;
+}
+
+__global__ void e2_tablefree_exhaustive_kernel(uint32_t *output) {
+    __shared__ unsigned long long table[256];
+    const int byte = threadIdx.x;
+    const uint32_t lo = uint32_t(uint8_t(c_e2i[byte & 15])) * 0x01010101u;
+    const uint32_t hi = uint32_t(uint8_t(c_e2i[byte >> 4])) * 0x01010101u;
+    table[byte] = static_cast<unsigned long long>(lo) |
+                  (static_cast<unsigned long long>(hi) << 32);
+    __syncthreads();
+    if (byte >= 16) return;
+    const uint32_t packed = uint32_t(byte) * 0x11111111u;
+    unpack_e2(packed, table, output[4 * byte], output[4 * byte + 1]);
+    unpack_e2_tablefree(packed, output[4 * byte + 2], output[4 * byte + 3]);
+}
+#endif
 
 __global__ __launch_bounds__(256) void nvfp4_dp4a_acc_kernel(
     const uint32_t *__restrict__ weights,
@@ -627,6 +708,1044 @@ __global__ __launch_bounds__(256) void nvfp4_dp4a_pair_rows_kernel(
     }
 }
 
+// Count-specialized exact multi-row family.  B removes the width-eight live
+// accumulator tax for sparse expert multiplicities below eight; CTA_WARPS
+// exposes the measured four-vs-eight-warp occupancy choice without changing
+// any row's group sequence or XOR reduction tree.
+template <int B>
+struct Nvfp4FixedRowIds {
+    int ids[B];
+};
+
+template <int B, int CTA_WARPS>
+__global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_fixed_rows_kernel(
+    const uint32_t *__restrict__ weights,
+    const uint8_t *__restrict__ scales,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_scale,
+    Nvfp4FixedRowIds<B> out) {
+    static_assert(B >= 1 && B <= 8);
+    static_assert(CTA_WARPS == 4 || CTA_WARPS == 8);
+    __shared__ unsigned long long table[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+        table[code] = static_cast<unsigned long long>(lo) |
+                      (static_cast<unsigned long long>(hi) << 32);
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * CTA_WARPS + warp;
+    if (row >= rows) return;
+    const uint32_t *row_weights = weights + static_cast<size_t>(row) * groups * 2;
+    const uint8_t *row_scales = scales + static_cast<size_t>(row) * groups;
+    float sums[B] = {};
+#pragma unroll 8
+    for (int group = lane; group < groups; group += 32) {
+        const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
+        uint32_t w0, w1, w2, w3;
+        unpack_e2(packed.x, table, w0, w1);
+        unpack_e2(packed.y, table, w2, w3);
+        const float base_scale = 0.5f * c_e4m3[row_scales[group]] * global_scale;
+#pragma unroll
+        for (int r = 0; r < B; ++r) {
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            int dot = __dp4a(int(w0), int(xg[0]), 0);
+            dot = __dp4a(int(w1), int(xg[1]), dot);
+            dot = __dp4a(int(w2), int(xg[2]), dot);
+            dot = __dp4a(int(w3), int(xg[3]), dot);
+            sums[r] = fmaf(float(dot),
+                           base_scale * xscale[static_cast<size_t>(r) * groups + group],
+                           sums[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+        const float sum = warp_sum(sums[r]);
+        if (!lane) y[static_cast<size_t>(out.ids[r]) * rows + row] = sum;
+    }
+}
+
+template <int B, int CTA_WARPS>
+__global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_pair_fixed_rows_kernel(
+    const uint32_t *__restrict__ weights_a,
+    const uint8_t *__restrict__ scales_a,
+    const uint32_t *__restrict__ weights_b,
+    const uint8_t *__restrict__ scales_b,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y_a,
+    float *__restrict__ y_b,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_a,
+    float global_b,
+    Nvfp4FixedRowIds<B> out) {
+    static_assert(B >= 1 && B <= 8);
+    static_assert(CTA_WARPS == 4 || CTA_WARPS == 8);
+    __shared__ unsigned long long table[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+        table[code] = static_cast<unsigned long long>(lo) |
+                      (static_cast<unsigned long long>(hi) << 32);
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * CTA_WARPS + warp;
+    if (row >= rows) return;
+    const uint32_t *row_a = weights_a + static_cast<size_t>(row) * groups * 2;
+    const uint32_t *row_b = weights_b + static_cast<size_t>(row) * groups * 2;
+    const uint8_t *scale_a = scales_a + static_cast<size_t>(row) * groups;
+    const uint8_t *scale_b = scales_b + static_cast<size_t>(row) * groups;
+    float sums_a[B] = {}, sums_b[B] = {};
+#pragma unroll 8
+    for (int group = lane; group < groups; group += 32) {
+        const uint2 packed_a = __ldcs(reinterpret_cast<const uint2 *>(row_a + group * 2));
+        const uint2 packed_b = __ldcs(reinterpret_cast<const uint2 *>(row_b + group * 2));
+        uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
+        unpack_e2(packed_a.x, table, a0, a1);
+        unpack_e2(packed_a.y, table, a2, a3);
+        unpack_e2(packed_b.x, table, b0, b1);
+        unpack_e2(packed_b.y, table, b2, b3);
+#pragma unroll
+        for (int r = 0; r < B; ++r) {
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            const float activation_scale =
+                0.5f * xscale[static_cast<size_t>(r) * groups + group];
+            int dot_a = __dp4a(int(a0), int(xg[0]), 0);
+            dot_a = __dp4a(int(a1), int(xg[1]), dot_a);
+            dot_a = __dp4a(int(a2), int(xg[2]), dot_a);
+            dot_a = __dp4a(int(a3), int(xg[3]), dot_a);
+            int dot_b = __dp4a(int(b0), int(xg[0]), 0);
+            dot_b = __dp4a(int(b1), int(xg[1]), dot_b);
+            dot_b = __dp4a(int(b2), int(xg[2]), dot_b);
+            dot_b = __dp4a(int(b3), int(xg[3]), dot_b);
+            sums_a[r] = fmaf(float(dot_a),
+                             activation_scale * c_e4m3[scale_a[group]] * global_a,
+                             sums_a[r]);
+            sums_b[r] = fmaf(float(dot_b),
+                             activation_scale * c_e4m3[scale_b[group]] * global_b,
+                             sums_b[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+        const float sum_a = warp_sum(sums_a[r]);
+        const float sum_b = warp_sum(sums_b[r]);
+        if (!lane) {
+            y_a[static_cast<size_t>(out.ids[r]) * rows + row] = sum_a;
+            y_b[static_cast<size_t>(out.ids[r]) * rows + row] = sum_b;
+        }
+    }
+}
+
+template <int B, int CTA_WARPS>
+cudaError_t launch_nvfp4_dp4a_fixed_rows(
+    const uint8_t *weights, const uint8_t *scales, float global_scale,
+    const uint32_t *xq, const float *xscale, float *y, const int *y_ids,
+    int rows, int groups, int words_per_row, cudaStream_t stream) {
+    Nvfp4FixedRowIds<B> out{};
+    for (int r = 0; r < B; ++r) out.ids[r] = y_ids[r];
+    nvfp4_dp4a_fixed_rows_kernel<B, CTA_WARPS>
+        <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
+            reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale, y,
+            rows, groups, words_per_row, global_scale, out);
+    return cudaPeekAtLastError();
+}
+
+template <int B, int CTA_WARPS>
+cudaError_t launch_nvfp4_dp4a_pair_fixed_rows(
+    const uint8_t *weights_a, const uint8_t *scales_a, float global_scale_a,
+    const uint8_t *weights_b, const uint8_t *scales_b, float global_scale_b,
+    const uint32_t *xq, const float *xscale, float *y_a, float *y_b,
+    const int *y_ids, int rows, int groups, int words_per_row, cudaStream_t stream) {
+    Nvfp4FixedRowIds<B> out{};
+    for (int r = 0; r < B; ++r) out.ids[r] = y_ids[r];
+    nvfp4_dp4a_pair_fixed_rows_kernel<B, CTA_WARPS>
+        <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
+            reinterpret_cast<const uint32_t *>(weights_a), scales_a,
+            reinterpret_cast<const uint32_t *>(weights_b), scales_b,
+            xq, xscale, y_a, y_b, rows, groups, words_per_row,
+            global_scale_a, global_scale_b, out);
+    return cudaPeekAtLastError();
+}
+
+// XPR1-v2 direct packed-scale prototype.  This deliberately lives in the
+// packed-VRAM execution path. Host staging proves the directory invariants;
+// kernels only pay for the exact decode and retain the existing DP4A DAG.
+
+__device__ __forceinline__ uint32_t packed_warp_sum_u32(uint32_t value) {
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return __shfl_sync(0xffffffffu, value, 0);
+}
+
+__device__ __forceinline__ void build_scale_pair_table(
+    const Nvfp4PackedScaleView &view,
+    uint32_t *__restrict__ table) {
+    const uint32_t code = threadIdx.x;
+    const uint32_t lo = code & 15u;
+    const uint32_t hi = code >> 4;
+    table[code] = uint32_t(view.codebook[lo]) |
+                  (uint32_t(view.codebook[hi]) << 8) |
+                  ((lo == view.escape_symbol ? 1u : 0u) << 16) |
+                  ((hi == view.escape_symbol ? 1u : 0u) << 17);
+}
+
+__device__ __forceinline__ uint32_t packed_escape_count_word(
+    uint32_t word,
+    const uint32_t *__restrict__ table) {
+    return __popc(table[word & 0xffu] >> 16) +
+           __popc(table[(word >> 8) & 0xffu] >> 16) +
+           __popc(table[(word >> 16) & 0xffu] >> 16) +
+           __popc(table[word >> 24] >> 16);
+}
+
+__device__ __forceinline__ uint32_t packed_row_escape_base(
+    const Nvfp4PackedScaleView &view,
+    const uint32_t *__restrict__ table,
+    uint32_t row,
+    uint32_t groups) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const size_t row_packed = (size_t(row) * groups) >> 1;
+    const uint32_t block = uint32_t(row_packed >> 8);
+    const uint32_t in_block = uint32_t(row_packed & 255u);
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(
+        view.packed + size_t(block) * 256u);
+    uint32_t local = 0;
+    for (uint32_t word = lane; word * 4u < in_block; word += 32u)
+        local += packed_escape_count_word(words[word], table);
+    local = packed_warp_sum_u32(local);
+    uint32_t base = lane ? 0u : view.prefix[block];
+    return __shfl_sync(0xffffffffu, base, 0) + local;
+}
+
+__device__ __forceinline__ uint8_t packed_decode_tile32(
+    const Nvfp4PackedScaleView &view,
+    const uint32_t *__restrict__ table,
+    uint32_t row,
+    uint32_t groups,
+    uint32_t tile,
+    uint32_t &cursor) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const size_t symbol = size_t(row) * groups + size_t(tile) * 32u;
+    uint32_t pair = 0;
+    if (lane < 16u) pair = table[view.packed[(symbol >> 1) + lane]];
+    pair = __shfl_sync(0xffffffffu, pair, lane >> 1);
+    uint32_t decoded = (pair >> (8u * (lane & 1u))) & 0xffu;
+    const uint32_t is_escape = (pair >> (16u + (lane & 1u))) & 1u;
+    const uint32_t mask = __ballot_sync(0xffffffffu, is_escape != 0u);
+    if (is_escape) {
+        const uint32_t lower = (uint32_t(1) << lane) - 1u;
+        decoded = view.escapes[cursor + __popc(mask & lower)];
+    }
+    cursor += __popc(mask);
+    return uint8_t(decoded);
+}
+
+template <int B, int CTA_WARPS>
+__global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_fixed_rows_kernel(
+    const uint32_t *__restrict__ weights,
+    Nvfp4PackedScaleView scales,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_scale,
+    Nvfp4FixedRowIds<B> out) {
+    __shared__ unsigned long long e2_table[256];
+    __shared__ uint32_t scale_table[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+        e2_table[code] = static_cast<unsigned long long>(lo) |
+                         (static_cast<unsigned long long>(hi) << 32);
+        scale_table[code] = uint32_t(scales.codebook[code & 15]) |
+                            (uint32_t(scales.codebook[code >> 4]) << 8) |
+                            (((code & 15) == scales.escape_symbol ? 1u : 0u) << 16) |
+                            (((code >> 4) == scales.escape_symbol ? 1u : 0u) << 17);
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * CTA_WARPS + warp;
+    if (row >= rows) return;
+    const uint32_t *row_weights = weights + static_cast<size_t>(row) * groups * 2;
+    uint32_t cursor = packed_row_escape_base(scales, scale_table, row, groups);
+    float sums[B] = {};
+#pragma unroll 8
+    for (int tile = 0; tile < groups / 32; ++tile) {
+        const int group = tile * 32 + lane;
+        const uint8_t scale_byte = packed_decode_tile32(
+            scales, scale_table, row, groups, uint32_t(tile), cursor);
+        const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
+        uint32_t w0, w1, w2, w3;
+        unpack_e2(packed.x, e2_table, w0, w1);
+        unpack_e2(packed.y, e2_table, w2, w3);
+        const float base_scale = 0.5f * c_e4m3[scale_byte] * global_scale;
+#pragma unroll
+        for (int r = 0; r < B; ++r) {
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            int dot = __dp4a(int(w0), int(xg[0]), 0);
+            dot = __dp4a(int(w1), int(xg[1]), dot);
+            dot = __dp4a(int(w2), int(xg[2]), dot);
+            dot = __dp4a(int(w3), int(xg[3]), dot);
+            sums[r] = fmaf(float(dot),
+                           base_scale * xscale[static_cast<size_t>(r) * groups + group],
+                           sums[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+        const float sum = warp_sum(sums[r]);
+        if (!lane) y[static_cast<size_t>(out.ids[r]) * rows + row] = sum;
+    }
+}
+
+template <int B, int CTA_WARPS>
+__global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_pair_fixed_rows_kernel(
+    const uint32_t *__restrict__ weights_a,
+    Nvfp4PackedScaleView scale_a,
+    const uint32_t *__restrict__ weights_b,
+    Nvfp4PackedScaleView scale_b,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y_a,
+    float *__restrict__ y_b,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_a,
+    float global_b,
+    Nvfp4FixedRowIds<B> out) {
+    __shared__ unsigned long long e2_table[256];
+    __shared__ uint32_t table_a[256];
+    __shared__ uint32_t table_b[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+        e2_table[code] = static_cast<unsigned long long>(lo) |
+                         (static_cast<unsigned long long>(hi) << 32);
+        table_a[code] = uint32_t(scale_a.codebook[code & 15]) |
+                        (uint32_t(scale_a.codebook[code >> 4]) << 8) |
+                        (((code & 15) == scale_a.escape_symbol ? 1u : 0u) << 16) |
+                        (((code >> 4) == scale_a.escape_symbol ? 1u : 0u) << 17);
+        table_b[code] = uint32_t(scale_b.codebook[code & 15]) |
+                        (uint32_t(scale_b.codebook[code >> 4]) << 8) |
+                        (((code & 15) == scale_b.escape_symbol ? 1u : 0u) << 16) |
+                        (((code >> 4) == scale_b.escape_symbol ? 1u : 0u) << 17);
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * CTA_WARPS + warp;
+    if (row >= rows) return;
+    const uint32_t *row_a = weights_a + static_cast<size_t>(row) * groups * 2;
+    const uint32_t *row_b = weights_b + static_cast<size_t>(row) * groups * 2;
+    uint32_t cursor_a = packed_row_escape_base(scale_a, table_a, row, groups);
+    uint32_t cursor_b = packed_row_escape_base(scale_b, table_b, row, groups);
+    float sums_a[B] = {}, sums_b[B] = {};
+#pragma unroll 8
+    for (int tile = 0; tile < groups / 32; ++tile) {
+        const int group = tile * 32 + lane;
+        const uint8_t byte_a = packed_decode_tile32(
+            scale_a, table_a, row, groups, uint32_t(tile), cursor_a);
+        const uint8_t byte_b = packed_decode_tile32(
+            scale_b, table_b, row, groups, uint32_t(tile), cursor_b);
+        const uint2 packed_a = __ldcs(reinterpret_cast<const uint2 *>(row_a + group * 2));
+        const uint2 packed_b = __ldcs(reinterpret_cast<const uint2 *>(row_b + group * 2));
+        uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
+        unpack_e2(packed_a.x, e2_table, a0, a1);
+        unpack_e2(packed_a.y, e2_table, a2, a3);
+        unpack_e2(packed_b.x, e2_table, b0, b1);
+        unpack_e2(packed_b.y, e2_table, b2, b3);
+#pragma unroll
+        for (int r = 0; r < B; ++r) {
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            const float activation_scale =
+                0.5f * xscale[static_cast<size_t>(r) * groups + group];
+            int dot_a = __dp4a(int(a0), int(xg[0]), 0);
+            dot_a = __dp4a(int(a1), int(xg[1]), dot_a);
+            dot_a = __dp4a(int(a2), int(xg[2]), dot_a);
+            dot_a = __dp4a(int(a3), int(xg[3]), dot_a);
+            int dot_b = __dp4a(int(b0), int(xg[0]), 0);
+            dot_b = __dp4a(int(b1), int(xg[1]), dot_b);
+            dot_b = __dp4a(int(b2), int(xg[2]), dot_b);
+            dot_b = __dp4a(int(b3), int(xg[3]), dot_b);
+            sums_a[r] = fmaf(float(dot_a),
+                             activation_scale * c_e4m3[byte_a] * global_a,
+                             sums_a[r]);
+            sums_b[r] = fmaf(float(dot_b),
+                             activation_scale * c_e4m3[byte_b] * global_b,
+                             sums_b[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+        const float sum_a = warp_sum(sums_a[r]);
+        const float sum_b = warp_sum(sums_b[r]);
+        if (!lane) {
+            y_a[static_cast<size_t>(out.ids[r]) * rows + row] = sum_a;
+            y_b[static_cast<size_t>(out.ids[r]) * rows + row] = sum_b;
+        }
+    }
+}
+
+template <int B, int CTA_WARPS>
+__global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_acc_fixed_rows_kernel(
+    const uint32_t *__restrict__ weights,
+    Nvfp4PackedScaleView scales,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_scale,
+    Nvfp4RowOut out) {
+    __shared__ unsigned long long e2_table[256];
+    __shared__ uint32_t scale_table[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+        e2_table[code] = static_cast<unsigned long long>(lo) |
+                         (static_cast<unsigned long long>(hi) << 32);
+        scale_table[code] = uint32_t(scales.codebook[code & 15]) |
+                            (uint32_t(scales.codebook[code >> 4]) << 8) |
+                            (((code & 15) == scales.escape_symbol ? 1u : 0u) << 16) |
+                            (((code >> 4) == scales.escape_symbol ? 1u : 0u) << 17);
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * CTA_WARPS + warp;
+    if (row >= rows) return;
+    const uint32_t *row_weights = weights + static_cast<size_t>(row) * groups * 2;
+    uint32_t cursor = packed_row_escape_base(scales, scale_table, row, groups);
+    float sums[B] = {};
+#pragma unroll 8
+    for (int tile = 0; tile < groups / 32; ++tile) {
+        const int group = tile * 32 + lane;
+        const uint8_t scale_byte = packed_decode_tile32(
+            scales, scale_table, row, groups, uint32_t(tile), cursor);
+        const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
+        uint32_t w0, w1, w2, w3;
+        unpack_e2(packed.x, e2_table, w0, w1);
+        unpack_e2(packed.y, e2_table, w2, w3);
+        const float base_scale = 0.5f * c_e4m3[scale_byte] * global_scale;
+#pragma unroll
+        for (int r = 0; r < B; ++r) {
+            const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
+            int dot = __dp4a(int(w0), int(xg[0]), 0);
+            dot = __dp4a(int(w1), int(xg[1]), dot);
+            dot = __dp4a(int(w2), int(xg[2]), dot);
+            dot = __dp4a(int(w3), int(xg[3]), dot);
+            sums[r] = fmaf(float(dot),
+                           base_scale * xscale[static_cast<size_t>(r) * groups + group],
+                           sums[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+        const float sum = warp_sum(sums[r]);
+        if (!lane) {
+            float &destination = y[static_cast<size_t>(out.ids[r]) * rows + row];
+            destination = fmaf(sum, out.weights[r], destination);
+        }
+    }
+}
+
+template <int B, int CTA_WARPS>
+cudaError_t launch_nvfp4_packed_fixed_rows(
+    const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
+    const void *workspace, float *y, const int *ids,
+    int rows, int cols, cudaStream_t stream = nullptr) {
+    Nvfp4FixedRowIds<B> out{};
+    for (int r = 0; r < B; ++r) out.ids[r] = ids[r];
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + B * aligned);
+    nvfp4_dp4a_packed_fixed_rows_kernel<B, CTA_WARPS>
+        <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
+            reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale, y,
+            rows, cols / 16, int(aligned / 4), global_scale, out);
+    return cudaPeekAtLastError();
+}
+
+template <int B, int CTA_WARPS>
+cudaError_t launch_nvfp4_packed_pair_fixed_rows(
+    const uint8_t *weights_a, Nvfp4PackedScaleView scale_a, float global_a,
+    const uint8_t *weights_b, Nvfp4PackedScaleView scale_b, float global_b,
+    const void *workspace, float *y_a, float *y_b, const int *ids,
+    int rows, int cols, cudaStream_t stream = nullptr) {
+    Nvfp4FixedRowIds<B> out{};
+    for (int r = 0; r < B; ++r) out.ids[r] = ids[r];
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + B * aligned);
+    nvfp4_dp4a_packed_pair_fixed_rows_kernel<B, CTA_WARPS>
+        <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
+            reinterpret_cast<const uint32_t *>(weights_a), scale_a,
+            reinterpret_cast<const uint32_t *>(weights_b), scale_b,
+            xq, xscale, y_a, y_b, rows, cols / 16, int(aligned / 4),
+            global_a, global_b, out);
+    return cudaPeekAtLastError();
+}
+
+template <int B, int CTA_WARPS>
+cudaError_t launch_nvfp4_packed_acc_fixed_rows(
+    const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
+    const void *workspace, float *y, const int *ids, const float *combine,
+    int rows, int cols, cudaStream_t stream = nullptr) {
+    Nvfp4RowOut out{};
+    out.count = B;
+    for (int r = 0; r < B; ++r) {
+        out.ids[r] = ids[r];
+        out.weights[r] = combine[r];
+    }
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + B * aligned);
+    nvfp4_dp4a_packed_acc_fixed_rows_kernel<B, CTA_WARPS>
+        <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
+            reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale, y,
+            rows, cols / 16, int(aligned / 4), global_scale, out);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t launch_nvfp4_packed_fixed_rows_runtime(
+    const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
+    const void *workspace, float *y, const int *ids, int count,
+    int rows, int cols, int cta_warps, cudaStream_t stream = nullptr) {
+#define INSIGNIA_PACKED_STORE_CASE(B)                                                \
+    case B:                                                                          \
+        return cta_warps == 4                                                        \
+            ? launch_nvfp4_packed_fixed_rows<B, 4>(                                  \
+                  weights, scales, global_scale, workspace, y, ids, rows, cols, stream) \
+            : launch_nvfp4_packed_fixed_rows<B, 8>(                                  \
+                  weights, scales, global_scale, workspace, y, ids, rows, cols, stream)
+    if (cta_warps != 4 && cta_warps != 8) return cudaErrorInvalidValue;
+    switch (count) {
+        INSIGNIA_PACKED_STORE_CASE(1);
+        INSIGNIA_PACKED_STORE_CASE(2);
+        INSIGNIA_PACKED_STORE_CASE(3);
+        INSIGNIA_PACKED_STORE_CASE(4);
+        INSIGNIA_PACKED_STORE_CASE(5);
+        INSIGNIA_PACKED_STORE_CASE(6);
+        INSIGNIA_PACKED_STORE_CASE(7);
+        INSIGNIA_PACKED_STORE_CASE(8);
+        default: return cudaErrorInvalidValue;
+    }
+#undef INSIGNIA_PACKED_STORE_CASE
+}
+
+cudaError_t launch_nvfp4_packed_pair_fixed_rows_runtime(
+    const uint8_t *weights_a, Nvfp4PackedScaleView scale_a, float global_a,
+    const uint8_t *weights_b, Nvfp4PackedScaleView scale_b, float global_b,
+    const void *workspace, float *y_a, float *y_b, const int *ids, int count,
+    int rows, int cols, int cta_warps, cudaStream_t stream = nullptr) {
+#define INSIGNIA_PACKED_PAIR_CASE(B)                                                \
+    case B:                                                                         \
+        return cta_warps == 4                                                       \
+            ? launch_nvfp4_packed_pair_fixed_rows<B, 4>(                            \
+                  weights_a, scale_a, global_a, weights_b, scale_b, global_b,       \
+                  workspace, y_a, y_b, ids, rows, cols, stream)                     \
+            : launch_nvfp4_packed_pair_fixed_rows<B, 8>(                            \
+                  weights_a, scale_a, global_a, weights_b, scale_b, global_b,       \
+                  workspace, y_a, y_b, ids, rows, cols, stream)
+    if (cta_warps != 4 && cta_warps != 8) return cudaErrorInvalidValue;
+    switch (count) {
+        INSIGNIA_PACKED_PAIR_CASE(1);
+        INSIGNIA_PACKED_PAIR_CASE(2);
+        INSIGNIA_PACKED_PAIR_CASE(3);
+        INSIGNIA_PACKED_PAIR_CASE(4);
+        INSIGNIA_PACKED_PAIR_CASE(5);
+        INSIGNIA_PACKED_PAIR_CASE(6);
+        INSIGNIA_PACKED_PAIR_CASE(7);
+        INSIGNIA_PACKED_PAIR_CASE(8);
+        default: return cudaErrorInvalidValue;
+    }
+#undef INSIGNIA_PACKED_PAIR_CASE
+}
+
+cudaError_t launch_nvfp4_packed_acc_fixed_rows_runtime(
+    const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
+    const void *workspace, float *y, const int *ids, const float *combine,
+    int count, int rows, int cols, int cta_warps, cudaStream_t stream = nullptr) {
+#define INSIGNIA_PACKED_ACC_CASE(B)                                                 \
+    case B:                                                                         \
+        return cta_warps == 4                                                       \
+            ? launch_nvfp4_packed_acc_fixed_rows<B, 4>(                             \
+                  weights, scales, global_scale, workspace, y, ids, combine,        \
+                  rows, cols, stream)                                               \
+            : launch_nvfp4_packed_acc_fixed_rows<B, 8>(                             \
+                  weights, scales, global_scale, workspace, y, ids, combine,        \
+                  rows, cols, stream)
+    if (cta_warps != 4 && cta_warps != 8) return cudaErrorInvalidValue;
+    switch (count) {
+        INSIGNIA_PACKED_ACC_CASE(1);
+        INSIGNIA_PACKED_ACC_CASE(2);
+        INSIGNIA_PACKED_ACC_CASE(3);
+        INSIGNIA_PACKED_ACC_CASE(4);
+        INSIGNIA_PACKED_ACC_CASE(5);
+        INSIGNIA_PACKED_ACC_CASE(6);
+        INSIGNIA_PACKED_ACC_CASE(7);
+        INSIGNIA_PACKED_ACC_CASE(8);
+        default: return cudaErrorInvalidValue;
+    }
+#undef INSIGNIA_PACKED_ACC_CASE
+}
+
+// ---------------------------------------------------------------------------
+// Experimental small-M Tensor Core path.
+//
+// Eight loader warps retain the production row-major streaming geometry:
+// warp n owns output row n and its 32 lanes load 32 consecutive NVFP4 groups.
+// The resulting 8 x (32 groups x 16 K) slab is converted to FP16 in shared
+// memory, while the same block stages up to 16 prequantized activation rows.
+// Each warp then consumes four groups with m16n16k16 HMMA (the upper eight N
+// columns are zero padding). E2M1 integers and signed-Q8 integers are exactly
+// representable in FP16, and the largest 16-term dot is far below 2^24, so an
+// individual MMA result is exactly the same integer dot as four DP4As.
+//
+// The final eight-way split reduction is intentionally NOT the legacy
+// lane-strided 32-way tree. This is the quality-gated speed arm; the old
+// kernels remain the bitwise oracle and production default.
+// ---------------------------------------------------------------------------
+
+#if !defined(INSIGNIA_GLM53_NO_MAIN)
+
+constexpr int kNvTcTokens = 16;
+constexpr int kNvTcOut = 8;
+constexpr int kNvTcWarps = 8;
+constexpr int kNvTcGroupTile = 32;
+
+struct Nvfp4TcRowIds {
+    int count;
+    int ids[kNvTcTokens];
+};
+
+__global__ __launch_bounds__(256, 1) void quantize_x16_tc_rows_kernel(
+    const float *__restrict__ x,
+    __half *__restrict__ xq,
+    float *__restrict__ xscale,
+    int cols,
+    int groups,
+    Nvfp4TcRowIds rows) {
+    const int compact_row = blockIdx.x;
+    if (compact_row >= rows.count) return;
+    const int group = threadIdx.x;
+    if (group >= groups) return;
+    const float4 *source = reinterpret_cast<const float4 *>(
+        x + static_cast<size_t>(rows.ids[compact_row]) * cols + group * 16);
+    float values[16];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        const float4 value = __ldg(source + word);
+        values[word * 4 + 0] = value.x;
+        values[word * 4 + 1] = value.y;
+        values[word * 4 + 2] = value.z;
+        values[word * 4 + 3] = value.w;
+        maximum = fmaxf(maximum, fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                       fmaxf(fabsf(value.z), fabsf(value.w))));
+    }
+    const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+    xscale[static_cast<size_t>(compact_row) * groups + group] =
+        maximum * (1.0f / 127.0f);
+    __half *destination = xq + static_cast<size_t>(compact_row) * cols + group * 16;
+#pragma unroll
+    for (int element = 0; element < 16; ++element) {
+        const int quantized = __float2int_rn(values[element] * inverse);
+        destination[element] = __float2half_rn(float(quantized));
+    }
+}
+
+__global__ __launch_bounds__(256, 1) void nvfp4_tc_rows_kernel(
+    const uint8_t *__restrict__ weights,
+    const uint8_t *__restrict__ scales,
+    const __half *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int cols,
+    int groups,
+    float global_scale,
+    Nvfp4TcRowIds out) {
+    __shared__ __align__(16) __half a[kNvTcGroupTile][kNvTcTokens][16];
+    // b[group][n][k] is the column-major KxN tile WMMA expects: column n is
+    // one checkpoint row and therefore contiguous in K.
+    __shared__ __align__(16) __half b[kNvTcGroupTile][16][16];
+    __shared__ __align__(16) float c[kNvTcWarps][kNvTcTokens][16];
+    __shared__ float weight_scale[kNvTcGroupTile][kNvTcOut];
+    __shared__ float partial[kNvTcWarps][kNvTcTokens][kNvTcOut];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int first_row = blockIdx.x * kNvTcOut;
+    float sums[4] = {};
+
+    for (int group_base = 0; group_base < groups; group_base += kNvTcGroupTile) {
+        // Token-major Q8-as-FP16 -> group-major WMMA A tiles, zero padding
+        // rows count..15. Every global read is naturally contiguous in K.
+        for (int index = threadIdx.x;
+             index < kNvTcGroupTile * kNvTcTokens * 16;
+             index += blockDim.x) {
+            const int local_group = index >> 8;
+            const int rem = index & 255;
+            const int token = rem >> 4;
+            const int k = rem & 15;
+            a[local_group][token][k] = token < out.count
+                ? xq[static_cast<size_t>(token) * cols +
+                     (group_base + local_group) * 16 + k]
+                : __float2half_rn(0.0f);
+        }
+
+        // The upper half of the WMMA N tile is structural zero padding.
+        for (int index = threadIdx.x;
+             index < kNvTcGroupTile * kNvTcOut * 16;
+             index += blockDim.x) {
+            const int local_group = index >> 7;
+            const int rem = index & 127;
+            b[local_group][kNvTcOut + (rem >> 4)][rem & 15] =
+                __float2half_rn(0.0f);
+        }
+
+        // Warp n streams one output row. Lane g owns one consecutive 16-K
+        // group, preserving the coalesced row-major access of the DP4A path.
+        const int row = first_row + warp;
+        const int group = group_base + lane;
+        uint2 packed{};
+        uint8_t scale_code = 0;
+        if (row < rows && group < groups) {
+            const uint8_t *row_weights =
+                weights + static_cast<size_t>(row) * groups * 8;
+            packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 8));
+            scale_code = __ldcs(scales + static_cast<size_t>(row) * groups + group);
+        }
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const uint32_t word = k < 8 ? packed.x : packed.y;
+            const int shift = 4 * (k & 7);
+            b[lane][warp][k] = __float2half_rn(float(c_e2i[(word >> shift) & 15u]));
+        }
+        weight_scale[lane][warp] = c_e4m3[scale_code];
+        __syncthreads();
+
+        // Four groups per warp. WMMA's fragment-to-lane map is deliberately
+        // treated as opaque: store the exact integer dot tile to warp-private
+        // shared memory, then apply the per-(token,row,group) FP32 scales.
+#pragma unroll
+        for (int local_group = warp;
+             local_group < kNvTcGroupTile;
+             local_group += kNvTcWarps) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                           __half, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                           __half, wmma::col_major> bf;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::load_matrix_sync(af, &a[local_group][0][0], 16);
+            wmma::load_matrix_sync(bf, &b[local_group][0][0], 16);
+            wmma::fill_fragment(acc, 0.0f);
+            wmma::mma_sync(acc, af, bf, acc);
+            wmma::store_matrix_sync(&c[warp][0][0], acc, 16,
+                                    wmma::mem_row_major);
+            __syncwarp();
+#pragma unroll
+            for (int slot = 0; slot < 4; ++slot) {
+                const int index = lane + slot * 32;
+                if (index < out.count * kNvTcOut) {
+                    const int token = index >> 3;
+                    const int n = index & 7;
+                    // Match the fused gate/up oracle's association exactly:
+                    // ((0.5 * activation_scale) * weight_scale) * global.
+                    const float activation_scale = 0.5f *
+                        xscale[static_cast<size_t>(token) * groups +
+                               group_base + local_group];
+                    const float scale = (activation_scale *
+                        weight_scale[local_group][n]) * global_scale;
+                    sums[slot] = fmaf(c[warp][token][n], scale, sums[slot]);
+                }
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int slot = 0; slot < 4; ++slot) {
+        const int index = lane + slot * 32;
+        if (index < out.count * kNvTcOut)
+            partial[warp][index >> 3][index & 7] = sums[slot];
+    }
+    __syncthreads();
+
+    for (int index = threadIdx.x; index < out.count * kNvTcOut;
+         index += blockDim.x) {
+        const int token = index >> 3;
+        const int n = index & 7;
+        float sum = partial[0][token][n];
+#pragma unroll
+        for (int split = 1; split < kNvTcWarps; ++split)
+            sum += partial[split][token][n];
+        if (first_row + n < rows)
+            y[static_cast<size_t>(out.ids[token]) * rows + first_row + n] = sum;
+    }
+}
+
+// Strict signed-INT8 Tensor Core prototype. Unlike the FP16 experiment above,
+// operands stay in their existing packed-Q8 integer workspace and every MMA
+// result stays in registers. K=16 NVFP4 groups occupy the low half of a
+// m16n8k32 instruction; the high half is literal zero. Processing logical
+// DP4A lanes in bit-reversed order plus a five-level carry stack reproduces
+// the legacy XOR reduction tree without materializing 32 leaf planes.
+struct NvI8A {
+    uint32_t x[4];
+};
+struct NvI8B {
+    uint32_t x[2];
+};
+struct NvI32C {
+    int x[4];
+};
+struct NvF4 {
+    float x[4];
+};
+
+__device__ __forceinline__ NvI32C nvfp4_imma_m16n8k32(
+    const NvI8A &a, const NvI8B &b) {
+    NvI32C c{{0, 0, 0, 0}};
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+r"(c.x[0]), "+r"(c.x[1]), "+r"(c.x[2]), "+r"(c.x[3])
+        : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]),
+          "r"(b.x[0]), "r"(b.x[1]));
+    return c;
+}
+
+__device__ __forceinline__ uint32_t nvfp4_decode_four(uint16_t packed) {
+    uint32_t result = 0;
+#pragma unroll
+    for (int element = 0; element < 4; ++element) {
+        const uint32_t code = (packed >> (element * 4)) & 15u;
+        result |= uint32_t(uint8_t(c_e2i[code])) << (element * 8);
+    }
+    return result;
+}
+
+__device__ __forceinline__ NvF4 nvfp4_add_fragments(
+    const NvF4 &left, const NvF4 &right) {
+    return NvF4{{
+        left.x[0] + right.x[0],
+        left.x[1] + right.x[1],
+        left.x[2] + right.x[2],
+        left.x[3] + right.x[3],
+    }};
+}
+
+template <bool PairAssociation>
+__global__ __launch_bounds__(256, 2) void nvfp4_imma_exact_rows_kernel(
+    const uint8_t *__restrict__ weights,
+    const uint8_t *__restrict__ scales,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int groups,
+    int words_per_row,
+    float global_scale,
+    Nvfp4TcRowIds out) {
+    __shared__ __align__(16) uint32_t a_shared[kNvTcWarps][16][8];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int first_row = (blockIdx.x * kNvTcWarps + warp) * 8;
+    if (first_row >= rows) return;
+
+    // Physical fragment mapping for m16n8k32:
+    // C[l] -> token ((l/2)*8 + lane/4), output ((lane%4)*2 + l%2).
+    const int token_low = lane >> 2;
+    const int token_high = token_low + 8;
+    const int out_even = (lane & 3) * 2;
+    const int out_odd = out_even + 1;
+
+    NvF4 stack0{}, stack1{}, stack2{}, stack3{}, stack4{};
+    NvF4 result{};
+    for (int sequence = 0; sequence < 32; ++sequence) {
+        const int logical_lane = int(__brev(unsigned(sequence)) >> 27);
+        NvF4 node{};
+        for (int group = logical_lane; group < groups; group += 32) {
+            // The A operand's register map is an ldmatrix map, not the C
+            // fragment map. Stage the exact row-major 16x32 signed-byte tile;
+            // words 4..7 are the K=16 zero pad and rows count..15 are zero.
+#pragma unroll
+            for (int index = lane; index < 16 * 8; index += 32) {
+                const int token = index >> 3;
+                const int word = index & 7;
+                uint32_t value = 0;
+                if (token < out.count && word < 4) {
+                    value = __ldg(xq + static_cast<size_t>(token) * words_per_row +
+                                  group * 4 + word);
+                }
+                a_shared[warp][token][word] = value;
+            }
+            __syncwarp();
+            NvI8A a{};
+            const uint32_t *a_address = &a_shared[warp][lane & 15][(lane >> 4) * 4];
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(a.x[0]), "=r"(a.x[1]), "=r"(a.x[2]), "=r"(a.x[3])
+                : "l"(a_address));
+
+            // Generic column-major B fragment mapping. Each lane owns one
+            // four-value quarter of one output row; the high K=16 half is zero.
+            const int b_row = first_row + (lane >> 2);
+            const int b_quarter = lane & 3;
+            const uint8_t *packed_address = weights +
+                static_cast<size_t>(b_row) * groups * 8 + group * 8 +
+                b_quarter * 2;
+            const uint16_t packed = __ldcs(
+                reinterpret_cast<const uint16_t *>(packed_address));
+            const NvI8B b{{nvfp4_decode_four(packed), 0u}};
+            const NvI32C dots = nvfp4_imma_m16n8k32(a, b);
+
+            const uint8_t even_code = __ldcs(
+                scales + static_cast<size_t>(first_row + out_even) * groups + group);
+            const uint8_t odd_code = __ldcs(
+                scales + static_cast<size_t>(first_row + out_odd) * groups + group);
+            const float weight_even = c_e4m3[even_code];
+            const float weight_odd = c_e4m3[odd_code];
+            const float x_low = token_low < out.count
+                ? xscale[static_cast<size_t>(token_low) * groups + group]
+                : 0.0f;
+            const float x_high = token_high < out.count
+                ? xscale[static_cast<size_t>(token_high) * groups + group]
+                : 0.0f;
+
+            float scale_low_even, scale_low_odd;
+            float scale_high_even, scale_high_odd;
+            if constexpr (PairAssociation) {
+                const float activation_low = 0.5f * x_low;
+                const float activation_high = 0.5f * x_high;
+                scale_low_even = (activation_low * weight_even) * global_scale;
+                scale_low_odd = (activation_low * weight_odd) * global_scale;
+                scale_high_even = (activation_high * weight_even) * global_scale;
+                scale_high_odd = (activation_high * weight_odd) * global_scale;
+            } else {
+                const float base_even = (0.5f * weight_even) * global_scale;
+                const float base_odd = (0.5f * weight_odd) * global_scale;
+                scale_low_even = base_even * x_low;
+                scale_low_odd = base_odd * x_low;
+                scale_high_even = base_even * x_high;
+                scale_high_odd = base_odd * x_high;
+            }
+            node.x[0] = fmaf(float(dots.x[0]), scale_low_even, node.x[0]);
+            node.x[1] = fmaf(float(dots.x[1]), scale_low_odd, node.x[1]);
+            node.x[2] = fmaf(float(dots.x[2]), scale_high_even, node.x[2]);
+            node.x[3] = fmaf(float(dots.x[3]), scale_high_odd, node.x[3]);
+            __syncwarp();
+        }
+
+        // Binary carry in depth-first leaf order. Named levels force the
+        // five live fragments to remain register-addressable rather than a
+        // dynamically indexed local array.
+        if ((sequence & 1) == 0) {
+            stack0 = node;
+        } else {
+            node = nvfp4_add_fragments(stack0, node);
+            if ((sequence & 3) != 3) {
+                stack1 = node;
+            } else {
+                node = nvfp4_add_fragments(stack1, node);
+                if ((sequence & 7) != 7) {
+                    stack2 = node;
+                } else {
+                    node = nvfp4_add_fragments(stack2, node);
+                    if ((sequence & 15) != 15) {
+                        stack3 = node;
+                    } else {
+                        node = nvfp4_add_fragments(stack3, node);
+                        if (sequence != 31)
+                            stack4 = node;
+                        else
+                            result = nvfp4_add_fragments(stack4, node);
+                    }
+                }
+            }
+        }
+    }
+
+    if (token_low < out.count) {
+        y[static_cast<size_t>(out.ids[token_low]) * rows + first_row + out_even] = result.x[0];
+        y[static_cast<size_t>(out.ids[token_low]) * rows + first_row + out_odd] = result.x[1];
+    }
+    if (token_high < out.count) {
+        y[static_cast<size_t>(out.ids[token_high]) * rows + first_row + out_even] = result.x[2];
+        y[static_cast<size_t>(out.ids[token_high]) * rows + first_row + out_odd] = result.x[3];
+    }
+}
+
+__global__ __launch_bounds__(256, 1) void quantize_x16_imma_rows_kernel(
+    const float *__restrict__ x,
+    uint32_t *__restrict__ xq,
+    float *__restrict__ xscale,
+    int cols,
+    int groups,
+    int words_per_row,
+    Nvfp4TcRowIds rows) {
+    const int compact_row = blockIdx.x;
+    if (compact_row >= rows.count) return;
+    const int group = threadIdx.x;
+    if (group >= groups) return;
+    const float4 *source = reinterpret_cast<const float4 *>(
+        x + static_cast<size_t>(rows.ids[compact_row]) * cols + group * 16);
+    float values[16];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        const float4 value = __ldg(source + word);
+        values[word * 4 + 0] = value.x;
+        values[word * 4 + 1] = value.y;
+        values[word * 4 + 2] = value.z;
+        values[word * 4 + 3] = value.w;
+        maximum = fmaxf(maximum, fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                       fmaxf(fabsf(value.z), fabsf(value.w))));
+    }
+    const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+    xscale[static_cast<size_t>(compact_row) * groups + group] =
+        maximum * (1.0f / 127.0f);
+    uint32_t *destination = xq + static_cast<size_t>(compact_row) * words_per_row + group * 4;
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte)
+            packed |= uint32_t(uint8_t(__float2int_rn(
+                values[word * 4 + byte] * inverse))) << (byte * 8);
+        destination[word] = packed;
+    }
+}
+
+#endif  // !INSIGNIA_GLM53_NO_MAIN
+
 __global__ __launch_bounds__(256, 1) void quantize_x64_kernel(
     const float *__restrict__ x,
     uint32_t *__restrict__ xq,
@@ -726,13 +1845,20 @@ __global__ __launch_bounds__(256) void grouped_i4_dp4a_kernel(
 }
 
 struct Metrics {
+    double mse;
     double relative_l2;
     double cosine;
     double max_abs;
+    double kl;
+    double js;
+    double ppl_delta_pct;
+    bool top1_mismatch;
 };
 
 Metrics compare(const std::vector<float> &actual, const float *reference) {
     double dot = 0.0, aa = 0.0, rr = 0.0, error = 0.0, maximum = 0.0;
+    double actual_max = -INFINITY, reference_max = -INFINITY;
+    size_t actual_top1 = 0, reference_top1 = 0;
     for (size_t i = 0; i < actual.size(); ++i) {
         const double a = actual[i], r = reference[i], d = a - r;
         dot += a * r;
@@ -740,8 +1866,44 @@ Metrics compare(const std::vector<float> &actual, const float *reference) {
         rr += r * r;
         error += d * d;
         maximum = fmax(maximum, fabs(d));
+        if (a > actual_max) {
+            actual_max = a;
+            actual_top1 = i;
+        }
+        if (r > reference_max) {
+            reference_max = r;
+            reference_top1 = i;
+        }
     }
-    return {sqrt(error / rr), dot / sqrt(aa * rr), maximum};
+
+    double actual_sum = 0.0, reference_sum = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        actual_sum += exp(double(actual[i]) - actual_max);
+        reference_sum += exp(double(reference[i]) - reference_max);
+    }
+    double kl = 0.0, js = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const double q = exp(double(actual[i]) - actual_max) / actual_sum;
+        const double p = exp(double(reference[i]) - reference_max) / reference_sum;
+        const double midpoint = 0.5 * (p + q);
+        if (p > 0.0) {
+            kl += p * log(p / fmax(q, 1.0e-300));
+            js += 0.5 * p * log(p / midpoint);
+        }
+        if (q > 0.0) js += 0.5 * q * log(q / midpoint);
+    }
+    kl = fmax(0.0, kl);
+    js = fmax(0.0, js);
+    return {
+        error / double(actual.size()),
+        rr > 0.0 ? sqrt(error / rr) : 0.0,
+        aa > 0.0 && rr > 0.0 ? dot / sqrt(aa * rr) : 1.0,
+        maximum,
+        kl,
+        js,
+        100.0 * expm1(kl),
+        actual_top1 != reference_top1,
+    };
 }
 
 template <typename Launch>
@@ -764,9 +1926,22 @@ float benchmark(Launch launch, int iterations = 2000) {
 
 void print_result(const char *name, float milliseconds, uint64_t bytes, const Metrics &metrics) {
     const double bandwidth = (double(bytes) / 1.0e9) / (double(milliseconds) / 1.0e3);
-    std::printf("%-23s %8.3f us  %7.1f GB/s  rel=%9.6f cos=%.9f max=%g\n",
+    std::printf("%-23s %8.3f us  %7.1f GB/s  mse=%9.3e rel=%9.6f "
+                "cos=%.9f max=%g KL=%9.3e JS=%9.3e synthPPL=%+.6f%% top1=%s\n",
                 name, milliseconds * 1000.0f, bandwidth,
-                metrics.relative_l2, metrics.cosine, metrics.max_abs);
+                metrics.mse, metrics.relative_l2, metrics.cosine,
+                metrics.max_abs, metrics.kl, metrics.js,
+                metrics.ppl_delta_pct,
+                metrics.top1_mismatch ? "DIFF" : "same");
+}
+
+void print_quality(const char *name, const Metrics &metrics) {
+    std::printf("  %-21s mse=%9.3e rel=%9.6f cos=%.9f max=%g "
+                "KL=%9.3e JS=%9.3e synthPPL=%+.6f%% top1=%s\n",
+                name, metrics.mse, metrics.relative_l2, metrics.cosine,
+                metrics.max_abs, metrics.kl, metrics.js,
+                metrics.ppl_delta_pct,
+                metrics.top1_mismatch ? "DIFF" : "same");
 }
 
 // One thread expands one packed byte (two output scale codes). The host
@@ -1350,6 +2525,246 @@ cudaError_t nvfp4_gemv2_dp4a_quantized_rows(
     return cudaPeekAtLastError();
 }
 
+cudaError_t nvfp4_gemv_dp4a_quantized_rows_fixed(
+    const uint8_t *weights, const uint8_t *scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids,
+    int rows, int cols, int cta_warps, cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !weights || !scales || !workspace || !y || !y_ids ||
+        rows <= 0 || count <= 0 || count > 8 ||
+        (cta_warps != 4 && cta_warps != 8)) return cudaErrorInvalidValue;
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+#define INSIGNIA_FIXED_ROWS_CASE(B)                                                \
+    case B:                                                                        \
+        return cta_warps == 4                                                      \
+            ? launch_nvfp4_dp4a_fixed_rows<B, 4>(                                  \
+                  weights, scales, global_scale, xq, xscale, y, y_ids, rows,       \
+                  cols / 16, int(aligned / 4), stream)                             \
+            : launch_nvfp4_dp4a_fixed_rows<B, 8>(                                  \
+                  weights, scales, global_scale, xq, xscale, y, y_ids, rows,       \
+                  cols / 16, int(aligned / 4), stream)
+    switch (count) {
+        INSIGNIA_FIXED_ROWS_CASE(1);
+        INSIGNIA_FIXED_ROWS_CASE(2);
+        INSIGNIA_FIXED_ROWS_CASE(3);
+        INSIGNIA_FIXED_ROWS_CASE(4);
+        INSIGNIA_FIXED_ROWS_CASE(5);
+        INSIGNIA_FIXED_ROWS_CASE(6);
+        INSIGNIA_FIXED_ROWS_CASE(7);
+        INSIGNIA_FIXED_ROWS_CASE(8);
+    }
+#undef INSIGNIA_FIXED_ROWS_CASE
+    return cudaErrorInvalidValue;
+}
+
+cudaError_t nvfp4_gemv2_dp4a_quantized_rows_fixed(
+    const uint8_t *weights_a, const uint8_t *scales_a, float global_scale_a,
+    const uint8_t *weights_b, const uint8_t *scales_b, float global_scale_b,
+    const void *workspace, int count, float *y_a, float *y_b, const int *y_ids,
+    int rows, int cols, int cta_warps, cudaStream_t stream) {
+    const size_t bytes = nvfp4_workspace_bytes(cols);
+    if (!bytes || !weights_a || !scales_a || !weights_b || !scales_b || !workspace ||
+        !y_a || !y_b || !y_ids || rows <= 0 || count <= 0 || count > 8 ||
+        (cta_warps != 4 && cta_warps != 8)) return cudaErrorInvalidValue;
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+#define INSIGNIA_FIXED_PAIR_ROWS_CASE(B)                                           \
+    case B:                                                                        \
+        return cta_warps == 4                                                      \
+            ? launch_nvfp4_dp4a_pair_fixed_rows<B, 4>(                             \
+                  weights_a, scales_a, global_scale_a, weights_b, scales_b,        \
+                  global_scale_b, xq, xscale, y_a, y_b, y_ids, rows, cols / 16,    \
+                  int(aligned / 4), stream)                                        \
+            : launch_nvfp4_dp4a_pair_fixed_rows<B, 8>(                             \
+                  weights_a, scales_a, global_scale_a, weights_b, scales_b,        \
+                  global_scale_b, xq, xscale, y_a, y_b, y_ids, rows, cols / 16,    \
+                  int(aligned / 4), stream)
+    switch (count) {
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(1);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(2);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(3);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(4);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(5);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(6);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(7);
+        INSIGNIA_FIXED_PAIR_ROWS_CASE(8);
+    }
+#undef INSIGNIA_FIXED_PAIR_ROWS_CASE
+    return cudaErrorInvalidValue;
+}
+
+cudaError_t nvfp4_gemv_dp4a_quantized_rows_packed(
+    const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids,
+    int rows, int cols, int cta_warps, cudaStream_t stream) {
+    const size_t logical = static_cast<size_t>(rows) * size_t(cols / 16);
+    const size_t packed_bytes = logical / 2u;
+    if ((cols != 2048 && cols != 4096) || !nvfp4_workspace_bytes(cols) ||
+        !weights || !workspace || !y || !y_ids ||
+        !scales.packed || !scales.escapes || !scales.codebook || !scales.prefix ||
+        rows <= 0 || count <= 0 || count > 8 || (logical & 1u) ||
+        scales.logical_symbols != logical || scales.escape_count > logical ||
+        scales.prefix_entries != packed_bytes / 256u + 1u ||
+        scales.packed_block_bytes != 256u || scales.escape_symbol != 15u ||
+        (cta_warps != 4 && cta_warps != 8))
+        return cudaErrorInvalidValue;
+    return launch_nvfp4_packed_fixed_rows_runtime(
+        weights, scales, global_scale, workspace, y, y_ids, count,
+        rows, cols, cta_warps, stream);
+}
+
+cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+    const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids,
+    const float *combine, int rows, int cols, int cta_warps,
+    cudaStream_t stream) {
+    const size_t logical = static_cast<size_t>(rows) * size_t(cols / 16);
+    const size_t packed_bytes = logical / 2u;
+    if ((cols != 2048 && cols != 4096) || !nvfp4_workspace_bytes(cols) ||
+        !weights || !workspace || !y || !y_ids ||
+        !combine || !scales.packed || !scales.escapes || !scales.codebook ||
+        !scales.prefix || rows <= 0 || count <= 0 || count > 8 ||
+        (logical & 1u) || scales.logical_symbols != logical ||
+        scales.escape_count > logical ||
+        scales.prefix_entries != packed_bytes / 256u + 1u ||
+        scales.packed_block_bytes != 256u || scales.escape_symbol != 15u ||
+        (cta_warps != 4 && cta_warps != 8))
+        return cudaErrorInvalidValue;
+    return launch_nvfp4_packed_acc_fixed_rows_runtime(
+        weights, scales, global_scale, workspace, y, y_ids, combine, count,
+        rows, cols, cta_warps, stream);
+}
+
+cudaError_t nvfp4_gemv2_dp4a_quantized_rows_packed(
+    const uint8_t *weights_a, Nvfp4PackedScaleView scales_a, float global_scale_a,
+    const uint8_t *weights_b, Nvfp4PackedScaleView scales_b, float global_scale_b,
+    const void *workspace, int count, float *y_a, float *y_b, const int *y_ids,
+    int rows, int cols, int cta_warps, cudaStream_t stream) {
+    const size_t logical = static_cast<size_t>(rows) * size_t(cols / 16);
+    const size_t packed_bytes = logical / 2u;
+    const auto valid = [&](const Nvfp4PackedScaleView &view) {
+        return view.packed && view.escapes && view.codebook && view.prefix &&
+               view.logical_symbols == logical && view.escape_count <= logical &&
+               view.prefix_entries == packed_bytes / 256u + 1u &&
+               view.packed_block_bytes == 256u && view.escape_symbol == 15u;
+    };
+    if ((cols != 2048 && cols != 4096) || !nvfp4_workspace_bytes(cols) ||
+        !weights_a || !weights_b || !workspace ||
+        !y_a || !y_b || !y_ids || rows <= 0 || count <= 0 || count > 8 ||
+        (logical & 1u) || !valid(scales_a) || !valid(scales_b) ||
+        (cta_warps != 4 && cta_warps != 8))
+        return cudaErrorInvalidValue;
+    return launch_nvfp4_packed_pair_fixed_rows_runtime(
+        weights_a, scales_a, global_scale_a, weights_b, scales_b, global_scale_b,
+        workspace, y_a, y_b, y_ids, count, rows, cols, cta_warps, stream);
+}
+
+#if !defined(INSIGNIA_GLM53_NO_MAIN)
+
+size_t nvfp4_tc_workspace_rows_bytes(int cols, int rows) {
+    if ((cols != 2048 && cols != 4096) || rows <= 0 || rows > kNvTcTokens)
+        return 0;
+    return static_cast<size_t>(rows) * cols * sizeof(__half) +
+           static_cast<size_t>(rows) * (cols / 16) * sizeof(float);
+}
+
+cudaError_t nvfp4_tc_quantize_activation_rows(
+    const float *x, int cols, const int *row_ids, int count, void *workspace,
+    cudaStream_t stream = nullptr) {
+    const size_t bytes = nvfp4_tc_workspace_rows_bytes(cols, count);
+    if (!bytes || !x || !row_ids || !workspace) return cudaErrorInvalidValue;
+    Nvfp4TcRowIds rows{};
+    rows.count = count;
+    for (int token = 0; token < count; ++token) rows.ids[token] = row_ids[token];
+    auto *xq = reinterpret_cast<__half *>(workspace);
+    auto *xscale = reinterpret_cast<float *>(
+        reinterpret_cast<uint8_t *>(workspace) +
+        static_cast<size_t>(count) * cols * sizeof(__half));
+    quantize_x16_tc_rows_kernel<<<count, 256, 0, stream>>>(
+        x, xq, xscale, cols, cols / 16, rows);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t nvfp4_tc_gemm_quantized_rows(
+    const uint8_t *weights, const uint8_t *scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids,
+    int rows, int cols, cudaStream_t stream = nullptr) {
+    const size_t bytes = nvfp4_tc_workspace_rows_bytes(cols, count);
+    if (!bytes || !weights || !scales || !workspace || !y || !y_ids ||
+        rows <= 0 || (rows & 7)) return cudaErrorInvalidValue;
+    Nvfp4TcRowIds out{};
+    out.count = count;
+    for (int token = 0; token < count; ++token) out.ids[token] = y_ids[token];
+    const auto *xq = reinterpret_cast<const __half *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) +
+        static_cast<size_t>(count) * cols * sizeof(__half));
+    nvfp4_tc_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
+        weights, scales, xq, xscale, y, rows, cols, cols / 16,
+        global_scale, out);
+    return cudaPeekAtLastError();
+}
+
+size_t nvfp4_imma_workspace_rows_bytes(int cols, int rows) {
+    if ((cols != 2048 && cols != 4096) || rows <= 0 || rows > kNvTcTokens)
+        return 0;
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    return static_cast<size_t>(rows) * aligned +
+           static_cast<size_t>(rows) * (cols / 16) * sizeof(float);
+}
+
+cudaError_t nvfp4_imma_quantize_activation_rows(
+    const float *x, int cols, const int *row_ids, int count, void *workspace,
+    cudaStream_t stream = nullptr) {
+    const size_t bytes = nvfp4_imma_workspace_rows_bytes(cols, count);
+    if (!bytes || !x || !row_ids || !workspace) return cudaErrorInvalidValue;
+    Nvfp4TcRowIds batch{};
+    batch.count = count;
+    for (int token = 0; token < count; ++token) batch.ids[token] = row_ids[token];
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    auto *xq = reinterpret_cast<uint32_t *>(workspace);
+    auto *xscale = reinterpret_cast<float *>(
+        reinterpret_cast<uint8_t *>(workspace) + static_cast<size_t>(count) * aligned);
+    quantize_x16_imma_rows_kernel<<<count, 256, 0, stream>>>(
+        x, xq, xscale, cols, cols / 16, int(aligned / 4), batch);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t nvfp4_imma_gemm_quantized_rows(
+    const uint8_t *weights, const uint8_t *scales, float global_scale,
+    const void *workspace, int count, float *y, const int *y_ids,
+    int rows, int cols, bool pair_association,
+    cudaStream_t stream = nullptr) {
+    const size_t bytes = nvfp4_imma_workspace_rows_bytes(cols, count);
+    if (!bytes || !weights || !scales || !workspace || !y || !y_ids ||
+        rows <= 0 || (rows & 63)) return cudaErrorInvalidValue;
+    Nvfp4TcRowIds out{};
+    out.count = count;
+    for (int token = 0; token < count; ++token) out.ids[token] = y_ids[token];
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) +
+        static_cast<size_t>(count) * aligned);
+    if (pair_association) {
+        nvfp4_imma_exact_rows_kernel<true><<<(rows + 63) / 64, 256, 0, stream>>>(
+            weights, scales, xq, xscale, y, rows, cols / 16,
+            int(aligned / 4), global_scale, out);
+    } else {
+        nvfp4_imma_exact_rows_kernel<false><<<(rows + 63) / 64, 256, 0, stream>>>(
+            weights, scales, xq, xscale, y, rows, cols / 16,
+            int(aligned / 4), global_scale, out);
+    }
+    return cudaPeekAtLastError();
+}
+
+#endif  // !INSIGNIA_GLM53_NO_MAIN
+
 }  // namespace insignia::glm53
 
 #ifndef INSIGNIA_GLM53_NO_MAIN
@@ -1533,6 +2948,74 @@ SynthScales synthesize_scales(double rate, uint64_t seed) {
     const uint8_t *prefix_bytes = reinterpret_cast<const uint8_t *>(plane.prefix.data());
     plane.blob.insert(plane.blob.end(), prefix_bytes,
                       prefix_bytes + kScalePrefixEntries * sizeof(uint32_t));
+    return plane;
+}
+
+// Deterministic, lossless XPR1-v2 encoder for a real expanded E4M3 scale
+// plane.  The fifteen most frequent bytes get direct nibbles; ties are broken
+// by byte value so a fixture always produces the same payload.  Everything
+// else is emitted in the ordered escape tail.
+SynthScales pack_exact_scales(const uint8_t *expanded, size_t bytes) {
+    if (!expanded || bytes != kExpandedScaleBytes || (bytes & 1u))
+        die("packed-scale fixture has the wrong shape");
+    std::array<uint32_t, 256> frequency{};
+    for (size_t i = 0; i < bytes; ++i) ++frequency[expanded[i]];
+    std::array<uint16_t, 256> order{};
+    for (uint16_t value = 0; value < 256; ++value) order[value] = value;
+    std::sort(order.begin(), order.end(), [&](uint16_t lhs, uint16_t rhs) {
+        if (frequency[lhs] != frequency[rhs]) return frequency[lhs] > frequency[rhs];
+        return lhs < rhs;
+    });
+
+    SynthScales plane;
+    plane.truth.assign(expanded, expanded + bytes);
+    plane.packed.assign(bytes / 2, 0);
+    plane.codebook.assign(16, 0);
+    std::array<uint8_t, 256> encode{};
+    encode.fill(15u);
+    for (uint8_t code = 0; code < 15; ++code) {
+        const uint8_t value = uint8_t(order[code]);
+        plane.codebook[code] = value;
+        encode[value] = code;
+    }
+    for (size_t i = 0; i < bytes; ++i) {
+        const uint8_t value = expanded[i];
+        const uint8_t code = encode[value];
+        if (code == 15u) plane.escapes.push_back(value);
+        if (i & 1u) plane.packed[i >> 1] |= uint8_t(code << 4);
+        else        plane.packed[i >> 1]  = code;
+    }
+    plane.escape_count = plane.escapes.size();
+    plane.prefix.resize(kScalePrefixEntries);
+    build_escape_prefix_host(plane.packed.data(), uint32_t(plane.escape_count),
+                             plane.prefix.data());
+
+    // The device decoder is intentionally unchecked.  Prove all directory
+    // invariants here before a view can be constructed.
+    if (plane.prefix.front() != 0u ||
+        plane.prefix.back() != plane.escape_count)
+        die("packed-scale prefix endpoints are invalid");
+    for (size_t block = 0; block + 1 < plane.prefix.size(); ++block) {
+        const uint32_t actual = count_escape_nibbles_256(
+            plane.packed.data() + block * 256u);
+        if (plane.prefix[block + 1] < plane.prefix[block] ||
+            plane.prefix[block + 1] - plane.prefix[block] != actual)
+            die("packed-scale prefix is not an exact monotone directory");
+    }
+    std::vector<uint8_t> decoded(bytes);
+    expand_scale_nibbles_host(
+        plane.packed.data(), plane.escapes.empty() ? nullptr : plane.escapes.data(),
+        uint32_t(plane.escape_count), plane.codebook.data(), decoded.data(), bytes);
+    if (std::memcmp(decoded.data(), expanded, bytes) != 0)
+        die("packed-scale host round trip failed");
+
+    plane.blob.assign(plane.packed.begin(), plane.packed.end());
+    plane.blob.insert(plane.blob.end(), plane.escapes.begin(), plane.escapes.end());
+    plane.blob.insert(plane.blob.end(), plane.codebook.begin(), plane.codebook.end());
+    plane.blob.resize((plane.blob.size() + 3u) & ~size_t(3u));
+    const uint8_t *prefix_bytes = reinterpret_cast<const uint8_t *>(plane.prefix.data());
+    plane.blob.insert(plane.blob.end(), prefix_bytes,
+                      prefix_bytes + plane.prefix.size() * sizeof(uint32_t));
     return plane;
 }
 
@@ -1867,8 +3350,52 @@ int main(int argc, char **argv) {
 
     cuda_check(insignia::glm53::initialize_nvfp4(), "NVFP4 LUT upload");
 
+    uint32_t *d_tablefree_decode = nullptr;
+    std::array<uint32_t, 16 * 4> tablefree_decode{};
+    cuda_check(cudaMalloc(&d_tablefree_decode, tablefree_decode.size() * sizeof(uint32_t)),
+               "cudaMalloc table-free decode gate");
+    e2_tablefree_exhaustive_kernel<<<1, 256>>>(d_tablefree_decode);
+    cuda_check(cudaMemcpy(tablefree_decode.data(), d_tablefree_decode,
+                          tablefree_decode.size() * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost), "table-free decode gate D2H");
+    cudaFree(d_tablefree_decode);
+    bool e2_tablefree_decode_exact = true;
+    for (int code = 0; code < 16; ++code) {
+        const size_t at = size_t(code) * 4;
+        e2_tablefree_decode_exact &=
+            tablefree_decode[at] == tablefree_decode[at + 2] &&
+            tablefree_decode[at + 1] == tablefree_decode[at + 3];
+        if (tablefree_decode[at] != tablefree_decode[at + 2] ||
+            tablefree_decode[at + 1] != tablefree_decode[at + 3])
+            std::printf("table-free code %x mismatch: lut=%08x/%08x arithmetic=%08x/%08x\n",
+                        code, tablefree_decode[at], tablefree_decode[at + 1],
+                        tablefree_decode[at + 2], tablefree_decode[at + 3]);
+    }
+
     uint8_t *d_nvw = device_copy<uint8_t>(nv_weight, header.nv_weight_bytes);
     uint8_t *d_nvs = device_copy<uint8_t>(nv_scale, header.nv_scale_bytes);
+    const SynthScales packed_fixture = pack_exact_scales(nv_scale, header.nv_scale_bytes);
+    uint8_t escape_dummy = 0;
+    uint8_t *d_packed_nvs = device_copy<uint8_t>(
+        packed_fixture.packed.data(), packed_fixture.packed.size());
+    uint8_t *d_packed_escapes = device_copy<uint8_t>(
+        packed_fixture.escapes.empty() ? &escape_dummy : packed_fixture.escapes.data(),
+        std::max<size_t>(packed_fixture.escapes.size(), 1));
+    uint8_t *d_packed_codebook = device_copy<uint8_t>(
+        packed_fixture.codebook.data(), packed_fixture.codebook.size());
+    uint32_t *d_packed_prefix = device_copy<uint32_t>(
+        packed_fixture.prefix.data(), packed_fixture.prefix.size());
+    const Nvfp4PackedScaleView packed_scale_view{
+        d_packed_nvs,
+        d_packed_escapes,
+        d_packed_codebook,
+        d_packed_prefix,
+        uint32_t(header.nv_scale_bytes),
+        uint32_t(packed_fixture.escape_count),
+        uint32_t(packed_fixture.prefix.size()),
+        256u,
+        15u,
+    };
     uint8_t *d_i4w = device_copy<uint8_t>(i4_weight, header.i4_weight_bytes);
     __half *d_i4s = device_copy<__half>(i4_scale, header.i4_scale_bytes / sizeof(__half));
     uint8_t *d_e2w = device_copy<uint8_t>(e2_weight, header.e2_weight_bytes);
@@ -1906,6 +3433,7 @@ int main(int argc, char **argv) {
     nvfp4_dp4a_kernel<<<packed_grid, block>>>(reinterpret_cast<const uint32_t *>(d_nvw), d_nvs,
         d_xq, d_xscale, d_y, header.rows, nv_groups, header.global_scale);
     Metrics nv_dp_metrics = fetch_metrics(nv_reference);
+    const std::vector<float> nv_dp_output = output;
     const float nv_dp_ms = benchmark([&] {
         quantize_x16_kernel<<<1, block>>>(d_x, d_xq, d_xscale, nv_groups);
         nvfp4_dp4a_kernel<<<packed_grid, block>>>(reinterpret_cast<const uint32_t *>(d_nvw), d_nvs,
@@ -1913,6 +3441,18 @@ int main(int argc, char **argv) {
     });
     const float nv_dp_gemv_ms = benchmark([&] {
         nvfp4_dp4a_kernel<<<packed_grid, block>>>(reinterpret_cast<const uint32_t *>(d_nvw), d_nvs,
+            d_xq, d_xscale, d_y, header.rows, nv_groups, header.global_scale);
+    });
+    nvfp4_dp4a_tablefree_kernel<<<packed_grid, block>>>(
+        reinterpret_cast<const uint32_t *>(d_nvw), d_nvs,
+        d_xq, d_xscale, d_y, header.rows, nv_groups, header.global_scale);
+    Metrics nv_tablefree_metrics = fetch_metrics(nv_reference);
+    const bool nv_tablefree_exact =
+        std::memcmp(nv_dp_output.data(), output.data(),
+                    output.size() * sizeof(float)) == 0;
+    const float nv_tablefree_ms = benchmark([&] {
+        nvfp4_dp4a_tablefree_kernel<<<packed_grid, block>>>(
+            reinterpret_cast<const uint32_t *>(d_nvw), d_nvs,
             d_xq, d_xscale, d_y, header.rows, nv_groups, header.global_scale);
     });
     const float nv_two_gemv_ms = benchmark([&] {
@@ -1949,17 +3489,892 @@ int main(int argc, char **argv) {
             d_xq, d_xscale, d_y, header.rows, i4_groups);
     });
 
+    // Focused small-M proof for the experimental expanded-scale Tensor Core
+    // arm. Token zero is the captured activation; the other rows are stable
+    // cyclic perturbations so row-id/workspace bugs cannot hide behind sixteen
+    // identical matrices. The FP32 oracle is generated with the existing
+    // direct NVFP4 kernel and is outside every timed region.
+    constexpr int tc_rows = 16;
+    constexpr int dp_rows = 8;
+    std::vector<float> x_rows(static_cast<size_t>(tc_rows) * header.cols);
+    for (int token = 0; token < tc_rows; ++token) {
+        for (uint32_t col = 0; col < header.cols; ++col) {
+            const uint32_t source = (col + uint32_t(token * 257)) & (header.cols - 1);
+            const int ripple = int((col * 17u + uint32_t(token * 29)) & 31u) - 15;
+            x_rows[static_cast<size_t>(token) * header.cols + col] =
+                x[source] + float(ripple) * 1.0e-4f;
+        }
+    }
+    std::array<int, dp_rows> ids_0_7{};
+    std::array<int, dp_rows> ids_8_15{};
+    std::array<int, tc_rows> ids_0_15{};
+    for (int token = 0; token < dp_rows; ++token) {
+        ids_0_7[token] = token;
+        ids_8_15[token] = token + dp_rows;
+    }
+    for (int token = 0; token < tc_rows; ++token) ids_0_15[token] = token;
+
+    float *d_x_rows = device_copy<float>(x_rows.data(), x_rows.size());
+    float *d_rows_reference = nullptr;
+    float *d_rows_dp = nullptr;
+    float *d_rows_tc = nullptr;
+    float *d_rows_imma = nullptr;
+    void *d_rows_dp_workspace = nullptr;
+    void *d_rows_dp_workspace_b = nullptr;
+    void *d_rows_tc8_workspace = nullptr;
+    void *d_rows_tc16_workspace = nullptr;
+    void *d_rows_imma16_workspace = nullptr;
+    const size_t row_output_bytes = static_cast<size_t>(tc_rows) * header.rows * sizeof(float);
+    cuda_check(cudaMalloc(&d_rows_reference, row_output_bytes), "cudaMalloc row reference");
+    cuda_check(cudaMalloc(&d_rows_dp, row_output_bytes), "cudaMalloc row DP4A");
+    cuda_check(cudaMalloc(&d_rows_tc, row_output_bytes), "cudaMalloc row TC");
+    cuda_check(cudaMalloc(&d_rows_imma, row_output_bytes), "cudaMalloc row IMMA");
+    cuda_check(cudaMalloc(&d_rows_dp_workspace,
+                          insignia::glm53::nvfp4_workspace_rows_bytes(header.cols, dp_rows)),
+               "cudaMalloc row DP4A workspace");
+    cuda_check(cudaMalloc(&d_rows_dp_workspace_b,
+                          insignia::glm53::nvfp4_workspace_rows_bytes(header.cols, dp_rows)),
+               "cudaMalloc second row DP4A workspace");
+    cuda_check(cudaMalloc(&d_rows_tc8_workspace,
+                          insignia::glm53::nvfp4_tc_workspace_rows_bytes(header.cols, dp_rows)),
+               "cudaMalloc row TC8 workspace");
+    cuda_check(cudaMalloc(&d_rows_tc16_workspace,
+                          insignia::glm53::nvfp4_tc_workspace_rows_bytes(header.cols, tc_rows)),
+               "cudaMalloc row TC16 workspace");
+    cuda_check(cudaMalloc(&d_rows_imma16_workspace,
+                          insignia::glm53::nvfp4_imma_workspace_rows_bytes(header.cols, tc_rows)),
+               "cudaMalloc row IMMA16 workspace");
+
+    for (int token = 0; token < tc_rows; ++token) {
+        nvfp4_f32_kernel<<<nv_grid, block>>>(
+            d_nvw, d_nvs,
+            d_x_rows + static_cast<size_t>(token) * header.cols,
+            d_rows_reference + static_cast<size_t>(token) * header.rows,
+            header.rows, header.cols, header.global_scale);
+    }
+    std::vector<float> rows_reference(static_cast<size_t>(tc_rows) * header.rows);
+    cuda_check(cudaMemcpy(rows_reference.data(), d_rows_reference, row_output_bytes,
+                          cudaMemcpyDeviceToHost), "row reference D2H");
+
+    auto launch_dp8 = [&] {
+        cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                       d_rows_dp_workspace),
+                   "DP4A T8 quantize");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       dp_rows, d_rows_dp, ids_0_7.data(), header.rows, header.cols),
+                   "DP4A T8 GEMV");
+    };
+    auto launch_dp16 = [&] {
+        launch_dp8();
+        cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_8_15.data(), dp_rows,
+                       d_rows_dp_workspace),
+                   "DP4A T16 second quantize");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       dp_rows, d_rows_dp, ids_8_15.data(), header.rows, header.cols),
+                   "DP4A T16 second GEMV");
+    };
+    auto launch_tc8 = [&] {
+        cuda_check(insignia::glm53::nvfp4_tc_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                       d_rows_tc8_workspace),
+                   "TC T8 quantize");
+        cuda_check(insignia::glm53::nvfp4_tc_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_tc8_workspace,
+                       dp_rows, d_rows_tc, ids_0_7.data(), header.rows, header.cols),
+                   "TC T8 GEMM");
+    };
+    auto launch_tc16 = [&] {
+        cuda_check(insignia::glm53::nvfp4_tc_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_0_15.data(), tc_rows,
+                       d_rows_tc16_workspace),
+                   "TC T16 quantize");
+        cuda_check(insignia::glm53::nvfp4_tc_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_tc16_workspace,
+                       tc_rows, d_rows_tc, ids_0_15.data(), header.rows, header.cols),
+                   "TC T16 GEMM");
+    };
+    auto launch_imma16 = [&] {
+        cuda_check(insignia::glm53::nvfp4_imma_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_0_15.data(), tc_rows,
+                       d_rows_imma16_workspace),
+                   "IMMA T16 quantize");
+        cuda_check(insignia::glm53::nvfp4_imma_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_imma16_workspace,
+                       tc_rows, d_rows_imma, ids_0_15.data(), header.rows,
+                       header.cols, false),
+                   "IMMA T16 GEMM");
+    };
+    auto launch_imma8 = [&] {
+        cuda_check(insignia::glm53::nvfp4_imma_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                       d_rows_imma16_workspace),
+                   "IMMA T8 quantize");
+        cuda_check(insignia::glm53::nvfp4_imma_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_imma16_workspace,
+                       dp_rows, d_rows_imma, ids_0_7.data(), header.rows,
+                       header.cols, false),
+                   "IMMA T8 GEMM");
+    };
+    auto fetch_rows = [&](float *source, int count) {
+        std::vector<float> result(static_cast<size_t>(count) * header.rows);
+        cuda_check(cudaDeviceSynchronize(), "row kernel completion");
+        cuda_check(cudaMemcpy(result.data(), source,
+                              result.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "row output D2H");
+        return result;
+    };
+
+    // The captured fixture is gate/up-shaped (2048x4096), but a down matrix
+    // has the same number of packed weights/scales in the transposed logical
+    // geometry (4096x2048).  Reinterpret the real bytes and use a contiguous
+    // 2048-wide activation slab to prove the packed decoder's row-to-prefix
+    // mapping at the production down-projection boundaries.  This is an exact
+    // transport/kernel gate; it intentionally does not claim the reinterpreted
+    // matrix is a semantically meaningful expert.
+    constexpr int down_rows = 4096;
+    constexpr int down_cols = 2048;
+    static_assert(down_rows * down_cols == 2048 * 4096);
+    std::vector<float> down_x_rows(static_cast<size_t>(dp_rows) * down_cols);
+    for (int token = 0; token < dp_rows; ++token)
+        std::memcpy(down_x_rows.data() + static_cast<size_t>(token) * down_cols,
+                    x_rows.data() + static_cast<size_t>(token) * header.cols,
+                    static_cast<size_t>(down_cols) * sizeof(float));
+    float *d_down_x_rows = device_copy<float>(down_x_rows.data(), down_x_rows.size());
+    void *d_down_workspace = nullptr;
+    cuda_check(cudaMalloc(&d_down_workspace,
+                          insignia::glm53::nvfp4_workspace_rows_bytes(down_cols, dp_rows)),
+               "cudaMalloc down-shape DP4A workspace");
+    constexpr std::array<float, dp_rows> down_combine{
+        0.03125f, -0.0625f, 0.09375f, -0.125f,
+        0.15625f, -0.1875f, 0.21875f, -0.25f};
+    std::array<float, dp_rows> down_store_base_ms{};
+    std::array<float, dp_rows> down_store_4w_ms{};
+    std::array<float, dp_rows> down_store_8w_ms{};
+    std::array<float, dp_rows> packed_down_store_4w_ms{};
+    std::array<float, dp_rows> packed_down_store_8w_ms{};
+    std::array<float, dp_rows> packed_down_acc_base_ms{};
+    std::array<float, dp_rows> packed_down_acc_4w_ms{};
+    std::array<float, dp_rows> packed_down_acc_8w_ms{};
+    std::array<bool, dp_rows> down_store_exact{};
+    std::array<bool, dp_rows> packed_down_store_exact{};
+    std::array<bool, dp_rows> packed_down_acc_exact{};
+    for (int count = 1; count <= dp_rows; ++count) {
+        cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                       d_down_x_rows, down_cols, ids_0_7.data(), count,
+                       d_down_workspace),
+                   "down-shape quantize");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                       count, d_rows_reference, ids_0_7.data(), down_rows, down_cols),
+                   "down-shape expanded-scale store oracle");
+        cuda_check(cudaDeviceSynchronize(), "down-shape store oracle completion");
+        std::vector<float> down_store_oracle(static_cast<size_t>(count) * down_rows);
+        cuda_check(cudaMemcpy(down_store_oracle.data(), d_rows_reference,
+                              down_store_oracle.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                    "down-shape store oracle D2H");
+
+        bool fixed_store_exact = true;
+        for (const int cta_warps : {4, 8}) {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                           count, d_rows_dp, ids_0_7.data(), down_rows, down_cols,
+                           cta_warps),
+                       "down-shape fixed store");
+            cuda_check(cudaDeviceSynchronize(), "down-shape fixed store completion");
+            std::vector<float> actual(static_cast<size_t>(count) * down_rows);
+            cuda_check(cudaMemcpy(actual.data(), d_rows_dp,
+                                  actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                       "down-shape fixed store D2H");
+            fixed_store_exact = fixed_store_exact &&
+                std::memcmp(down_store_oracle.data(), actual.data(),
+                            actual.size() * sizeof(float)) == 0;
+        }
+        down_store_exact[size_t(count - 1)] = fixed_store_exact;
+
+        bool store_exact = true;
+        for (const int cta_warps : {4, 8}) {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_rows, down_cols, cta_warps),
+                       "down-shape packed store");
+            cuda_check(cudaDeviceSynchronize(), "down-shape packed store completion");
+            std::vector<float> actual(static_cast<size_t>(count) * down_rows);
+            cuda_check(cudaMemcpy(actual.data(), d_rows_dp,
+                                  actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                       "down-shape packed store D2H");
+            store_exact = store_exact &&
+                std::memcmp(down_store_oracle.data(), actual.data(),
+                            actual.size() * sizeof(float)) == 0;
+        }
+        packed_down_store_exact[size_t(count - 1)] = store_exact;
+
+        cuda_check(cudaMemset(d_rows_reference, 0, row_output_bytes),
+                   "clear down-shape accumulate oracle");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                       count, d_rows_reference, ids_0_7.data(), down_combine.data(),
+                       down_rows, down_cols),
+                   "down-shape expanded-scale accumulate oracle");
+        cuda_check(cudaDeviceSynchronize(), "down-shape accumulate oracle completion");
+        std::vector<float> down_acc_oracle(static_cast<size_t>(count) * down_rows);
+        cuda_check(cudaMemcpy(down_acc_oracle.data(), d_rows_reference,
+                              down_acc_oracle.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                   "down-shape accumulate oracle D2H");
+
+        bool acc_exact = true;
+        for (const int cta_warps : {4, 8}) {
+            cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                       "clear down-shape packed accumulate");
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_combine.data(), down_rows, down_cols, cta_warps),
+                       "down-shape packed accumulate");
+            cuda_check(cudaDeviceSynchronize(),
+                       "down-shape packed accumulate completion");
+            std::vector<float> actual(static_cast<size_t>(count) * down_rows);
+            cuda_check(cudaMemcpy(actual.data(), d_rows_dp,
+                                  actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                       "down-shape packed accumulate D2H");
+            acc_exact = acc_exact &&
+                std::memcmp(down_acc_oracle.data(), actual.data(),
+                            actual.size() * sizeof(float)) == 0;
+        }
+        packed_down_acc_exact[size_t(count - 1)] = acc_exact;
+
+        constexpr int down_iterations = 500;
+        down_store_base_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                           d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                           count, d_rows_dp, ids_0_7.data(), down_rows, down_cols),
+                       "timed down-shape generic store");
+        }, down_iterations);
+        down_store_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                           count, d_rows_dp, ids_0_7.data(), down_rows, down_cols, 4),
+                       "timed down-shape fixed store 4w");
+        }, down_iterations);
+        down_store_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                           count, d_rows_dp, ids_0_7.data(), down_rows, down_cols, 8),
+                       "timed down-shape fixed store 8w");
+        }, down_iterations);
+        packed_down_store_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_rows, down_cols, 4),
+                       "timed down-shape packed store 4w");
+        }, down_iterations);
+        packed_down_store_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_rows, down_cols, 8),
+                       "timed down-shape packed store 8w");
+        }, down_iterations);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear timed down-shape accumulate baseline");
+        packed_down_acc_base_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
+                           d_nvw, d_nvs, header.global_scale, d_down_workspace,
+                           count, d_rows_dp, ids_0_7.data(), down_combine.data(),
+                           down_rows, down_cols),
+                       "timed down-shape accumulate baseline");
+        }, down_iterations);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear timed down-shape packed accumulate 4w");
+        packed_down_acc_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_combine.data(), down_rows, down_cols, 4),
+                       "timed down-shape packed accumulate 4w");
+        }, down_iterations);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear timed down-shape packed accumulate 8w");
+        packed_down_acc_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_combine.data(), down_rows, down_cols, 8),
+                       "timed down-shape packed accumulate 8w");
+        }, down_iterations);
+    }
+
+    // Real-sm_89 calibration for the count-specialized exact kernels.  The
+    // activation quantization is outside every timed region so this isolates
+    // the multiplicity/CTA decision the generated scheduler needs.
+    std::array<float, 8> multiplicity_store_base_ms{};
+    std::array<float, 8> multiplicity_store_4w_ms{};
+    std::array<float, 8> multiplicity_store_8w_ms{};
+    std::array<float, 8> multiplicity_pair_base_ms{};
+    std::array<float, 8> multiplicity_pair_4w_ms{};
+    std::array<float, 8> multiplicity_pair_8w_ms{};
+    std::array<float, 8> packed_store_4w_ms{};
+    std::array<float, 8> packed_store_8w_ms{};
+    std::array<float, 8> packed_pair_4w_ms{};
+    std::array<float, 8> packed_pair_8w_ms{};
+    std::array<float, 8> packed_acc_base_ms{};
+    std::array<float, 8> packed_acc_4w_ms{};
+    std::array<float, 8> packed_acc_8w_ms{};
+    std::array<bool, 8> multiplicity_store_exact{};
+    std::array<bool, 8> multiplicity_pair_exact{};
+    std::array<bool, 8> packed_store_exact{};
+    std::array<bool, 8> packed_pair_exact{};
+    std::array<bool, 8> packed_acc_exact{};
+    constexpr std::array<float, 8> packed_combine{
+        0.03125f, -0.0625f, 0.09375f, -0.125f,
+        0.15625f, -0.1875f, 0.21875f, -0.25f};
+    for (int count = 1; count <= dp_rows; ++count) {
+        cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                       d_x_rows, header.cols, ids_0_7.data(), count,
+                       d_rows_dp_workspace),
+                   "multiplicity quantize");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       count, d_rows_dp, ids_0_7.data(), header.rows, header.cols),
+                   "multiplicity baseline store");
+        std::vector<float> baseline_store = fetch_rows(d_rows_dp, count);
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       count, d_rows_dp, ids_0_7.data(), header.rows, header.cols, 4),
+                   "multiplicity fixed store 4w");
+        std::vector<float> fixed_store = fetch_rows(d_rows_dp, count);
+        multiplicity_store_exact[size_t(count - 1)] =
+            std::memcmp(baseline_store.data(), fixed_store.data(),
+                        baseline_store.size() * sizeof(float)) == 0;
+        cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                       header.rows, header.cols, 4),
+                   "packed direct store 4w");
+        std::vector<float> packed_store_4 = fetch_rows(d_rows_dp, count);
+        cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                       header.rows, header.cols, 8),
+                   "packed direct store 8w");
+        std::vector<float> packed_store_8 = fetch_rows(d_rows_dp, count);
+        packed_store_exact[size_t(count - 1)] =
+            std::memcmp(baseline_store.data(), packed_store_4.data(),
+                        baseline_store.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_store.data(), packed_store_8.data(),
+                        baseline_store.size() * sizeof(float)) == 0;
+
+        cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale,
+                       d_nvw, d_nvs, header.global_scale,
+                       d_rows_dp_workspace, count, d_rows_dp, d_rows_reference,
+                       ids_0_7.data(), header.rows, header.cols),
+                   "multiplicity baseline pair");
+        std::vector<float> baseline_pair_a = fetch_rows(d_rows_dp, count);
+        std::vector<float> baseline_pair_b = fetch_rows(d_rows_reference, count);
+        cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_fixed(
+                       d_nvw, d_nvs, header.global_scale,
+                       d_nvw, d_nvs, header.global_scale,
+                       d_rows_dp_workspace, count, d_rows_dp, d_rows_reference,
+                       ids_0_7.data(), header.rows, header.cols, 4),
+                   "multiplicity fixed pair 4w");
+        std::vector<float> fixed_pair_a = fetch_rows(d_rows_dp, count);
+        std::vector<float> fixed_pair_b = fetch_rows(d_rows_reference, count);
+        multiplicity_pair_exact[size_t(count - 1)] =
+            std::memcmp(baseline_pair_a.data(), fixed_pair_a.data(),
+                        baseline_pair_a.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_b.data(), fixed_pair_b.data(),
+                        baseline_pair_b.size() * sizeof(float)) == 0;
+        cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                       ids_0_7.data(), count, header.rows, header.cols, 4),
+                   "packed direct pair 4w");
+        std::vector<float> packed_pair_4a = fetch_rows(d_rows_dp, count);
+        std::vector<float> packed_pair_4b = fetch_rows(d_rows_reference, count);
+        cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                       ids_0_7.data(), count, header.rows, header.cols, 8),
+                   "packed direct pair 8w");
+        std::vector<float> packed_pair_8a = fetch_rows(d_rows_dp, count);
+        std::vector<float> packed_pair_8b = fetch_rows(d_rows_reference, count);
+        packed_pair_exact[size_t(count - 1)] =
+            std::memcmp(baseline_pair_a.data(), packed_pair_4a.data(),
+                        baseline_pair_a.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_b.data(), packed_pair_4b.data(),
+                        baseline_pair_b.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_a.data(), packed_pair_8a.data(),
+                        baseline_pair_a.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_b.data(), packed_pair_8b.data(),
+                        baseline_pair_b.size() * sizeof(float)) == 0;
+
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear packed accumulate baseline");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       count, d_rows_dp, ids_0_7.data(), packed_combine.data(),
+                       header.rows, header.cols),
+                   "packed accumulate baseline");
+        std::vector<float> baseline_acc = fetch_rows(d_rows_dp, count);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear packed accumulate 4w");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, count, d_rows_dp, ids_0_7.data(),
+                       packed_combine.data(), header.rows, header.cols, 4),
+                   "packed accumulate 4w");
+        std::vector<float> packed_acc_4 = fetch_rows(d_rows_dp, count);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear packed accumulate 8w");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, count, d_rows_dp, ids_0_7.data(),
+                       packed_combine.data(), header.rows, header.cols, 8),
+                   "packed accumulate 8w");
+        std::vector<float> packed_acc_8 = fetch_rows(d_rows_dp, count);
+        packed_acc_exact[size_t(count - 1)] =
+            std::memcmp(baseline_acc.data(), packed_acc_4.data(),
+                        baseline_acc.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_acc.data(), packed_acc_8.data(),
+                        baseline_acc.size() * sizeof(float)) == 0;
+
+        constexpr int multiplicity_iterations = 500;
+        multiplicity_store_base_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                           d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                           count, d_rows_dp, ids_0_7.data(), header.rows, header.cols),
+                       "timed multiplicity baseline store");
+        }, multiplicity_iterations);
+        multiplicity_store_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                           count, d_rows_dp, ids_0_7.data(), header.rows, header.cols, 4),
+                       "timed multiplicity fixed store 4w");
+        }, multiplicity_iterations);
+        multiplicity_store_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                           count, d_rows_dp, ids_0_7.data(), header.rows, header.cols, 8),
+                       "timed multiplicity fixed store 8w");
+        }, multiplicity_iterations);
+        multiplicity_pair_base_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
+                           d_nvw, d_nvs, header.global_scale,
+                           d_nvw, d_nvs, header.global_scale,
+                           d_rows_dp_workspace, count, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), header.rows, header.cols),
+                       "timed multiplicity baseline pair");
+        }, multiplicity_iterations);
+        multiplicity_pair_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale,
+                           d_nvw, d_nvs, header.global_scale,
+                           d_rows_dp_workspace, count, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), header.rows, header.cols, 4),
+                       "timed multiplicity fixed pair 4w");
+        }, multiplicity_iterations);
+        multiplicity_pair_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_fixed(
+                           d_nvw, d_nvs, header.global_scale,
+                           d_nvw, d_nvs, header.global_scale,
+                           d_rows_dp_workspace, count, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), header.rows, header.cols, 8),
+                       "timed multiplicity fixed pair 8w");
+        }, multiplicity_iterations);
+        packed_store_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                           header.rows, header.cols, 4),
+                       "timed packed direct store 4w");
+        }, multiplicity_iterations);
+        packed_store_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                           header.rows, header.cols, 8),
+                       "timed packed direct store 8w");
+        }, multiplicity_iterations);
+        packed_pair_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), count, header.rows, header.cols, 4),
+                       "timed packed direct pair 4w");
+        }, multiplicity_iterations);
+        packed_pair_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), count, header.rows, header.cols, 8),
+                       "timed packed direct pair 8w");
+        }, multiplicity_iterations);
+        packed_acc_base_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
+                           d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                           count, d_rows_dp, ids_0_7.data(), packed_combine.data(),
+                           header.rows, header.cols),
+                       "timed packed accumulate baseline");
+        }, multiplicity_iterations);
+        packed_acc_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, count, d_rows_dp, ids_0_7.data(),
+                           packed_combine.data(), header.rows, header.cols, 4),
+                       "timed packed accumulate 4w");
+        }, multiplicity_iterations);
+        packed_acc_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, count, d_rows_dp, ids_0_7.data(),
+                           packed_combine.data(), header.rows, header.cols, 8),
+                       "timed packed accumulate 8w");
+        }, multiplicity_iterations);
+    }
+
+    launch_dp8();
+    std::vector<float> dp8_output = fetch_rows(d_rows_dp, dp_rows);
+    launch_tc8();
+    std::vector<float> tc8_output = fetch_rows(d_rows_tc, dp_rows);
+    launch_imma8();
+    std::vector<float> imma8_output = fetch_rows(d_rows_imma, dp_rows);
+    launch_dp16();
+    std::vector<float> dp16_output = fetch_rows(d_rows_dp, tc_rows);
+    launch_tc16();
+    std::vector<float> tc16_output = fetch_rows(d_rows_tc, tc_rows);
+    launch_imma16();
+    std::vector<float> imma16_output = fetch_rows(d_rows_imma, tc_rows);
+
+    const Metrics dp8_vs_f32 = compare(dp8_output, rows_reference.data());
+    const Metrics tc8_vs_f32 = compare(tc8_output, rows_reference.data());
+    const Metrics tc8_vs_dp = compare(tc8_output, dp8_output.data());
+    const Metrics imma8_vs_f32 = compare(imma8_output, rows_reference.data());
+    const Metrics imma8_vs_dp = compare(imma8_output, dp8_output.data());
+    const bool imma8_byte_exact =
+        std::memcmp(imma8_output.data(), dp8_output.data(),
+                    imma8_output.size() * sizeof(float)) == 0;
+    const Metrics dp16_vs_f32 = compare(dp16_output, rows_reference.data());
+    const Metrics tc16_vs_f32 = compare(tc16_output, rows_reference.data());
+    const Metrics tc16_vs_dp = compare(tc16_output, dp16_output.data());
+    const Metrics imma16_vs_f32 = compare(imma16_output, rows_reference.data());
+    const Metrics imma16_vs_dp = compare(imma16_output, dp16_output.data());
+    const bool imma16_byte_exact =
+        std::memcmp(imma16_output.data(), dp16_output.data(),
+                    imma16_output.size() * sizeof(float)) == 0;
+
+    const int row_iterations = 500;
+    const float dp8_total_ms = benchmark(launch_dp8, row_iterations);
+    const float dp8_gemv_ms = benchmark([&] {
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       dp_rows, d_rows_dp, ids_0_7.data(), header.rows, header.cols),
+                   "DP4A T8 timed GEMV");
+    }, row_iterations);
+    const float tc8_total_ms = benchmark(launch_tc8, row_iterations);
+    const float tc8_gemm_ms = benchmark([&] {
+        cuda_check(insignia::glm53::nvfp4_tc_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_tc8_workspace,
+                       dp_rows, d_rows_tc, ids_0_7.data(), header.rows, header.cols),
+                   "TC T8 timed GEMM");
+    }, row_iterations);
+    const float imma8_total_ms = benchmark(launch_imma8, row_iterations);
+    cuda_check(insignia::glm53::nvfp4_imma_quantize_activation_rows(
+                   d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                   d_rows_imma16_workspace),
+               "IMMA T8 timed workspace setup");
+    const float imma8_gemm_ms = benchmark([&] {
+        cuda_check(insignia::glm53::nvfp4_imma_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_imma16_workspace,
+                       dp_rows, d_rows_imma, ids_0_7.data(), header.rows,
+                       header.cols, false),
+                   "IMMA T8 timed GEMM");
+    }, row_iterations);
+    const float dp16_total_ms = benchmark(launch_dp16, row_iterations);
+    cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                   d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                   d_rows_dp_workspace),
+               "DP4A T16 first workspace setup");
+    cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                   d_x_rows, header.cols, ids_8_15.data(), dp_rows,
+                   d_rows_dp_workspace_b),
+               "DP4A T16 second workspace setup");
+    const float dp16_gemv_ms = benchmark([&] {
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                       dp_rows, d_rows_dp, ids_0_7.data(), header.rows, header.cols),
+                   "DP4A T16 timed first GEMV");
+        cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace_b,
+                       dp_rows, d_rows_dp, ids_8_15.data(), header.rows, header.cols),
+                   "DP4A T16 timed second GEMV");
+    }, row_iterations);
+    const float tc16_total_ms = benchmark(launch_tc16, row_iterations);
+    const float tc16_gemm_ms = benchmark([&] {
+        cuda_check(insignia::glm53::nvfp4_tc_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_tc16_workspace,
+                       tc_rows, d_rows_tc, ids_0_15.data(), header.rows, header.cols),
+                   "TC T16 timed GEMM");
+    }, row_iterations);
+    const float imma16_total_ms = benchmark(launch_imma16, row_iterations);
+    cuda_check(insignia::glm53::nvfp4_imma_quantize_activation_rows(
+                   d_x_rows, header.cols, ids_0_15.data(), tc_rows,
+                   d_rows_imma16_workspace),
+               "IMMA T16 timed workspace setup");
+    const float imma16_gemm_ms = benchmark([&] {
+        cuda_check(insignia::glm53::nvfp4_imma_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_imma16_workspace,
+                       tc_rows, d_rows_imma, ids_0_15.data(), header.rows,
+                       header.cols, false),
+                   "IMMA T16 timed GEMM");
+    }, row_iterations);
+
+    // Shape/index safety sweep. A deliberately noncontiguous permutation is
+    // used for both input and output ids. R>8 is expressed as the exact
+    // production DP4A sequence of one T8 pass plus a remainder pass.
+    const std::array<int, tc_rows> sweep_ids = {
+        15, 0, 14, 1, 13, 2, 12, 3, 11, 4, 10, 5, 9, 6, 8, 7,
+    };
+    const std::array<int, 6> sweep_counts = {1, 2, 4, 8, 9, 16};
+    std::array<Metrics, sweep_counts.size()> sweep_tc_vs_f32{};
+    std::array<Metrics, sweep_counts.size()> sweep_tc_vs_dp{};
+    std::array<Metrics, sweep_counts.size()> sweep_imma_vs_dp{};
+    std::array<bool, sweep_counts.size()> sweep_imma_exact{};
+    for (size_t shape = 0; shape < sweep_counts.size(); ++shape) {
+        const int count = sweep_counts[shape];
+        for (int base = 0; base < count; base += dp_rows) {
+            const int chunk = (count - base) < dp_rows ? count - base : dp_rows;
+            cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                           d_x_rows, header.cols, sweep_ids.data() + base, chunk,
+                           d_rows_dp_workspace),
+                       "DP4A shape sweep quantize");
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                           d_nvw, d_nvs, header.global_scale, d_rows_dp_workspace,
+                           chunk, d_rows_dp, sweep_ids.data() + base,
+                           header.rows, header.cols),
+                       "DP4A shape sweep GEMV");
+        }
+        cuda_check(insignia::glm53::nvfp4_tc_quantize_activation_rows(
+                       d_x_rows, header.cols, sweep_ids.data(), count,
+                       d_rows_tc16_workspace),
+                   "TC shape sweep quantize");
+        cuda_check(insignia::glm53::nvfp4_tc_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_tc16_workspace,
+                       count, d_rows_tc, sweep_ids.data(), header.rows, header.cols),
+                   "TC shape sweep GEMM");
+        cuda_check(insignia::glm53::nvfp4_imma_quantize_activation_rows(
+                       d_x_rows, header.cols, sweep_ids.data(), count,
+                       d_rows_imma16_workspace),
+                   "IMMA shape sweep quantize");
+        cuda_check(insignia::glm53::nvfp4_imma_gemm_quantized_rows(
+                       d_nvw, d_nvs, header.global_scale, d_rows_imma16_workspace,
+                       count, d_rows_imma, sweep_ids.data(), header.rows,
+                       header.cols, false),
+                   "IMMA shape sweep GEMM");
+        std::vector<float> sweep_dp_all = fetch_rows(d_rows_dp, tc_rows);
+        std::vector<float> sweep_tc_all = fetch_rows(d_rows_tc, tc_rows);
+        std::vector<float> sweep_imma_all = fetch_rows(d_rows_imma, tc_rows);
+        std::vector<float> sweep_dp(static_cast<size_t>(count) * header.rows);
+        std::vector<float> sweep_tc(sweep_dp.size());
+        std::vector<float> sweep_imma(sweep_dp.size());
+        std::vector<float> sweep_ref(sweep_dp.size());
+        for (int compact = 0; compact < count; ++compact) {
+            const int id = sweep_ids[compact];
+            std::memcpy(sweep_dp.data() + static_cast<size_t>(compact) * header.rows,
+                        sweep_dp_all.data() + static_cast<size_t>(id) * header.rows,
+                        static_cast<size_t>(header.rows) * sizeof(float));
+            std::memcpy(sweep_tc.data() + static_cast<size_t>(compact) * header.rows,
+                        sweep_tc_all.data() + static_cast<size_t>(id) * header.rows,
+                        static_cast<size_t>(header.rows) * sizeof(float));
+            std::memcpy(sweep_imma.data() + static_cast<size_t>(compact) * header.rows,
+                        sweep_imma_all.data() + static_cast<size_t>(id) * header.rows,
+                        static_cast<size_t>(header.rows) * sizeof(float));
+            std::memcpy(sweep_ref.data() + static_cast<size_t>(compact) * header.rows,
+                        rows_reference.data() + static_cast<size_t>(id) * header.rows,
+                        static_cast<size_t>(header.rows) * sizeof(float));
+        }
+        sweep_tc_vs_f32[shape] = compare(sweep_tc, sweep_ref.data());
+        sweep_tc_vs_dp[shape] = compare(sweep_tc, sweep_dp.data());
+        sweep_imma_vs_dp[shape] = compare(sweep_imma, sweep_dp.data());
+        sweep_imma_exact[shape] =
+            std::memcmp(sweep_imma.data(), sweep_dp.data(),
+                        sweep_dp.size() * sizeof(float)) == 0;
+    }
+
+    // The fused gate/up kernel uses a different, intentional multiplication
+    // association. Compare that template against the pair oracle with the same
+    // matrix in both slots so only arithmetic order is under test.
+    cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
+                   d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                   d_rows_dp_workspace),
+               "pair gate quantize");
+    cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
+                   d_nvw, d_nvs, header.global_scale,
+                   d_nvw, d_nvs, header.global_scale,
+                   d_rows_dp_workspace, dp_rows, d_rows_dp, d_rows_reference,
+                   ids_0_7.data(), header.rows, header.cols),
+               "pair gate oracle");
+    cuda_check(insignia::glm53::nvfp4_imma_quantize_activation_rows(
+                   d_x_rows, header.cols, ids_0_7.data(), dp_rows,
+                   d_rows_imma16_workspace),
+               "pair IMMA quantize");
+    cuda_check(insignia::glm53::nvfp4_imma_gemm_quantized_rows(
+                   d_nvw, d_nvs, header.global_scale, d_rows_imma16_workspace,
+                   dp_rows, d_rows_imma, ids_0_7.data(), header.rows,
+                   header.cols, true),
+               "pair IMMA GEMM");
+    std::vector<float> pair_dp_output = fetch_rows(d_rows_dp, dp_rows);
+    std::vector<float> pair_imma_output = fetch_rows(d_rows_imma, dp_rows);
+    const Metrics imma_pair_vs_dp = compare(pair_imma_output, pair_dp_output.data());
+    const bool imma_pair_byte_exact =
+        std::memcmp(pair_imma_output.data(), pair_dp_output.data(),
+                    pair_dp_output.size() * sizeof(float)) == 0;
+
     std::printf("GLM-5.3 expert %ux%u on %s (sm_%d%d)\n", header.rows, header.cols, device.name, device.major, device.minor);
+    std::printf("table-free E2M1 exhaustive code gate: %s\n",
+                e2_tablefree_decode_exact ? "EXACT" : "FAIL");
     print_result("NVFP4 float decode", nv_f32_ms, header.nv_weight_bytes + header.nv_scale_bytes, nv_f32_metrics);
     print_result("NVFP4 DP4A total", nv_dp_ms, header.nv_weight_bytes + header.nv_scale_bytes, nv_dp_metrics);
     print_result("NVFP4 DP4A GEMV", nv_dp_gemv_ms, header.nv_weight_bytes + header.nv_scale_bytes, nv_dp_metrics);
+    print_result("NVFP4 table-free", nv_tablefree_ms,
+                 header.nv_weight_bytes + header.nv_scale_bytes,
+                 nv_tablefree_metrics);
+    std::printf("  table-free byte gate: %s\n",
+                nv_tablefree_exact ? "EXACT" : "FAIL");
     print_result("NVFP4 two GEMVs", nv_two_gemv_ms, 2 * (header.nv_weight_bytes + header.nv_scale_bytes), nv_dp_metrics);
     print_result("NVFP4 fused pair", nv_pair_ms, 2 * (header.nv_weight_bytes + header.nv_scale_bytes), nv_dp_metrics);
     print_result("uniform INT4-g64", i4_ms, header.i4_weight_bytes + header.i4_scale_bytes, i4_metrics);
     print_result("E2M1 INT4-g64", e2_ms, header.e2_weight_bytes + header.e2_scale_bytes, e2_metrics);
 
-    cudaFree(d_nvw); cudaFree(d_nvs); cudaFree(d_i4w); cudaFree(d_i4s);
+    const uint64_t nv_bytes = header.nv_weight_bytes + header.nv_scale_bytes;
+    std::puts("small-M NVFP4 A/B (synthPPL is softmax(ref logits) diagnostic, not LM PPL):");
+    print_result("DP4A T8 total", dp8_total_ms, nv_bytes, dp8_vs_f32);
+    print_result("DP4A T8 GEMV", dp8_gemv_ms, nv_bytes, dp8_vs_f32);
+    print_result("FP16-TC T8 total", tc8_total_ms, nv_bytes, tc8_vs_f32);
+    print_result("FP16-TC T8 GEMM", tc8_gemm_ms, nv_bytes, tc8_vs_f32);
+    print_quality("FP16-TC T8 vs DP4A", tc8_vs_dp);
+    print_result("INT8-IMMA T8 total", imma8_total_ms, nv_bytes, imma8_vs_f32);
+    print_result("INT8-IMMA T8 GEMM", imma8_gemm_ms, nv_bytes, imma8_vs_f32);
+    print_quality("INT8-IMMA T8 vs DP4A", imma8_vs_dp);
+    std::printf("  INT8-IMMA T8 byte gate: %s\n",
+                imma8_byte_exact ? "EXACT" : "FAIL");
+    print_result("DP4A T16 total (2x)", dp16_total_ms, 2 * nv_bytes, dp16_vs_f32);
+    print_result("DP4A T16 GEMV (2x)", dp16_gemv_ms, 2 * nv_bytes, dp16_vs_f32);
+    print_result("FP16-TC T16 total", tc16_total_ms, nv_bytes, tc16_vs_f32);
+    print_result("FP16-TC T16 GEMM", tc16_gemm_ms, nv_bytes, tc16_vs_f32);
+    print_quality("FP16-TC T16 vs DP4A", tc16_vs_dp);
+    print_result("INT8-IMMA T16 total", imma16_total_ms, nv_bytes, imma16_vs_f32);
+    print_result("INT8-IMMA T16 GEMM", imma16_gemm_ms, nv_bytes, imma16_vs_f32);
+    print_quality("INT8-IMMA T16 vs DP4A", imma16_vs_dp);
+    std::printf("  INT8-IMMA T16 byte gate: %s\n",
+                imma16_byte_exact ? "EXACT" : "FAIL");
+    print_quality("INT8-IMMA pair vs pair DP4A", imma_pair_vs_dp);
+    std::printf("  INT8-IMMA paired-association byte gate: %s\n",
+                imma_pair_byte_exact ? "EXACT" : "FAIL");
+    std::puts("FP16-TC / INT8-IMMA noncontiguous-id shape sweep:");
+    for (size_t shape = 0; shape < sweep_counts.size(); ++shape) {
+        char label[64];
+        std::snprintf(label, sizeof(label), "R=%d TC vs f32", sweep_counts[shape]);
+        print_quality(label, sweep_tc_vs_f32[shape]);
+        std::snprintf(label, sizeof(label), "R=%d TC vs DP4A", sweep_counts[shape]);
+        print_quality(label, sweep_tc_vs_dp[shape]);
+        std::snprintf(label, sizeof(label), "R=%d IMMA vs DP4A", sweep_counts[shape]);
+        print_quality(label, sweep_imma_vs_dp[shape]);
+        std::printf("    R=%d IMMA byte gate: %s\n", sweep_counts[shape],
+                    sweep_imma_exact[shape] ? "EXACT" : "FAIL");
+    }
+    std::puts("exact NVFP4 multiplicity A/B, GEMV-only medians:");
+    for (int count = 1; count <= dp_rows; ++count) {
+        const size_t i = size_t(count - 1);
+        std::printf("  R=%d store_us base=%.3f fixed4=%.3f fixed8=%.3f exact=%s "
+                    "pair_us base=%.3f fixed4=%.3f fixed8=%.3f exact=%s\n",
+                    count,
+                    1000.0f * multiplicity_store_base_ms[i],
+                    1000.0f * multiplicity_store_4w_ms[i],
+                    1000.0f * multiplicity_store_8w_ms[i],
+                    multiplicity_store_exact[i] ? "YES" : "NO",
+                    1000.0f * multiplicity_pair_base_ms[i],
+                    1000.0f * multiplicity_pair_4w_ms[i],
+                    1000.0f * multiplicity_pair_8w_ms[i],
+                    multiplicity_pair_exact[i] ? "YES" : "NO");
+    }
+    std::printf("direct XPR1-v2 scales: blob %.1f KiB vs expanded %.1f KiB "
+                "(escapes=%zu, %.3f%%)\n",
+                packed_fixture.blob.size() / 1024.0,
+                header.nv_scale_bytes / 1024.0,
+                packed_fixture.escape_count,
+                100.0 * packed_fixture.escape_count / double(header.nv_scale_bytes));
+    for (int count = 1; count <= dp_rows; ++count) {
+        const size_t i = size_t(count - 1);
+        std::printf("  R=%d packed_store_us 4w=%.3f 8w=%.3f exact=%s "
+                    "packed_pair_us 4w=%.3f 8w=%.3f exact=%s "
+                    "packed_acc_us base=%.3f 4w=%.3f 8w=%.3f exact=%s\n",
+                    count,
+                    1000.0f * packed_store_4w_ms[i],
+                    1000.0f * packed_store_8w_ms[i],
+                    packed_store_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_pair_4w_ms[i],
+                    1000.0f * packed_pair_8w_ms[i],
+                    packed_pair_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_acc_base_ms[i],
+                    1000.0f * packed_acc_4w_ms[i],
+                    1000.0f * packed_acc_8w_ms[i],
+                    packed_acc_exact[i] ? "YES" : "NO");
+    }
+    std::puts("down-projection NVFP4 A/B (4096x2048, GEMV-only medians):");
+    for (int count = 1; count <= dp_rows; ++count) {
+        const size_t i = size_t(count - 1);
+        std::printf("  B=%d expanded_store_us generic=%.3f cta4=%.3f cta8=%.3f exact=%s "
+                    "packed_store_us cta4=%.3f cta8=%.3f exact=%s "
+                    "acc_us expanded_generic=%.3f packed_cta4=%.3f packed_cta8=%.3f exact=%s\n",
+                    count,
+                    1000.0f * down_store_base_ms[i],
+                    1000.0f * down_store_4w_ms[i],
+                    1000.0f * down_store_8w_ms[i],
+                    down_store_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_down_store_4w_ms[i],
+                    1000.0f * packed_down_store_8w_ms[i],
+                    packed_down_store_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_down_acc_base_ms[i],
+                    1000.0f * packed_down_acc_4w_ms[i],
+                    1000.0f * packed_down_acc_8w_ms[i],
+                    packed_down_acc_exact[i] ? "YES" : "NO");
+    }
+
+    const auto all_exact = [](const auto &gates) {
+        return std::all_of(gates.begin(), gates.end(), [](bool value) { return value; });
+    };
+    const bool exact_gates_pass =
+        e2_tablefree_decode_exact && nv_tablefree_exact &&
+        imma8_byte_exact && imma16_byte_exact &&
+        imma_pair_byte_exact &&
+        all_exact(sweep_imma_exact) && all_exact(multiplicity_store_exact) &&
+        all_exact(multiplicity_pair_exact) && all_exact(packed_store_exact) &&
+        all_exact(packed_pair_exact) && all_exact(packed_acc_exact) &&
+        all_exact(down_store_exact) &&
+        all_exact(packed_down_store_exact) && all_exact(packed_down_acc_exact);
+
+    cudaFree(d_nvw); cudaFree(d_nvs); cudaFree(d_packed_nvs);
+    cudaFree(d_packed_escapes); cudaFree(d_packed_codebook); cudaFree(d_packed_prefix);
+    cudaFree(d_i4w); cudaFree(d_i4s);
     cudaFree(d_e2w); cudaFree(d_e2s); cudaFree(d_x); cudaFree(d_y); cudaFree(d_y2); cudaFree(d_xq); cudaFree(d_xscale);
-    return 0;
+    cudaFree(d_x_rows); cudaFree(d_rows_reference); cudaFree(d_rows_dp); cudaFree(d_rows_tc);
+    cudaFree(d_rows_imma);
+    cudaFree(d_rows_dp_workspace); cudaFree(d_rows_dp_workspace_b);
+    cudaFree(d_down_x_rows); cudaFree(d_down_workspace);
+    cudaFree(d_rows_tc8_workspace); cudaFree(d_rows_tc16_workspace);
+    cudaFree(d_rows_imma16_workspace);
+    return exact_gates_pass ? 0 : 1;
 }
 #endif

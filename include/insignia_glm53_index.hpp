@@ -27,10 +27,24 @@ struct TensorLocation {
     std::vector<uint32_t> shape;
 };
 
+enum class AlternateShardPolicy : uint8_t {
+    // Preserve the legacy whole-shard override: a valid same-name shard in
+    // INSIGNIA_GLM53_ALT_SHARD_DIR replaces the primary copy.
+    environment,
+    // Ignore INSIGNIA_GLM53_ALT_SHARD_DIR entirely.
+    disabled,
+    // Overlay indexes may resolve only shards absent from the primary root.
+    // This prevents stale same-name mirrors from silently joining a new
+    // per-expert stripe.
+    strict_overlay,
+};
+
 class ShardedIndex {
 public:
     explicit ShardedIndex(const std::filesystem::path &index_path,
-                          const std::filesystem::path &model_root);
+                          const std::filesystem::path &model_root,
+                          AlternateShardPolicy alternate_policy =
+                              AlternateShardPolicy::environment);
     ~ShardedIndex();
     ShardedIndex(const ShardedIndex &) = delete;
     ShardedIndex &operator=(const ShardedIndex &) = delete;
@@ -55,6 +69,8 @@ public:
     bool shard_is_alt(uint16_t shard) const {
         return shard < alt_shard_.size() && alt_shard_[shard];
     }
+    size_t alt_shard_count() const { return alt_shard_count_; }
+    uint64_t alt_shard_bytes() const { return alt_shard_bytes_; }
 
     uint32_t hidden_size() const { return hidden_size_; }
     uint32_t layers() const { return layers_; }
@@ -74,6 +90,8 @@ private:
     std::vector<int> shard_fds_;
     std::vector<int> direct_fds_;
     std::vector<uint8_t> alt_shard_;
+    size_t alt_shard_count_ = 0;
+    uint64_t alt_shard_bytes_ = 0;
     std::unordered_map<std::string, TensorLocation> tensors_;
     uint32_t hidden_size_ = 0;
     uint32_t layers_ = 0;

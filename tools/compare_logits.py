@@ -29,7 +29,8 @@ src/glm53_generate.cu, lines 3274-3281):
 
 Usage:
     python3 tools/compare_logits.py A.f32 B.f32 [--steps N] [--vocab V]
-            [--tokens IDS.txt] [--topk K] [--cos-threshold T] [--quiet]
+            [--tokens IDS.txt] [--topk K] [--cos-threshold T]
+            [--max-ppl-delta D] [--allow-top1-mismatch] [--quiet]
 
   A B              two dump files (raw float32 records, format above)
   --steps N        compare at most the first N records (default: all)
@@ -43,15 +44,20 @@ Usage:
                    they are taken as pre-aligned target(record k) = ids[k].
   --topk K         set-overlap / top-diff width (default 10)
   --cos-threshold  per-step full-vocab cosine floor (default 0.999)
+  --max-ppl-delta  optional fractional candidate PPL-regression ceiling
+  --allow-top1-mismatch
+                    report top-1 agreement without treating mismatches as failure
   --quiet          suppress the per-step table, print summary only
 
 Per step the tool reports: top-1 agreement, top-K set overlap, max/mean
 abs logit difference over the union of the two dumps' top-K sets,
-full-vocab cosine similarity and MSE. A summary (mean/median/max) is
-printed at the end.
+full-vocab cosine similarity, reference-relative L2, MSE, KL(A||B),
+KL(B||A), and JS. Cosine, relative L2, and MSE are also reported after
+subtracting each row's own mean, removing distribution-invariant additive
+logit shifts. A summary (mean/median/max) is printed at the end.
 
-Exit codes: 0 = pass, 1 = quality failure (any compared step has cosine <
---cos-threshold or top-1 disagreement), 2 = usage/IO error.
+Exit codes: 0 = pass, 1 = quality failure (cosine, top-1, or an optional PPL
+regression gate), 2 = usage/IO error.
 """
 from __future__ import annotations
 
@@ -111,8 +117,9 @@ def logsumexp(x: np.ndarray) -> float:
     return m + math.log(float(np.sum(np.exp(x - m))))
 
 
-def distribution_divergences(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float, float]:
-    """Return KL(A||B), JS(A,B), logsumexp(A), and logsumexp(B)."""
+def distribution_divergences(
+        a: np.ndarray, b: np.ndarray) -> tuple[float, float, float, float, float]:
+    """Return KL(A||B), KL(B||A), JS(A,B), and each logsumexp."""
     lse_a = logsumexp(a)
     lse_b = logsumexp(b)
     log_pa = a - lse_a
@@ -120,10 +127,40 @@ def distribution_divergences(a: np.ndarray, b: np.ndarray) -> tuple[float, float
     pa = np.exp(log_pa)
     pb = np.exp(log_pb)
     log_mix = np.logaddexp(log_pa, log_pb) - math.log(2.0)
-    kl = float(np.sum(pa * (log_pa - log_pb)))
+    kl_ab = float(np.sum(pa * (log_pa - log_pb)))
+    kl_ba = float(np.sum(pb * (log_pb - log_pa)))
     js = 0.5 * float(np.sum(pa * (log_pa - log_mix)) +
                      np.sum(pb * (log_pb - log_mix)))
-    return max(0.0, kl), max(0.0, js), lse_a, lse_b
+    return max(0.0, kl_ab), max(0.0, kl_ba), max(0.0, js), lse_a, lse_b
+
+
+def relative_l2(reference: np.ndarray, candidate: np.ndarray) -> float:
+    reference_norm = float(np.linalg.norm(reference))
+    delta_norm = float(np.linalg.norm(reference - candidate))
+    if reference_norm:
+        return delta_norm / reference_norm
+    return 0.0 if delta_norm == 0.0 else float("inf")
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    norm_a = float(np.linalg.norm(a))
+    norm_b = float(np.linalg.norm(b))
+    if norm_a == 0.0 and norm_b == 0.0:
+        return 1.0
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return float(np.dot(a, b)) / (norm_a * norm_b)
+
+
+def centered_metrics(
+        reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float, float]:
+    centered_reference = reference - float(np.mean(reference))
+    centered_candidate = candidate - float(np.mean(candidate))
+    return (
+        cosine_similarity(centered_reference, centered_candidate),
+        relative_l2(centered_reference, centered_candidate),
+        float(np.mean((centered_reference - centered_candidate) ** 2)),
+    )
 
 
 def main() -> int:
@@ -143,6 +180,10 @@ def main() -> int:
                         help="top-K overlap width (default 10)")
     parser.add_argument("--cos-threshold", type=float, default=0.999,
                         metavar="T", help="per-step cosine floor (default 0.999)")
+    parser.add_argument("--max-ppl-delta", type=float, default=None, metavar="D",
+                        help="optional maximum fractional candidate PPL regression")
+    parser.add_argument("--allow-top1-mismatch", action="store_true",
+                        help="report top-1 agreement without making mismatches fail")
     parser.add_argument("--quiet", action="store_true",
                         help="suppress the per-step table")
     args = parser.parse_args()
@@ -153,6 +194,10 @@ def main() -> int:
         die("error: --topk must be in [1, vocab)")
     if args.steps is not None and args.steps <= 0:
         die("error: --steps must be positive")
+    if args.max_ppl_delta is not None and args.max_ppl_delta < 0:
+        die("error: --max-ppl-delta cannot be negative")
+    if args.max_ppl_delta is not None and args.tokens is None:
+        die("error: --max-ppl-delta requires --tokens")
     for label, path in (("A", args.a), ("B", args.b)):
         if not os.path.isfile(path):
             die(f"error: dump {label} {path!r} does not exist")
@@ -189,7 +234,9 @@ def main() -> int:
                 f"(pre-aligned)")
 
     columns = (f"{'step':>5}  {'top1':>12}  {'ovlp':>7}  {'dmax':>10}  "
-               f"{'dmean':>10}  {'cos':>9}  {'mse':>10}  {'kl':>10}  {'js':>10}")
+               f"{'dmean':>10}  {'cos':>9}  {'rel_l2':>10}  {'mse':>10}  "
+               f"{'cos_ctr':>9}  {'rel_l2_ctr':>10}  {'mse_ctr':>10}  "
+               f"{'klAB':>10}  {'klBA':>10}  {'js':>10}")
     if targets is not None:
         columns += f"  {'nllA':>9}  {'nllB':>9}"
     if not args.quiet:
@@ -197,8 +244,9 @@ def main() -> int:
         print("-" * len(columns))
 
     # Per-step metric series for the summary.
-    cos_series, mse_series, dmax_series, dmean_series = [], [], [], []
-    kl_series, js_series = [], []
+    cos_series, rel_l2_series, mse_series, dmax_series, dmean_series = [], [], [], [], []
+    centered_cos_series, centered_rel_l2_series, centered_mse_series = [], [], []
+    kl_series, kl_reverse_series, js_series = [], [], []
     ovlp_series, top1_mismatches, cos_violations = [], [], []
     nll_a_sum = nll_b_sum = 0.0
 
@@ -214,12 +262,11 @@ def main() -> int:
         d = ra[union] - rb[union]
         dmax = float(np.max(np.abs(d)))
         dmean = float(np.mean(np.abs(d)))
-        na = float(np.linalg.norm(ra))
-        nb = float(np.linalg.norm(rb))
-        cos = 1.0 if na == 0.0 and nb == 0.0 else (
-            0.0 if na == 0.0 or nb == 0.0 else float(np.dot(ra, rb)) / (na * nb))
+        cos = cosine_similarity(ra, rb)
+        rel_l2 = relative_l2(ra, rb)
         mse = float(np.mean((ra - rb) ** 2))
-        kl, js, lse_a, lse_b = distribution_divergences(ra, rb)
+        centered_cos, centered_rel_l2, centered_mse = centered_metrics(ra, rb)
+        kl, kl_reverse, js, lse_a, lse_b = distribution_divergences(ra, rb)
 
         nll_a = nll_b = float("nan")
         if targets is not None:
@@ -229,8 +276,13 @@ def main() -> int:
             nll_b_sum += nll_b
 
         cos_series.append(cos)
+        rel_l2_series.append(rel_l2)
         mse_series.append(mse)
+        centered_cos_series.append(centered_cos)
+        centered_rel_l2_series.append(centered_rel_l2)
+        centered_mse_series.append(centered_mse)
         kl_series.append(kl)
+        kl_reverse_series.append(kl_reverse)
         js_series.append(js)
         dmax_series.append(dmax)
         dmean_series.append(dmean)
@@ -243,8 +295,10 @@ def main() -> int:
         if not args.quiet:
             top1 = f"{top1_a}/{top1_b}" if agree else f"{top1_a}!{top1_b}"
             row = (f"{step:>5}  {top1:>12}  {ovlp:>3}/{k:<3}  {dmax:>10.3e}  "
-                   f"{dmean:>10.3e}  {cos:>9.6f}  {mse:>10.3e}  "
-                   f"{kl:>10.3e}  {js:>10.3e}")
+                   f"{dmean:>10.3e}  {cos:>9.6f}  {rel_l2:>10.3e}  "
+                   f"{mse:>10.3e}  {centered_cos:>9.6f}  "
+                   f"{centered_rel_l2:>10.3e}  {centered_mse:>10.3e}  "
+                   f"{kl:>10.3e}  {kl_reverse:>10.3e}  {js:>10.3e}")
             if targets is not None:
                 row += f"  {nll_a:>9.4f}  {nll_b:>9.4f}"
             print(row)
@@ -256,8 +310,13 @@ def main() -> int:
 
     print("-" * len(columns))
     print(summary("cos", cos_series, lambda v: f"{v:.6f}"))
+    print(summary("rel_l2", rel_l2_series, lambda v: f"{v:.3e}"))
     print(summary("mse", mse_series, lambda v: f"{v:.3e}"))
+    print(summary("cos_ctr", centered_cos_series, lambda v: f"{v:.6f}"))
+    print(summary("rel_l2_ctr", centered_rel_l2_series, lambda v: f"{v:.3e}"))
+    print(summary("mse_ctr", centered_mse_series, lambda v: f"{v:.3e}"))
     print(summary("kl", kl_series, lambda v: f"{v:.3e}"))
+    print(summary("klrev", kl_reverse_series, lambda v: f"{v:.3e}"))
     print(summary("js", js_series, lambda v: f"{v:.3e}"))
     print(summary("dmax", dmax_series, lambda v: f"{v:.3e}"))
     print(summary("dmean", dmean_series, lambda v: f"{v:.3e}"))
@@ -269,25 +328,37 @@ def main() -> int:
           f"{top1_mismatches if top1_mismatches else 'none'})")
     print(f"cos    steps below {args.cos_threshold}: "
           f"{cos_violations if cos_violations else 'none'}")
+    ppl_ratio = None
     if targets is not None:
+        ppl_a = math.exp(nll_a_sum / steps)
+        ppl_b = math.exp(nll_b_sum / steps)
+        ppl_ratio = ppl_b / ppl_a
         for label, total in (("A", nll_a_sum), ("B", nll_b_sum)):
             print(f"nll[{label}] total {total:.4f}  "
                   f"mean {total / steps:.4f}  "
                   f"ppl {math.exp(total / steps):.4f}")
         print(f"nll delta (B-A) total {nll_b_sum - nll_a_sum:+.4f}  "
-              f"ppl A {math.exp(nll_a_sum / steps):.4f} -> "
-              f"B {math.exp(nll_b_sum / steps):.4f}")
+              f"ppl A {ppl_a:.4f} -> B {ppl_b:.4f}")
+        print(f"ppl ratio (B/A) {ppl_ratio:.6f}  "
+              f"delta {(ppl_ratio - 1.0) * 100:+.3f}%")
 
-    if top1_mismatches or cos_violations:
+    top1_violation = bool(top1_mismatches) and not args.allow_top1_mismatch
+    ppl_violation = (args.max_ppl_delta is not None and
+                     ppl_ratio is not None and
+                     ppl_ratio > 1.0 + args.max_ppl_delta)
+    if top1_violation or cos_violations or ppl_violation:
         reasons = []
-        if top1_mismatches:
+        if top1_violation:
             reasons.append(f"top-1 disagreement on {len(top1_mismatches)} step(s)")
         if cos_violations:
             reasons.append(f"cosine < {args.cos_threshold} on "
                            f"{len(cos_violations)} step(s)")
+        if ppl_violation:
+            reasons.append(f"PPL regression {(ppl_ratio - 1.0) * 100:.3f}% > "
+                           f"{args.max_ppl_delta * 100:.3f}%")
         print(f"FAIL: {'; '.join(reasons)}")
         return 1
-    print(f"PASS: {steps} step(s), top-1 100%, cosine >= {args.cos_threshold} "
+    print(f"PASS: {steps} step(s), top-1 {agree_pct:.2f}%, cosine >= {args.cos_threshold} "
           f"on every step")
     return 0
 

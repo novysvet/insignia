@@ -331,7 +331,8 @@ DFlash2Drafter::DFlash2Drafter(const std::string &index_path, const std::string 
     load(fc_b_, "fc.b");
     load(hp_, "hp");
 
-    ShardedIndex bf16(index_path, model_root);
+    // Target expert striping must never redirect the drafter checkpoint.
+    ShardedIndex bf16(index_path, model_root, AlternateShardPolicy::disabled);
     auto small_f32 = [&](const char *name, float **dst, size_t count) {
         const TensorLocation &loc = bf16.tensor(name);
         if (loc.type != TensorType::bf16 || loc.bytes != count * 2)

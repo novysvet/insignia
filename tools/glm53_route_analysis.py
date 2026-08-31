@@ -9,6 +9,7 @@ Usage: python glm53_route_analysis.py run1.txt [run2.txt ...] [--warmup N]
 """
 import argparse
 from collections import Counter, OrderedDict
+from pathlib import Path
 
 import numpy as np
 
@@ -97,6 +98,47 @@ def cache_curves(streams, warm):
         print(f"{cap:>6} {cap * SLOT_MIB:>9.0f} {100 * hits / n:>7.2f} {100 * sh:>8.2f}")
 
 
+def stripe_miss_weights(streams, capacity):
+    """Return per-record LRU misses, resetting cache at each prompt trace.
+
+    Striping should balance bytes that actually reach NVMe, not raw router
+    frequency.  Each input stream is one independently benchmarked prompt, so
+    carrying a warm cache between streams would leak locality across requests.
+    """
+    if capacity <= 0:
+        raise ValueError("stripe cache capacity must be positive")
+    misses = Counter()
+    requests = hits = 0
+    for stream in streams:
+        cache = OrderedDict()
+        for _token, key in stream:
+            requests += 1
+            if key in cache:
+                hits += 1
+                cache.move_to_end(key)
+                continue
+            misses[key] += 1
+            cache[key] = None
+            if len(cache) > capacity:
+                cache.popitem(last=False)
+    return misses, requests, hits
+
+
+def write_stripe_miss_weights(streams, capacity, path):
+    """Write ``layer expert miss_weight`` rows accepted by stripe_repack.py."""
+    misses, requests, hits = stripe_miss_weights(streams, capacity)
+    output = Path(path)
+    with output.open("w", encoding="utf-8", newline="\n") as file:
+        file.write("# Insignia GLM-5.3 route-trace LRU miss weights\n")
+        file.write(f"# cache_slots {capacity}\n")
+        file.write(f"# prompt_streams {len(streams)} requests {requests} hits {hits} "
+                   f"misses {requests - hits}\n")
+        file.write("layer expert miss_weight\n")
+        for key, count in sorted(misses.items()):
+            file.write(f"{key // 1024} {key % 1024} {count}\n")
+    return misses, requests, hits
+
+
 def entropy_tables(files, warm, experts):
     print(f"\n(d) per-layer expert frequency after warmup (uniform max = {np.log2(experts):.2f} bits)")
     print(f"{'layer':>5} {'accesses':>9} {'H(bits)':>8} {'top32%':>7} {'unique':>6}")
@@ -126,6 +168,10 @@ def main():
     ap.add_argument("traces", nargs="+")
     ap.add_argument("--warmup", type=int, default=0, help="decode steps excluded from (b)/(d)/(e); 0 = 10%%")
     ap.add_argument("--experts", type=int, default=288)
+    ap.add_argument("--stripe-weights", type=Path,
+                    help="write per-(layer,expert) LRU miss weights for stripe_repack.py")
+    ap.add_argument("--stripe-cache-slots", type=int, default=0,
+                    help="host expert slots used for --stripe-weights (required)")
     a = ap.parse_args()
     files = [load(p) for p in a.traces]
     topk = max((len(rows[0][1]) for f in files for rows in f[0].values()), default=0)
@@ -136,6 +182,15 @@ def main():
     overlap_stats(files, topk)
     cache_curves([st for _, st in files], warm)
     entropy_tables(files, warm, a.experts)
+    if a.stripe_weights:
+        if a.stripe_cache_slots <= 0:
+            ap.error("--stripe-weights requires positive --stripe-cache-slots")
+        misses, requests, hits = write_stripe_miss_weights(
+            [stream for _, stream in files], a.stripe_cache_slots,
+            a.stripe_weights,
+        )
+        print(f"wrote {len(misses)} nonzero miss weights to {a.stripe_weights} "
+              f"({requests - hits}/{requests} LRU misses; cache resets per trace)")
 
 
 if __name__ == "__main__":

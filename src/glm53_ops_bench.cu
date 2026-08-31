@@ -414,7 +414,11 @@ void test_mla(std::mt19937 &rng) {
     using namespace insignia::glm53;
     constexpr int vector_size = kKdaHeads * kMlaHeadDim;
     constexpr int position = 7;
-    constexpr size_t cache_size = size_t(kMlaMaxContext) * vector_size;
+    // The kernels accept storage sized to the exercised prefix.  Allocating
+    // kMlaMaxContext here became a >16 GiB host allocation once the production
+    // context ceiling moved to 262144, even though this probe touches eight
+    // rows.  Keep the benchmark proportional to its actual test geometry.
+    constexpr size_t cache_size = size_t(position + 1) * vector_size;
     std::normal_distribution<float> normal(0.0f, 0.08f);
     std::vector<float> query(vector_size), kv(size_t(kKdaHeads) * 2 * kMlaHeadDim),
         key_cache(cache_size, 0.0f), value_cache(cache_size, 0.0f),
@@ -484,7 +488,7 @@ void test_mla_prefill(std::mt19937 &rng) {
     using namespace insignia::glm53;
     constexpr int tokens = 16;
     constexpr int width = kKdaHeads * kMlaHeadDim;
-    constexpr size_t cache_size = size_t(kMlaMaxContext) * width;
+    constexpr size_t cache_size = size_t(tokens) * width;
     std::normal_distribution<float> normal(0.0f, 0.08f);
     std::vector<float> query(size_t(tokens) * width), kv(size_t(tokens) * 2 * width),
         empty_cache(cache_size, 0.0f);

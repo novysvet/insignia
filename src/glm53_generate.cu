@@ -3,6 +3,7 @@
 #include "insignia_glm53_dflash2.cuh"
 #include "insignia_glm53_fp8.cuh"
 #include "insignia_glm53_index.hpp"
+#include "insignia_glm53_logit_metrics.cuh"
 #include "insignia_glm53_q8.cuh"
 #include "insignia_glm53_q8_index.hpp"
 
@@ -44,6 +45,7 @@
 
 namespace {
 
+using insignia::glm53::AlternateShardPolicy;
 using insignia::glm53::ShardedIndex;
 using insignia::glm53::TensorLocation;
 using insignia::glm53::TensorType;
@@ -53,6 +55,13 @@ using insignia::glm53::Cache8Format;
 constexpr int kStreams = insignia::glm53::kHyperStreams;
 static int kMaxContext() { static const int limit = [] { const char *v = std::getenv("INSIGNIA_GLM53_CONTEXT"); return std::clamp(v ? std::atoi(v) : 8192, 512, 262144); }(); return limit; }
 constexpr int kLegacyMlaContext = 256;
+// Twenty-one serialized medians on the local sm_89 4070 SUPER.  Down-store
+// and fused weighted-accumulate have distinct occupancy optima; sharing one
+// table left 1--5% on the floor.  Gate/up pair is a different 2048x4096 shape
+// and independently prefers eight warps for every B=1..8.
+constexpr std::array<int, 9> kNvfp4DownStoreCtaWarps{0, 4, 4, 8, 4, 4, 4, 4, 4};
+constexpr std::array<int, 9> kNvfp4PackedDownStoreCtaWarps{0, 4, 4, 8, 4, 4, 4, 4, 4};
+constexpr std::array<int, 9> kNvfp4PackedDownAccCtaWarps{0, 4, 4, 8, 8, 4, 4, 4, 4};
 
 void check(cudaError_t status, const char *what) {
     if (status != cudaSuccess)
@@ -613,7 +622,9 @@ public:
         (kPayloadCapacity + 2 * kAlignment - 2) & ~(kAlignment - 1);
     static constexpr uint32_t kNoKey = 0xffffffffu;
 
-    explicit ExpertStager(ShardedIndex &model, uint64_t host_cache_bytes) : model_(model) {
+    explicit ExpertStager(ShardedIndex &model, ShardedIndex *stripe_model,
+                          uint64_t host_cache_bytes)
+        : model_(model), stripe_model_(stripe_model) {
         // A full decode token needs 336 records; default the tier just above
         // that and let the environment shrink it on smaller hosts.
         window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / kWindowBytes, 64, 4096));
@@ -654,6 +665,11 @@ public:
             vram_budget_mb_ = std::max(0, std::atoi(budget));
         if (const char *value = std::getenv("INSIGNIA_GLM53_DEVICE_PACKED_SCALES"))
             device_packed_scales_ = std::atoi(value) != 0;
+        const char *packed_direct_setting =
+            std::getenv("INSIGNIA_GLM53_PACKED_DIRECT");
+        const bool packed_direct_explicit = packed_direct_setting != nullptr;
+        if (packed_direct_setting)
+            packed_direct_ = std::atoi(packed_direct_setting) != 0;
         // The model has exactly 42 sparse layers (3..44).  The legacy
         // layer-id mapping carved 46 segments and stranded four complete
         // slices.  Keep the corrected dense mapping A/B-gated until the
@@ -671,15 +687,23 @@ public:
         // upload time, after the bytes had already been re-read from disk.
         if (const char *f3 = std::getenv("INSIGNIA_GLM53_F3"))
             f3_device_consult_ = std::atoi(f3) != 0;
+        else
+            f3_device_consult_ = true;
         // O(1) intrusive LRU for the host tier: the ioaudit measured 10-12
         // ms/verify-round in the O(2425) victim scans. The list order mirrors
         // the admission-stamp ordering the scanner selected, so eviction
         // choice is unchanged outside stamp-0 (never-admitted) ties.
-        tier_o1_ = std::getenv("INSIGNIA_GLM53_TIER_O1") != nullptr;
+        if (const char *o1 = std::getenv("INSIGNIA_GLM53_TIER_O1"))
+            tier_o1_ = std::atoi(o1) != 0;
+        else
+            tier_o1_ = true;
         tier_slru_ = std::getenv("INSIGNIA_GLM53_TIER_SLRU") != nullptr;
+        stripe_required_ = std::getenv("INSIGNIA_GLM53_STRIPE_REQUIRED") != nullptr;
         lru_prev_.assign(size_t(window_count_), -1);
         lru_next_.assign(size_t(window_count_), -1);
         if (const char *path = std::getenv("INSIGNIA_GLM53_PACKED_EXPERTS")) {
+            require(!stripe_model_,
+                    "INSIGNIA_GLM53_PACKED_EXPERTS and STRIPE_INDEX cannot be combined yet");
             const char *gpu = std::getenv("INSIGNIA_GLM53_PACKED_GPU");
             packed_gpu_scales_ = !gpu || std::atoi(gpu) != 0;
             if (const char *merge = std::getenv("INSIGNIA_GLM53_PACKED_V2"))
@@ -687,12 +711,29 @@ public:
             if (const char *kernel = std::getenv("INSIGNIA_GLM53_PACKED_KERNEL"))
                 packed_kernel_v2_ = std::atoi(kernel) == 2;
             open_packed_experts(path);
+            // XPR1-v2 carries the exact random-access prefix directory needed
+            // by the direct kernels.  Three matched local model runs made the
+            // direct path 2.34% faster end-to-end with byte-identical logits,
+            // so v2 promotes it by default.  PACKED_DIRECT=0 remains the
+            // explicit expanded-scale rollback arm; v1 stays expanded.
+            if (!packed_direct_explicit && packed_version_ >= 2)
+                packed_direct_ = true;
+            if (packed_direct_) {
+                // Direct views consume the v2 blobs in-place and require the
+                // packed device-slot layout.  Keep the single switch complete.
+                device_packed_scales_ = true;
+                packed_gpu_scales_ = true;
+                packed_kernel_v2_ = true;
+            }
             if (device_packed_scales_)
                 require(packed_version_ >= 2 && packed_gpu_scales_ && packed_kernel_v2_,
                         "packed device slots require XPR1-v2, GPU scales, and PACKED_KERNEL=2");
             if (packed_gpu_scales_)
                 check(cudaMalloc(&packed_scale_device_, kPackedDeviceCapacity),
                       "cudaMalloc packed scale transport/execution scratch");
+            std::printf("packed scale execution: %s%s\n",
+                        packed_direct_ ? "direct XPR1-v2" : "expanded E4M3",
+                        packed_direct_explicit ? " (explicit)" : " (default)");
         }
         if (device_packed_scales_)
             require(packed_fd_ >= 0,
@@ -933,7 +974,10 @@ public:
         cache_hits_ += hits;
         cache_lookups_ += count;
         f3_rescued_ += uint64_t(f3_rescued);
-        batch_demand_count_ = count - hits - f3_rescued;
+        // Include F3 candidates in the expected completion count. upload()
+        // contributes a zero-I/O marker for a surviving device hit or the
+        // actual read end if an earlier slot recycles it before use.
+        batch_demand_count_ = count - hits;
         batch_read_ends_.clear();
         batch_read_ends_.reserve(8);
         if (!overlap_reads_)
@@ -988,7 +1032,13 @@ public:
                 active_device_slot_ = device_slot;
                 active_ = device_slot_layouts_[size_t(device_slot)];
                 active_globals_ = device_slot_globals_[size_t(device_slot)];
-                expand_active_packed_slot_scales();
+                if (!packed_direct_) expand_active_packed_slot_scales();
+                // Keep one completion marker per non-host-hit slot. Device
+                // hits use the batch start as a zero-I/O marker; a later
+                // same-batch recycle instead falls through and records its
+                // real demand-read completion below. This prevents an F3
+                // fallback from finalizing the batch timer too early.
+                record_batch_read_end(batch_read_begin_);
                 batch_device_[size_t(slot)] = false;
                 return;
             }
@@ -1079,7 +1129,7 @@ public:
         if (device_packed_scales_ && active_device_slot_ >= 0) {
             active_ = device_slot_layouts_[size_t(active_device_slot_)];
             active_globals_ = device_slot_globals_[size_t(active_device_slot_)];
-            expand_active_packed_slot_scales();
+            if (!packed_direct_) expand_active_packed_slot_scales();
         } else {
             active_ = state.layout;
             active_globals_ = state.globals;
@@ -1087,8 +1137,12 @@ public:
         if (state.pinned || (batch_populate_[size_t(slot)] && batch_admit_[size_t(slot)])) {            // Admitted: the window stays resident in the host LRU; eviction
             // re-checks copy_done before the slot can be refilled. The pinned
             // window now owns the bytes, so drop the page-cache shadow.
-            if (l2_mode_ && state.l2_shard >= 0)
-                model_.evict_span_cache(uint16_t(state.l2_shard), state.l2_offset, state.l2_bytes);
+            if (l2_mode_ && state.l2_shard >= 0) {
+                ShardedIndex &source =
+                    state.drive == 1 && stripe_model_ ? *stripe_model_ : model_;
+                source.evict_span_cache(uint16_t(state.l2_shard),
+                                        state.l2_offset, state.l2_bytes);
+            }
             state.claimed = false;
             state.stamp = ++stamp_;
             seg_move_front(window, 1);
@@ -1106,6 +1160,39 @@ public:
     }
     bool active_slot_is_packed() const {
         return device_packed_scales_ && active_device_slot_ >= 0;
+    }
+    bool packed_direct_active() const {
+        return packed_direct_ && active_slot_is_packed();
+    }
+    insignia::glm53::Nvfp4PackedScaleView packed_scale_view(int projection) const {
+        require(packed_direct_active() && projection >= 0 && projection < 3,
+                "packed scale view requested outside direct packed execution");
+        const uint8_t *blob = active_device_ + active_.packed_blob[size_t(projection)];
+        const size_t escapes = active_.packed_escapes[size_t(projection)];
+        const size_t codebook = active_.packed_codebook[size_t(projection)];
+        const size_t prefix = active_.packed_prefix[size_t(projection)];
+        require(codebook >= escapes && codebook - escapes <= kProjectionScaleBytes,
+                "packed scale escape span is invalid");
+        return {
+            blob,
+            blob + escapes,
+            blob + codebook,
+            reinterpret_cast<const uint32_t *>(blob + prefix),
+            uint32_t(kProjectionScaleBytes),
+            uint32_t(codebook - escapes),
+            uint32_t(kScalePrefixEntries),
+            256u,
+            15u,
+        };
+    }
+    insignia::glm53::Nvfp4PackedScaleView down_packed_scale() const {
+        return packed_scale_view(0);
+    }
+    insignia::glm53::Nvfp4PackedScaleView gate_packed_scale() const {
+        return packed_scale_view(1);
+    }
+    insignia::glm53::Nvfp4PackedScaleView up_packed_scale() const {
+        return packed_scale_view(2);
     }
     const uint8_t *down_weight() const {
         return active_device_ + (active_slot_is_packed() ? active_.packed_body[0] : active_.body[0]);
@@ -1138,6 +1225,13 @@ public:
     // Demand NVMe record reads started (load_batch misses, F3 fallbacks,
     // stage_layer unions) - the U3 adaptive-k cost estimator's denominator.
     uint64_t records_read() const { return records_read_; }
+    uint64_t drive_records(int drive) const {
+        return drive >= 0 && drive < 2 ? drive_records_[size_t(drive)].load() : 0;
+    }
+    uint64_t drive_bytes(int drive) const {
+        return drive >= 0 && drive < 2 ? drive_bytes_[size_t(drive)].load() : 0;
+    }
+    uint64_t stripe_fallbacks() const { return stripe_fallbacks_.load(); }
     uint64_t cache_lookups() const { return cache_lookups_; }
     uint64_t prefetch_started() const { return prefetch_started_; }
     uint64_t prefetch_useful() const { return prefetch_useful_; }
@@ -1148,6 +1242,10 @@ public:
     uint64_t f3_rescued() const { return f3_rescued_; }
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
+    // Whole-layer prompt staging owns large transient sidecars.  Freeze the
+    // permanent expert tier first so those temporaries cannot silently reduce
+    // the decode-time slot count chosen from free VRAM.
+    void prime_device_arena() { ensure_device_arena(); }
     bool packed_experts() const { return packed_fd_ >= 0; }
     bool packed_gpu_scales() const { return packed_gpu_scales_; }
     uint64_t packed_h2d_bytes() const { return packed_h2d_bytes_.load(); }
@@ -1189,6 +1287,7 @@ private:
     struct WindowState {
         uint32_t key = kNoKey;
         int layer = -1, expert = -1;
+        uint8_t drive = 0;
         bool demand = false, done = true, claimed = false, copy_issued = false;
         bool releasing = false, pinned = false;
         uint8_t segment = 0;    // 0=unlisted, 1=probationary, 2=protected
@@ -1284,11 +1383,12 @@ private:
 #endif
         const double fraction = header.source_bytes
             ? double(header.stored_bytes) / double(header.source_bytes) : 1.0;
-        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + %s expand (format v%d)\n",
+        std::printf("packed experts: %zu records, %.3f GiB logical, %.2f%% smaller, %s + %s (format v%d)\n",
                     populated, header.stored_bytes / double(1ull << 30),
                     100.0 * (1.0 - fraction),
                     packed_direct_fd_ >= 0 ? "O_DIRECT" : "buffered I/O",
-                    packed_gpu_scales_ ? "GPU/packed-H2D" : "AVX2/expanded-H2D",
+                    packed_gpu_scales_ ? "GPU packed-scale transport"
+                                       : "AVX2 expanded-scale transport",
                     packed_version_);
     }
     const PackedExpertIndexEntry &packed_entry(int layer, int expert) const {
@@ -1538,13 +1638,24 @@ private:
         payload = window;
         pread_exact(fd, entry.offset + kAlignment, window, entry.stored_bytes - kAlignment,
                     "read packed v2 record");
-        // Corruption tripwire: the on-disk prefix table's last entry counts
-        // every escape nibble, so it must equal the header's escape count.
+        // Direct execution trusts this directory inside the hot kernel, so
+        // validate every block once as its record enters the host tier. The
+        // expanded path keeps the cheaper endpoint tripwire.
         for (int projection = 0; projection < 3; ++projection) {
+            const uint8_t *packed =
+                window + layout.packed_blob[projection];
             const uint32_t *prefix = reinterpret_cast<const uint32_t *>(
                 window + layout.packed_blob[projection] + layout.packed_prefix[projection]);
+            require(prefix[0] == 0u, "packed v2 prefix must start at zero");
+            if (packed_direct_)
+                for (size_t block = 0; block + 1 < kScalePrefixEntries; ++block) {
+                    const uint32_t actual = count_escape_nibbles_256(packed + block * 256u);
+                    require(prefix[block + 1] >= prefix[block] &&
+                            prefix[block + 1] - prefix[block] == actual,
+                            "packed v2 prefix block mismatch");
+                }
             require(prefix[kScalePrefixEntries - 1] == header->escapes[projection],
-                    "packed v2 prefix table mismatch");
+                     "packed v2 prefix table mismatch");
         }
     }
     void stage_packed_v2_cpu(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
@@ -2110,11 +2221,13 @@ private:
     // entries once per distinct key.
     int drive_of(uint32_t key, int layer, int expert) {
         if (packed_fd_ >= 0) return 0;
+        if (stripe_failed_.load(std::memory_order_relaxed)) return 0;
         std::lock_guard<std::mutex> lock(pool_mutex_);
         const auto found = drive_cache_.find(key);
         if (found != drive_cache_.end()) return found->second;
-        const ExpertLocations tensors = locate_expert(model_, layer, expert);
-        const int drive = model_.shard_is_alt(tensors.body[0]->shard) ? 1 : 0;
+        ShardedIndex &routing_model = stripe_model_ ? *stripe_model_ : model_;
+        const ExpertLocations tensors = locate_expert(routing_model, layer, expert);
+        const int drive = routing_model.shard_is_alt(tensors.body[0]->shard) ? 1 : 0;
         drive_cache_.emplace(key, drive);
         return drive;
     }
@@ -2130,7 +2243,9 @@ private:
         if (const char *workers = std::getenv("INSIGNIA_GLM53_READERS_E"))
             readers_e = std::max(1, std::atoi(workers));
         stop_ = false;
-        for (int drive = 0; drive < 2; ++drive) {
+        const int drive_count =
+            (stripe_model_ ? stripe_model_->alt_shard_count() : model_.alt_shard_count()) ? 2 : 1;
+        for (int drive = 0; drive < drive_count; ++drive) {
             const int workers = std::min<int>(drive ? readers_e : readers, window_count_);
             for (int index = 0; index < workers; ++index)
                 pool_.emplace_back([this, drive] {
@@ -2182,8 +2297,9 @@ private:
         pool_.clear();
     }
     void submit_window(int window, bool demand) {
-        const WindowState &state = windows_[size_t(window)];
+        WindowState &state = windows_[size_t(window)];
         const int drive = drive_of(state.key, state.layer, state.expert);
+        state.drive = uint8_t(drive);
         {
             std::lock_guard<std::mutex> lock(pool_mutex_);
             (demand ? demand_queue_[drive] : prefetch_queue_[drive]).push_back(window);
@@ -2201,16 +2317,45 @@ private:
                              host_ + size_t(window) * kWindowBytes,
                              state.layer, state.expert, packed_scratch);
             } else {
-                const ExpertLocations tensors = locate_expert(model_, state.layer, state.expert);
-                stage(state.layout, state.globals, state.payload, tensors,
-                      host_ + size_t(window) * kWindowBytes, state);
+                auto stage_from = [&](ShardedIndex &source) {
+                    const ExpertLocations tensors =
+                        locate_expert(source, state.layer, state.expert);
+                    stage(source, state.layout, state.globals, state.payload, tensors,
+                          host_ + size_t(window) * kWindowBytes, state);
+                };
+                if (state.drive == 1 && stripe_model_ &&
+                    stripe_failed_.load(std::memory_order_relaxed)) {
+                    if (stripe_required_)
+                        throw std::runtime_error("required expert stripe was disabled after an I/O error");
+                    state.drive = 0;
+                    ++stripe_fallbacks_;
+                    stage_from(model_);
+                } else if (state.drive == 1 && stripe_model_) {
+                    try {
+                        stage_from(*stripe_model_);
+                    } catch (...) {
+                        if (stripe_required_) throw;
+                        stripe_failed_.store(true, std::memory_order_relaxed);
+                        ++stripe_fallbacks_;
+                        state.drive = 0;
+                        state.l2_shard = -1;
+                        state.l2_offset = state.l2_bytes = 0;
+                        stage_from(model_);
+                    }
+                } else {
+                    stage_from(model_);
+                }
+                ++drive_records_[state.drive];
+                drive_bytes_[state.drive].fetch_add(state.layout.bytes,
+                                                     std::memory_order_relaxed);
             }
             if (!state.demand) prefetch_bytes_ += state.source_bytes;
         } catch (...) {
             state.error = std::current_exception();
         }
     }
-    void stage(Layout &layout, std::array<float, 3> &globals, uint8_t *&payload,
+    void stage(ShardedIndex &source, Layout &layout,
+               std::array<float, 3> &globals, uint8_t *&payload,
                const ExpertLocations &tensors, uint8_t *window, WindowState &wstate) {
         layout = {};
         const TensorLocation &first = *tensors.body[0];
@@ -2239,13 +2384,13 @@ private:
                 // Page-cache L2: read through cache; the upload path later
                 // evicts the pages iff the record is admitted to the pinned
                 // tier, so transients (verify-union residue) stay RAM-served.
-                delta = model_.read_span_cached_window(
+                delta = source.read_span_cached_window(
                     first.shard, first.offset, layout.bytes, window, kWindowBytes);
                 wstate.l2_shard = first.shard;
                 wstate.l2_offset = first.offset;
                 wstate.l2_bytes = layout.bytes;
             } else {
-                delta = model_.read_span_direct_window(
+                delta = source.read_span_direct_window(
                     first.shard, first.offset, layout.bytes, window, kWindowBytes);
             }
             payload = window + delta;
@@ -2267,15 +2412,16 @@ private:
             const TensorLocation &scales = *tensors.scales[projection];
             layout.body[projection] = cursor;
             layout.scales[projection] = cursor + size_t(body.bytes);
-            model_.read_span_direct(body.shard, body.offset, body.bytes + scales.bytes,
+            source.read_span_direct(body.shard, body.offset, body.bytes + scales.bytes,
                                     window + cursor);
             cursor += size_t(body.bytes + scales.bytes);
-            model_.read(*tensors.globals[projection], globals.data() + projection);
+            source.read(*tensors.globals[projection], globals.data() + projection);
         }
         layout.bytes = cursor;
     }
 
     ShardedIndex &model_;
+    ShardedIndex *stripe_model_ = nullptr;
     int packed_fd_ = -1, packed_direct_fd_ = -1;
     int packed_version_ = 0;
     std::vector<PackedExpertIndexEntry> packed_entries_;
@@ -2296,10 +2442,14 @@ private:
     std::condition_variable pool_cv_, pool_done_;
     std::deque<int> demand_queue_[2], prefetch_queue_[2];
     std::unordered_map<uint32_t, int> drive_cache_;
+    std::array<std::atomic<uint64_t>, 2> drive_records_{};
+    std::array<std::atomic<uint64_t>, 2> drive_bytes_{};
+    std::atomic<uint64_t> stripe_fallbacks_{0};
+    std::atomic<bool> stripe_failed_{false};
     cudaStream_t copy_stream_ = nullptr;
-    bool stop_ = false, packed_gpu_scales_ = false;
+    bool stop_ = false, packed_gpu_scales_ = false, stripe_required_ = false;
     bool packed_merge_h2d_ = false, packed_kernel_v2_ = false;
-    bool device_packed_scales_ = false;
+    bool device_packed_scales_ = false, packed_direct_ = false;
     std::array<int, 8> batch_experts_{};
     std::array<bool, 8> batch_cached_{};
     std::array<bool, 8> batch_admit_{};
@@ -2619,10 +2769,35 @@ std::vector<float> read_widened(ShardedIndex &model, std::string_view name);
 class Runner {
 public:
     Runner(const char *root, const char *index, const char *q8_prefix)
-        : model_(index, root), stager_(model_),
+        : model_(index, root,
+                 std::getenv("INSIGNIA_GLM53_STRIPE_INDEX")
+                     ? AlternateShardPolicy::disabled
+                     : AlternateShardPolicy::environment),
+          stager_(model_),
           q8_index_(open_q8(q8_prefix)),
           q8_stager_(q8_index_ ? std::make_unique<Q8Stager>(*q8_index_) : nullptr),
           logits_(0), finite_(1) {
+        if (const char *stripe_index = std::getenv("INSIGNIA_GLM53_STRIPE_INDEX")) {
+            try {
+                stripe_model_ = std::make_unique<ShardedIndex>(
+                    stripe_index, root, AlternateShardPolicy::strict_overlay);
+                require(stripe_model_->hidden_size() == model_.hidden_size() &&
+                            stripe_model_->layers() == model_.layers() &&
+                            stripe_model_->experts() == model_.experts() &&
+                            stripe_model_->active_experts() == model_.active_experts() &&
+                            stripe_model_->tensor_count() == model_.tensor_count(),
+                        "stripe overlay geometry does not match the primary index");
+                std::printf("expert stripe overlay: %zu shards, %.3f GiB from alternate device\n",
+                            stripe_model_->alt_shard_count(),
+                            stripe_model_->alt_shard_bytes() / double(1ull << 30));
+            } catch (const std::exception &error) {
+                stripe_model_.reset();
+                if (std::getenv("INSIGNIA_GLM53_STRIPE_REQUIRED")) throw;
+                std::fprintf(stderr,
+                             "expert stripe unavailable; using exact primary store: %s\n",
+                             error.what());
+            }
+        }
         if (const char *budget = std::getenv("INSIGNIA_GLM53_VRAM_BUDGET_MB"))
             stager_.set_resident_budget(uint64_t(std::max(0, std::atoi(budget))) << 20);
         else if (q8_stager_)
@@ -2823,6 +2998,11 @@ public:
                             df_approx_topm_ ? "fixed-k" : "adaptive-mass",
                             df_cache_route_k_ ? " + cache-aware tail" : "");
         }
+        if (const char *whole =
+                std::getenv("INSIGNIA_GLM53_PREFILL_WHOLE_LAYER_MOE"))
+            prefill_whole_layer_moe_ = std::atoi(whole) != 0;
+        if (const char *fixed = std::getenv("INSIGNIA_GLM53_NVFP4_FIXED_ROWS"))
+            nvfp4_fixed_rows_ = std::atoi(fixed) != 0;
         if (const char *margin = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN")) {
             df_logit_guard_margin_ = std::strtof(margin, nullptr);
             require(df_logit_guard_margin_ > 0.0f,
@@ -3010,7 +3190,8 @@ public:
                 uint64_t host_cache = 32768ull << 20;
                 if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_CACHE_MB"))
                     host_cache = uint64_t(std::max(0, std::atoi(budget))) << 20;
-                expert_stager_ = std::make_unique<ExpertStager>(model_, host_cache);
+                expert_stager_ =
+                    std::make_unique<ExpertStager>(model_, stripe_model_.get(), host_cache);
             }
         }
         if (!moe_metrics_path_.empty() ||
@@ -3121,17 +3302,31 @@ public:
                 std::getenv("INSIGNIA_GLM53_MLA_CROSS_HEAD_FP8") &&
                 std::atoi(std::getenv("INSIGNIA_GLM53_MLA_CROSS_HEAD_FP8")) != 0;
             if (mla_cross_head_fp8_) {
+                const char *parallel_prefix =
+                    std::getenv("INSIGNIA_GLM53_MLA_PREFIX_PARALLEL");
+                mla_prefix_parallel_ = !parallel_prefix ||
+                    std::atoi(parallel_prefix) != 0;
                 mla_qeff_u8_.reset(size_t(kMaxChunk()) * mla_heads_ * kv_a_rows_);
                 mla_qeff_scale_.reset(size_t(kMaxChunk()) * mla_heads_ *
                                        insignia::glm53::kMlaLatentGroups);
-                std::printf("MLA long path: approximate H8 decode / H4xQ8 fused prefill FP8 MMA\n");
+                mla_qeff_f32_.reset(size_t(kMaxChunk()) * mla_heads_ * kv_a_rows_);
+                if (mla_prefix_parallel_)
+                    mla_prefix_partial_.reset(
+                        size_t(mla_heads_) * (kLegacyMlaContext / 16) *
+                        (kv_a_rows_ + 2));
+                std::printf("MLA long path: exact 256-row prefix + approximate "
+                            "H8 decode / H4xQ8 fused prefill FP8 suffix\n");
+                std::printf("MLA decode prefix: %s\n",
+                            mla_prefix_parallel_
+                                ? "ordered-partial FP32 default (reassociated)"
+                                : "scalar FP32 diagnostic (explicit opt-out)");
             }
             const char *reconstruct = std::getenv("INSIGNIA_GLM53_MLA_RECON_PREFIX");
             mla_prefix_reconstruct_ = reconstruct && std::atoi(reconstruct) != 0 &&
                                       mla_fp8_absorb_;
+            const size_t prefix_latent_stride =
+                size_t(kLegacyMlaContext) * kv_a_rows_;
             if (mla_prefix_reconstruct_) {
-                const size_t prefix_latent_stride =
-                    size_t(kLegacyMlaContext) * kv_a_rows_;
                 mla_prefix_latent_.reset(size_t(mla_layers_) * prefix_latent_stride);
                 mla_prefix_kv_.reset(size_t(kLegacyMlaContext) * kv_b_rows_);
                 const double old_mib = 2.0 * mla_layers_ * kLegacyMlaContext *
@@ -3142,6 +3337,9 @@ public:
                             "(%.1f MiB -> %.1f MiB, %.1f MiB reclaimed)\n",
                             old_mib, new_mib, old_mib - new_mib);
             } else {
+                if (mla_cross_head_fp8_)
+                    mla_prefix_latent_.reset(
+                        size_t(mla_layers_) * prefix_latent_stride);
                 const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
                 mla_keys_.reset(size_t(mla_layers_) * expanded_stride);
                 mla_values_.reset(size_t(mla_layers_) * expanded_stride);
@@ -3218,6 +3416,28 @@ public:
             // exact inputs the recurrence replay needs after a rejected draft.
             kda_arch_.reset(size_t(kda_layers_) * kMaxVerify * (4 * size_t(kda_width_) + kda_heads_));
         }
+        if (df_calibration_guard_js_ > 0.0f) {
+            const int vocab = int(model_.vocab_size());
+            df_prior_logits_device_.reset(size_t(vocab));
+            df_logit_metrics_workspace_.reset(
+                insignia::glm53::logit_metrics_workspace_bytes(vocab));
+            df_logit_metrics_device_.reset(1);
+            check(cudaHostAlloc(&df_logit_metrics_host_,
+                                sizeof(insignia::glm53::LogitMetrics),
+                                cudaHostAllocDefault),
+                  "pin DFlash2 calibration metrics");
+        }
+        if (df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f) {
+            constexpr int rows = insignia::glm53::DFlash2Drafter::kDrafts;
+            const int vocab = int(model_.vocab_size());
+            df_logit_row_stats_workspace_.reset(
+                insignia::glm53::logit_row_stats_workspace_bytes(rows, vocab));
+            df_logit_row_stats_device_.reset(rows);
+            check(cudaHostAlloc(&df_logit_row_stats_host_,
+                                size_t(rows) * sizeof(insignia::glm53::LogitRowStats),
+                                cudaHostAllocDefault),
+                  "pin DFlash2 row statistics");
+        }
         check(cudaMemset(kda_states_, 0, kda_states_.size() * sizeof(float)), "clear KDA states");
         check(cudaMemset(conv_history_, 0, conv_history_.size() * sizeof(float)), "clear convolution history");
         if (nvfp4_experts_)
@@ -3244,6 +3464,14 @@ public:
                         (unsigned long long)(stager_.resident_bytes() >> 20),
                         (unsigned long long)(q8_stager_ ? q8_stager_->resident_bytes() : 0) >> 20,
                         q8_index_->format() == Cache8Format::q8 ? "Q8" : "FP8");
+    }
+
+    ~Runner() {
+        if (df_logit_row_stats_host_) cudaFreeHost(df_logit_row_stats_host_);
+        if (df_logit_metrics_host_) cudaFreeHost(df_logit_metrics_host_);
+        if (df_retry_logits_host_) cudaFreeHost(df_retry_logits_host_);
+        if (df_hp_host_) cudaFreeHost(df_hp_host_);
+        if (df_logits_host_) cudaFreeHost(df_logits_host_);
     }
 
     int layer_count() const { return int(model_.layers()); }
@@ -3288,11 +3516,7 @@ public:
         if (df_calibration_guard_js_ <= 0.0f && df_retry_top1_drop_ <= 0.0f) return;
         require(row >= 0 && row < kMaxVerify, "DFlash prior-logit row is out of range");
         const size_t vocab = model_.vocab_size();
-        df_prior_logits_host_.resize(vocab);
-        check(cudaMemcpy(df_prior_logits_host_.data(),
-                         verify_logits_.get() + size_t(row) * vocab,
-                         vocab * sizeof(float), cudaMemcpyDeviceToHost),
-              "download accepted DFlash target logits");
+        retain_df_prior_logits(verify_logits_.get() + size_t(row) * vocab, nullptr);
     }
     bool dflash_retry_needed(int rows);
     void begin_dflash_exact_retry() {
@@ -3417,6 +3641,7 @@ private:
 
     ShardedIndex model_;
     TensorStager stager_;
+    std::unique_ptr<ShardedIndex> stripe_model_;
     std::unique_ptr<ExpertStager> expert_stager_;
     std::vector<std::array<int, 8>> prev_routing_;
     std::vector<std::array<int, 64>> row_routing_;  // [layer][row*8+slot], last multi-row chunk
@@ -3453,6 +3678,8 @@ private:
     bool prefetch_on_ = true, deep_checks_ = false, trace_layers_ = false;
     bool full_layer_major_active_ = false;
     bool prefill_approx_moe_ = false;
+    bool prefill_whole_layer_moe_ = false;
+    bool nvfp4_fixed_rows_ = true;
     int prefill_approx_first_layer_ = 0;
     bool early_route_on_ = false, early_route_prefetch_ = false;
     int early_route_prefetch_n_ = 8;
@@ -3463,6 +3690,13 @@ private:
     uint64_t early_multi_predicted_ = 0, early_multi_actual_ = 0;
     uint64_t early_multi_hints_ = 0, early_multi_started_ = 0;
     std::vector<std::vector<std::array<int, 8>>> early_multi_rows_;
+
+    struct WholeMoeRouteSink {
+        std::array<int, 8> *experts;
+        std::array<float, 8> *weights;
+        int row_base;
+    };
+    WholeMoeRouteSink *whole_moe_route_sink_ = nullptr;
 
     void route_trace(int layer, const std::vector<int> &selected, const std::vector<float> &scores);
     void early_route(int layer, const float *input);
@@ -3553,7 +3787,7 @@ private:
         df_logit_guard_k_[size_t(row)] = uint8_t(std::max<int>(
             df_logit_guard_k_[size_t(row)], k));
     }
-    double dflash_calibration_js(const float *draft) const;
+    void retain_df_prior_logits(const float *device_logits, const float *host_logits = nullptr);
     std::vector<std::string> layer_types_, mlp_types_;
     std::unordered_map<std::string, std::vector<float>> host_cache_;
     std::unordered_map<std::string, std::unique_ptr<DeviceBuffer<float>>> f32_cache_;
@@ -3574,12 +3808,13 @@ private:
     // merge scratch [heads, tiles, latent+2].
     DeviceBuffer<uint8_t> mla_latent_u8_, mla_qeff_u8_;
     DeviceBuffer<float> mla_latent_f32_, mla_latent_scale_, mla_partial_, w_uk_, w_uv_;
-    DeviceBuffer<float> mla_qeff_scale_;
+    DeviceBuffer<float> mla_qeff_scale_, mla_qeff_f32_, mla_prefix_partial_;
     DeviceBuffer<float> mla_keys_, mla_values_, mla_prefix_latent_, mla_prefix_kv_;
     std::vector<Q8Stager::ResidentView> mla_absorb_fp8_views_;
     bool kv_fp8_ = true, mla_legacy_ = false, mla_fp8_absorb_ = false;
     bool mla_prefix_reconstruct_ = false;
     bool mla_cross_head_fp8_ = false;
+    bool mla_prefix_parallel_ = false;
     int mla_prefix_kv_slot_ = -1, mla_prefix_kv_positions_ = 0;
     size_t absorb_per_layer_ = 0;
     const uint32_t *chunk_bf16_weights_ = nullptr;
@@ -3598,6 +3833,13 @@ private:
     DeviceBuffer<float> verify_means_, verify_normed_, verify_logits_;
     DeviceBuffer<int> verify_arg_;
     DeviceBuffer<float> kda_snap_, conv_snap_, kda_arch_;
+    DeviceBuffer<float> df_prior_logits_device_;
+    bool df_prior_logits_ready_ = false;
+    DeviceBuffer<uint8_t> df_logit_metrics_workspace_, df_logit_row_stats_workspace_;
+    DeviceBuffer<insignia::glm53::LogitMetrics> df_logit_metrics_device_;
+    DeviceBuffer<insignia::glm53::LogitRowStats> df_logit_row_stats_device_;
+    insignia::glm53::LogitMetrics *df_logit_metrics_host_ = nullptr;
+    insignia::glm53::LogitRowStats *df_logit_row_stats_host_ = nullptr;
     std::vector<int> kda_row_;
     // CCT: per layer, the byte offset of its (layer, layer+1) table (or -1),
     // plus the flat top-8-per-expert id table and its header constants.
@@ -4014,13 +4256,15 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
         check(insignia::glm53::mla_store_latent(
               small_b_.get(), cache_u8, cache_scale, cache_f32, 1, position,
               kv_a_rows_), "MLA latent shadow store");
-        if (mla_prefix_reconstruct_) {
-            const size_t prefix_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+        const size_t prefix_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+        if (mla_prefix_reconstruct_ || mla_cross_head_fp8_) {
             check(cudaMemcpyAsync(
                   mla_prefix_latent_.get() + size_t(slot) * prefix_stride +
                       size_t(position) * kv_a_rows_,
                   small_b_.get(), size_t(kv_a_rows_) * sizeof(float),
                   cudaMemcpyDeviceToDevice), "save exact MLA prefix latent");
+        }
+        if (mla_prefix_reconstruct_) {
             reconstruct_mla_prefix(slot, position + 1, position);
             check(insignia::glm53::mla_decode_reconstructed(
                   mla_query_.get(), mla_prefix_kv_.get(), mla_output_, position,
@@ -4043,7 +4287,12 @@ void Runner::mla(int layer, const float *input, float *output, int position) {
                       mla_query_.get(), small_b_.get(), cache_u8, cache_scale,
                       view.weights, view.scales, mla_qeff_u8_.get(),
                       mla_qeff_scale_.get(), mla_partial_.get(), mla_output_, position,
-                      mla_heads_, mla_head_dim_, kv_a_rows_),
+                      mla_heads_, mla_head_dim_, kv_a_rows_,
+                      mla_prefix_latent_.get() + size_t(slot) *
+                          kLegacyMlaContext * kv_a_rows_,
+                      mla_qeff_f32_.get(),
+                      mla_prefix_parallel_ ? mla_prefix_partial_.get() : nullptr,
+                      mla_prefix_parallel_),
                       "MLA cross-head FP8 attention");
             else
                 check(insignia::glm53::mla_decode_latent_fp8_absorb(
@@ -4334,16 +4583,38 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
         for (int slot = 0; slot < moe_topk_; ++slot) {
             const int expert = selected[slot];
             expert_stager_->upload(slot);
-            check(insignia::glm53::nvfp4_gemv2_dp4a_quantized(
-                expert_stager_->gate_weight(), expert_stager_->gate_scale(), expert_stager_->gate_global(slot),
-                expert_stager_->up_weight(), expert_stager_->up_scale(), expert_stager_->up_global(slot),
-                nv_workspace_4096_, gate_, up_, moe_intermediate_, hidden_), "routed expert gate/up");
+            constexpr int direct_id = 0;
+            check(expert_stager_->packed_direct_active()
+                      ? insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_packed(
+                            expert_stager_->gate_weight(),
+                            expert_stager_->gate_packed_scale(),
+                            expert_stager_->gate_global(slot),
+                            expert_stager_->up_weight(),
+                            expert_stager_->up_packed_scale(),
+                            expert_stager_->up_global(slot),
+                            nv_workspace_4096_, 1, gate_, up_, &direct_id,
+                            moe_intermediate_, hidden_, 8)
+                      : insignia::glm53::nvfp4_gemv2_dp4a_quantized(
+                            expert_stager_->gate_weight(), expert_stager_->gate_scale(),
+                            expert_stager_->gate_global(slot), expert_stager_->up_weight(),
+                            expert_stager_->up_scale(), expert_stager_->up_global(slot),
+                            nv_workspace_4096_, gate_, up_, moe_intermediate_, hidden_),
+                  "routed expert gate/up");
                 check(insignia::glm53::quantize_swiglu_activation(gate_, up_, moe_intermediate_, nv_workspace_2048_),
                       "quantize routed SwiGLU");
                 const float weight = 2.5f * scores[expert] / denominator;
-                check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
-                    expert_stager_->down_weight(), expert_stager_->down_scale(), expert_stager_->down_global(slot),
-                    nv_workspace_2048_, routed_, weight, hidden_, moe_intermediate_), "routed expert down");
+                check(expert_stager_->packed_direct_active()
+                          ? insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                                expert_stager_->down_weight(),
+                                expert_stager_->down_packed_scale(),
+                                expert_stager_->down_global(slot), nv_workspace_2048_,
+                                1, routed_, &direct_id, &weight, hidden_, moe_intermediate_,
+                                kNvfp4PackedDownAccCtaWarps[1])
+                          : insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
+                                expert_stager_->down_weight(), expert_stager_->down_scale(),
+                                expert_stager_->down_global(slot), nv_workspace_2048_,
+                                routed_, weight, hidden_, moe_intermediate_),
+                      "routed expert down");
             }
         add_kernel<<<16, 256>>>(output, routed_, hidden_);
     }
@@ -4473,33 +4744,27 @@ int Runner::mtp_forward(int token, const float *hidden_in, int position) {
     return token_out;
 }
 
-double Runner::dflash_calibration_js(const float *draft) const {
+void Runner::retain_df_prior_logits(const float *device_logits, const float *host_logits) {
     const size_t vocab = model_.vocab_size();
-    require(df_prior_logits_host_.size() == vocab,
-            "DFlash calibration guard has no previous target logits");
-    const float *prior = df_prior_logits_host_.data();
-    double prior_max = -std::numeric_limits<double>::infinity();
-    double draft_max = prior_max;
-    for (size_t token = 0; token < vocab; ++token) {
-        prior_max = std::max(prior_max, double(prior[token]));
-        draft_max = std::max(draft_max, double(draft[token]));
+    require(device_logits, "DFlash prior logits are missing");
+    if (df_calibration_guard_js_ > 0.0f) {
+        require(df_prior_logits_device_.size() == vocab,
+                "DFlash calibration prior buffer has wrong geometry");
+        check(cudaMemcpyAsync(df_prior_logits_device_.get(), device_logits,
+                              vocab * sizeof(float), cudaMemcpyDeviceToDevice),
+              "retain accepted DFlash target logits on device");
+        df_prior_logits_ready_ = true;
     }
-    double prior_sum = 0.0, draft_sum = 0.0;
-    for (size_t token = 0; token < vocab; ++token) {
-        prior_sum += std::exp(double(prior[token]) - prior_max);
-        draft_sum += std::exp(double(draft[token]) - draft_max);
+    if (df_retry_top1_drop_ > 0.0f) {
+        df_prior_logits_host_.resize(vocab);
+        if (host_logits) {
+            std::copy_n(host_logits, vocab, df_prior_logits_host_.data());
+        } else {
+            check(cudaMemcpy(df_prior_logits_host_.data(), device_logits,
+                             vocab * sizeof(float), cudaMemcpyDeviceToHost),
+                  "download accepted DFlash retry prior logits");
+        }
     }
-    const double prior_log_z = prior_max + std::log(prior_sum);
-    const double draft_log_z = draft_max + std::log(draft_sum);
-    double js = 0.0;
-    for (size_t token = 0; token < vocab; ++token) {
-        const double p = std::exp(double(prior[token]) - prior_log_z);
-        const double q = std::exp(double(draft[token]) - draft_log_z);
-        const double mixture = 0.5 * (p + q);
-        if (p > 0.0) js += 0.5 * p * std::log(p / mixture);
-        if (q > 0.0) js += 0.5 * q * std::log(q / mixture);
-    }
-    return js;
 }
 
 // The first-pass verifier has already paid for target logits but has not yet
@@ -4583,14 +4848,41 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
         linear("lm_head.weight", df_->draft_hidden() + size_t(t) * hidden_,
                verify_logits_.get() + size_t(t) * model_.vocab_size(),
                int(model_.vocab_size()), hidden_);
-    check(cudaMemcpy(df_logits_host_, verify_logits_.get(),
-                     df_->logits_span() * sizeof(float), cudaMemcpyDeviceToHost),
+    constexpr int draft_rows = insignia::glm53::DFlash2Drafter::kDrafts;
+    const int vocab = int(model_.vocab_size());
+    // The engine already enforces finite residuals before lm_head. Keep that
+    // invariant here rather than paying another full-vocabulary validation pass.
+    if (df_calibration_guard_js_ > 0.0f) {
+        require(df_prior_logits_ready_, "DFlash calibration has no target-logit prior");
+        check(insignia::glm53::logit_metrics_async(
+                  df_prior_logits_device_.get(), verify_logits_.get(), vocab,
+                  df_logit_metrics_workspace_.get(), df_logit_metrics_device_.get()),
+              "launch DFlash2 calibration metrics");
+    }
+    if (df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f)
+        check(insignia::glm53::logit_row_stats_async(
+                  verify_logits_.get(), draft_rows, vocab,
+                  df_logit_row_stats_workspace_.get(), df_logit_row_stats_device_.get()),
+              "launch DFlash2 row statistics");
+    if (df_calibration_guard_js_ > 0.0f)
+        check(cudaMemcpyAsync(df_logit_metrics_host_, df_logit_metrics_device_.get(),
+                              sizeof(insignia::glm53::LogitMetrics),
+                              cudaMemcpyDeviceToHost),
+              "download DFlash2 calibration metrics");
+    if (df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f)
+        check(cudaMemcpyAsync(df_logit_row_stats_host_, df_logit_row_stats_device_.get(),
+                              size_t(draft_rows) * sizeof(insignia::glm53::LogitRowStats),
+                              cudaMemcpyDeviceToHost),
+              "download DFlash2 row statistics");
+    check(cudaMemcpyAsync(df_logits_host_, verify_logits_.get(),
+                          df_->logits_span() * sizeof(float), cudaMemcpyDeviceToHost),
           "download DFlash2 logits");
-    check(cudaMemcpy(df_hp_host_, df_->hidden_projection(),
-                     size_t(insignia::glm53::DFlash2Drafter::kDrafts) * insignia::glm53::DFlash2Drafter::kRank *
-                         sizeof(float),
-                     cudaMemcpyDeviceToHost),
+    check(cudaMemcpyAsync(df_hp_host_, df_->hidden_projection(),
+                          size_t(draft_rows) * insignia::glm53::DFlash2Drafter::kRank *
+                              sizeof(float),
+                          cudaMemcpyDeviceToHost),
           "download DFlash2 hp");
+    check(cudaStreamSynchronize(nullptr), "complete DFlash2 logit decisions");
     df_logit_guard_exact_.fill(0);
     df_logit_guard_k_.fill(0);
     const int draft_round = int(df_draft_round_++);
@@ -4604,7 +4896,7 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
         --df_uncertainty_hold_left_;
     }
     if (df_calibration_guard_js_ > 0.0f) {
-        const double js = dflash_calibration_js(df_logits_host_);
+        const double js = df_logit_metrics_host_->js;
         ++df_calibration_guard_rounds_;
         df_calibration_js_sum_ += js;
         df_calibration_js_max_ = std::max(df_calibration_js_max_, js);
@@ -4619,18 +4911,10 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
     }
     if (df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f) {
         constexpr int rows = insignia::glm53::DFlash2Drafter::kDrafts;
-        const int vocab = int(model_.vocab_size());
         std::array<double, rows> top1_probability{};
-        for (int draft_row = 0; draft_row < rows; ++draft_row) {
-            const float *logits = df_logits_host_ + size_t(draft_row) * vocab;
-            double maximum = -std::numeric_limits<double>::infinity();
-            for (int token = 0; token < vocab; ++token)
-                maximum = std::max(maximum, double(logits[token]));
-            double normalizer = 0.0;
-            for (int token = 0; token < vocab; ++token)
-                normalizer += std::exp(double(logits[token]) - maximum);
-            top1_probability[size_t(draft_row)] = 1.0 / normalizer;
-        }
+        for (int draft_row = 0; draft_row < rows; ++draft_row)
+            top1_probability[size_t(draft_row)] =
+                df_logit_row_stats_host_[draft_row].top1_probability;
         int highest_guard = -1;
         // Target output after verify row r predicts candidate r+1, whose
         // causal uncertainty is DFlash row r+1.  The probability drop from
@@ -4665,7 +4949,6 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
         }
     }
     if (df_logit_guard_margin_ > 0.0f) {
-        const int vocab = int(model_.vocab_size());
         int highest_margin_guard = -1;
         for (int verify_row = 0; verify_row < kMaxVerify; ++verify_row) {
             // Target output after candidate r predicts candidate r+1. DFlash
@@ -4702,7 +4985,6 @@ std::vector<int> Runner::df_draft(int anchor, int position) {
     }
     static const bool df_debug = std::getenv("INSIGNIA_GLM53_DF_DEBUG") != nullptr;
     if (df_debug) {
-        const int vocab = int(model_.vocab_size());
         for (int t = 0; t < 5; ++t) {
             const float *row = df_logits_host_ + size_t(t) * vocab;
             std::vector<int> order(vocab);
@@ -4747,19 +5029,34 @@ void Runner::mtp_moe(const float *input, float *output) {
     for (int slot = 0; slot < moe_topk_; ++slot) {
         const int expert = selected[slot];
         expert_stager_->upload(slot);
-        check(insignia::glm53::nvfp4_gemv2_dp4a_quantized(
-            expert_stager_->gate_weight(), expert_stager_->gate_scale(),
-            expert_stager_->gate_global(slot),
-            expert_stager_->up_weight(), expert_stager_->up_scale(),
-            expert_stager_->up_global(slot),
-            nv_workspace_4096_, gate_, up_, moe_intermediate_, hidden_), "MTP expert gate/up");
+        constexpr int direct_id = 0;
+        check(expert_stager_->packed_direct_active()
+                  ? insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_packed(
+                        expert_stager_->gate_weight(), expert_stager_->gate_packed_scale(),
+                        expert_stager_->gate_global(slot), expert_stager_->up_weight(),
+                        expert_stager_->up_packed_scale(), expert_stager_->up_global(slot),
+                        nv_workspace_4096_, 1, gate_, up_, &direct_id,
+                        moe_intermediate_, hidden_, 8)
+                  : insignia::glm53::nvfp4_gemv2_dp4a_quantized(
+                        expert_stager_->gate_weight(), expert_stager_->gate_scale(),
+                        expert_stager_->gate_global(slot), expert_stager_->up_weight(),
+                        expert_stager_->up_scale(), expert_stager_->up_global(slot),
+                        nv_workspace_4096_, gate_, up_, moe_intermediate_, hidden_),
+              "MTP expert gate/up");
         check(insignia::glm53::quantize_swiglu_activation(gate_, up_, moe_intermediate_,
               nv_workspace_2048_), "quantize MTP SwiGLU");
         const float weight = 2.5f * scores[expert] / denominator;
-        check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
-            expert_stager_->down_weight(), expert_stager_->down_scale(),
-            expert_stager_->down_global(slot), nv_workspace_2048_, routed_, weight,
-            hidden_, moe_intermediate_), "MTP expert down");
+        check(expert_stager_->packed_direct_active()
+                  ? insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                        expert_stager_->down_weight(), expert_stager_->down_packed_scale(),
+                        expert_stager_->down_global(slot), nv_workspace_2048_, 1,
+                        routed_, &direct_id, &weight, hidden_, moe_intermediate_,
+                        kNvfp4PackedDownAccCtaWarps[1])
+                  : insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
+                        expert_stager_->down_weight(), expert_stager_->down_scale(),
+                        expert_stager_->down_global(slot), nv_workspace_2048_, routed_,
+                        weight, hidden_, moe_intermediate_),
+              "MTP expert down");
     }
     add_kernel<<<16, 256>>>(output, routed_, hidden_);
     check(cudaGetLastError(), "MTP MoE combine launch");
@@ -4912,11 +5209,10 @@ void Runner::force_logits(const std::vector<int> &tokens, int position_base, int
                          cudaMemcpyDeviceToHost), "download target-forced logits");
         require(std::fwrite(host.data(), sizeof(float), values, dump) == values,
                 "write target-forced logits");
-        if (df_calibration_guard_js_ > 0.0f || df_retry_top1_drop_ > 0.0f) {
-            df_prior_logits_host_.resize(size_t(vocab));
-            std::copy_n(host.data() + size_t(count - 1) * vocab, size_t(vocab),
-                        df_prior_logits_host_.data());
-        }
+        if (df_calibration_guard_js_ > 0.0f || df_retry_top1_drop_ > 0.0f)
+            retain_df_prior_logits(
+                verify_logits_.get() + size_t(count - 1) * vocab,
+                host.data() + size_t(count - 1) * vocab);
         df_commit(count, position_base + int(consumed));
         anchor = tokens[consumed + size_t(count) - 1];
         consumed += size_t(count);
@@ -5032,80 +5328,131 @@ void Runner::mla_multi(int layer, const float *input, float *output, int tokens,
         &mla_absorb_fp8_views_[size_t(slot)] : nullptr;
     float *cache_scale = mla_latent_scale_.get() + size_t(slot) * kMaxContext() *
                          insignia::glm53::kMlaLatentGroups;
-    const bool exact_prefix = position_base + tokens <= kLegacyMlaContext;
-    if (exact_prefix) {
+    // A legal prefill chunk may straddle 256 (for example 192..287 with
+    // PREFILL_CHUNK=96). Execute and save the overlapping exact rows first,
+    // then dispatch only the suffix from position 256.
+    const int prefix_tokens =
+        insignia::glm53::mla_exact_prefix_overlap_tokens(
+            tokens, position_base);
+    const int long_tokens = tokens - prefix_tokens;
+    const int long_position_base = position_base + prefix_tokens;
+    if (prefix_tokens) {
         check(insignia::glm53::mla_store_latent(
               c_small_.get(), cache_u8, cache_scale, cache_f32,
-              tokens, position_base, kv_a_rows_), "MLA latent shadow prefill store");
-        if (mla_prefix_reconstruct_) {
-            const size_t prefix_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+              prefix_tokens, position_base, kv_a_rows_),
+              "MLA exact-prefix latent shadow prefill store");
+        const size_t prefix_stride = size_t(kLegacyMlaContext) * kv_a_rows_;
+        if (mla_prefix_reconstruct_ || mla_cross_head_fp8_) {
             check(cudaMemcpyAsync(
                   mla_prefix_latent_.get() + size_t(slot) * prefix_stride +
                       size_t(position_base) * kv_a_rows_,
-                  c_small_.get(), size_t(tokens) * kv_a_rows_ * sizeof(float),
+                  c_small_.get(),
+                  size_t(prefix_tokens) * kv_a_rows_ * sizeof(float),
                   cudaMemcpyDeviceToDevice), "save exact MLA prefix latents (prefill)");
-            reconstruct_mla_prefix(slot, position_base + tokens, position_base);
+        }
+        if (mla_prefix_reconstruct_) {
+            reconstruct_mla_prefix(
+                slot, position_base + prefix_tokens, position_base);
             check(insignia::glm53::mla_flash2_prefill_reconstructed(
-                  c_mlaq_.get(), mla_prefix_kv_.get(), c_mlao_.get(), tokens,
+                  c_mlaq_.get(), mla_prefix_kv_.get(), c_mlao_.get(),
+                  prefix_tokens,
                   position_base, mla_heads_, mla_head_dim_),
                   "reconstructed exact FlashAttention-2 MLA prefix");
         } else {
-            linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_, tokens,
-                         kv_b_rows_, kv_a_rows_);
+            linear_multi(stem + "kv_b_proj.weight", c_small_, c_kv_,
+                         prefix_tokens, kv_b_rows_, kv_a_rows_);
             const size_t expanded_stride = size_t(kLegacyMlaContext) * q_b_rows_;
             check(insignia::glm53::mla_flash2_prefill(
                   c_mlaq_.get(), c_kv_.get(),
                   mla_keys_.get() + size_t(slot) * expanded_stride,
                   mla_values_.get() + size_t(slot) * expanded_stride,
-                  c_mlao_.get(), tokens, position_base, mla_heads_, mla_head_dim_),
+                  c_mlao_.get(), prefix_tokens, position_base,
+                  mla_heads_, mla_head_dim_),
                   "exact FlashAttention-2 MLA prefix");
         }
     }
     static const bool scalar_attention =
         std::getenv("INSIGNIA_GLM53_SCALAR_MLA_PREFILL") != nullptr;
-    if (!exact_prefix && scalar_attention) {
-        for (int token = 0; token < tokens; ++token) {
-            if (mla_fp8_absorb_)
-                check(insignia::glm53::mla_decode_latent_fp8_absorb(
-                      c_mlaq_.get() + size_t(token) * q_b_rows_,
-                      c_small_.get() + size_t(token) * kv_a_rows_,
-                      cache_u8, cache_scale, cache_f32,
-                      absorb_view->weights, absorb_view->scales, mla_partial_.get(),
-                      c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
-                      mla_heads_, mla_head_dim_, kv_a_rows_),
-                      "scalar compact-absorb MLA attention (prefill)");
-            else
+    const float *long_query =
+        c_mlaq_.get() + size_t(prefix_tokens) * q_b_rows_;
+    const float *long_latent =
+        c_small_.get() + size_t(prefix_tokens) * kv_a_rows_;
+    float *long_output = c_mlao_.get() + size_t(prefix_tokens) * q_b_rows_;
+    auto decode_long_rows = [&] {
+        for (int token = 0; token < long_tokens; ++token) {
+            if (mla_fp8_absorb_) {
+                if (mla_cross_head_fp8_)
+                    check(insignia::glm53::mla_decode_latent_cross_head_fp8_absorb(
+                          long_query + size_t(token) * q_b_rows_,
+                          long_latent + size_t(token) * kv_a_rows_,
+                          cache_u8, cache_scale,
+                          absorb_view->weights, absorb_view->scales,
+                          mla_qeff_u8_.get(), mla_qeff_scale_.get(),
+                          mla_partial_.get(),
+                          long_output + size_t(token) * q_b_rows_,
+                          long_position_base + token,
+                          mla_heads_, mla_head_dim_, kv_a_rows_,
+                          mla_prefix_latent_.get() + size_t(slot) *
+                              kLegacyMlaContext * kv_a_rows_,
+                          mla_qeff_f32_.get(),
+                          mla_prefix_parallel_ ? mla_prefix_partial_.get() : nullptr,
+                          mla_prefix_parallel_),
+                          "cross-head exact-prefix MLA decode rows (prefill)");
+                else
+                    check(insignia::glm53::mla_decode_latent_fp8_absorb(
+                          long_query + size_t(token) * q_b_rows_,
+                          long_latent + size_t(token) * kv_a_rows_,
+                          cache_u8, cache_scale, cache_f32,
+                          absorb_view->weights, absorb_view->scales,
+                          mla_partial_.get(),
+                          long_output + size_t(token) * q_b_rows_,
+                          long_position_base + token,
+                          mla_heads_, mla_head_dim_, kv_a_rows_),
+                          "scalar compact-absorb MLA attention (prefill)");
+            } else {
                 check(insignia::glm53::mla_decode_latent(
-                      c_mlaq_.get() + size_t(token) * q_b_rows_,
-                      c_small_.get() + size_t(token) * kv_a_rows_,
+                      long_query + size_t(token) * q_b_rows_,
+                      long_latent + size_t(token) * kv_a_rows_,
                       nullptr, cache_u8, cache_scale, cache_f32, nullptr,
                       w_uk, w_uv, mla_partial_.get(),
-                      c_mlao_.get() + size_t(token) * q_b_rows_, position_base + token,
+                      long_output + size_t(token) * q_b_rows_,
+                      long_position_base + token,
                       mla_heads_, mla_head_dim_, kv_a_rows_),
                       "scalar MLA attention (prefill)");
+            }
         }
-    } else if (!exact_prefix) {
+    };
+    if (long_tokens && scalar_attention) {
+        decode_long_rows();
+    } else if (long_tokens) {
         const bool cross_prefill = mla_cross_head_fp8_ &&
-            (tokens >= 16 || position_base >= 4096);
+            insignia::glm53::mla_cross_head_use_fused_prefill(
+                long_tokens, long_position_base);
         if (mla_fp8_absorb_ && cross_prefill)
             check(insignia::glm53::mla_prefill_latent_cross_head_fp8_absorb(
-                  c_mlaq_.get(), c_small_.get(), cache_u8, cache_scale,
+                  long_query, long_latent, cache_u8, cache_scale,
                   absorb_view->weights, absorb_view->scales,
                   mla_qeff_u8_.get(), mla_qeff_scale_.get(),
-                  c_mlao_.get(), tokens,
-                  position_base, mla_heads_, mla_head_dim_, kv_a_rows_),
+                  long_output, long_tokens, long_position_base,
+                  mla_heads_, mla_head_dim_, kv_a_rows_,
+                  mla_prefix_latent_.get() + size_t(slot) *
+                      kLegacyMlaContext * kv_a_rows_,
+                  mla_qeff_f32_.get()),
                   "cross-head FP8 MLA latent prefill");
+        else if (mla_fp8_absorb_ && mla_cross_head_fp8_)
+            decode_long_rows();
         else if (mla_fp8_absorb_)
             check(insignia::glm53::mla_prefill_latent_fp8_absorb(
-                  c_mlaq_.get(), c_small_.get(), cache_u8, cache_scale, cache_f32,
-                  absorb_view->weights, absorb_view->scales, c_mlao_, tokens,
-                  position_base, mla_heads_, mla_head_dim_, kv_a_rows_),
+                  long_query, long_latent, cache_u8, cache_scale, cache_f32,
+                  absorb_view->weights, absorb_view->scales, long_output,
+                  long_tokens, long_position_base,
+                  mla_heads_, mla_head_dim_, kv_a_rows_),
                   "compact-absorb MLA latent prefill");
         else
-            check(insignia::glm53::mla_prefill_latent(c_mlaq_.get(), c_small_.get(),
+            check(insignia::glm53::mla_prefill_latent(long_query, long_latent,
                   nullptr, cache_u8, cache_scale, cache_f32, nullptr,
-                  w_uk, w_uv, c_mlao_, tokens,
-                  position_base, mla_heads_, mla_head_dim_, kv_a_rows_),
+                  w_uk, w_uv, long_output, long_tokens, long_position_base,
+                  mla_heads_, mla_head_dim_, kv_a_rows_),
                   "MLA latent prefill");
     }
     if (std::getenv("INSIGNIA_GLM53_MLA_DUMP") && layer == mla_slot_.front() &&
@@ -6195,6 +6542,35 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             std::fflush(early_multi_trace_);
         }
     }
+    if (whole_moe_route_sink_) {
+        require(nvfp4_experts_ && expert_stager_ && topk == 8 && !approximate_moe &&
+                    !kda_archive_,
+                "whole-layer route sink requires exact Top-8 NVFP4 prompt routing");
+        for (int token = 0; token < tokens; ++token) {
+            require(exec_count[size_t(token)] == topk,
+                    "whole-layer route sink cannot retain a pruned row");
+            const int row = whole_moe_route_sink_->row_base + token;
+            for (int slot = 0; slot < topk; ++slot) {
+                whole_moe_route_sink_->experts[size_t(row)][size_t(slot)] =
+                    selection[size_t(token)][size_t(slot)].first;
+                whole_moe_route_sink_->weights[size_t(row)][size_t(slot)] =
+                    selection[size_t(token)][size_t(slot)].second;
+            }
+        }
+        // Retain the ordinary prompt bookkeeping even though expert compute
+        // is deferred.  Successive original chunks therefore leave exactly
+        // the same final prev_routing_/row_routing_ state as moe_multi.
+        for (int slot = 0; slot < topk; ++slot)
+            prev_routing_[size_t(layer)][size_t(slot)] =
+                selection[size_t(tokens - 1)][size_t(slot)].first;
+        for (int row = 0; row < tokens && row < 8; ++row) {
+            row_vein_[size_t(layer)][size_t(row)] = verify_epoch_;
+            for (int slot = 0; slot < topk; ++slot)
+                row_routing_[size_t(layer)][size_t(row * topk + slot)] =
+                    selection[size_t(row)][size_t(slot)].first;
+        }
+        return;
+    }
     check(cudaMemset(c_routed_, 0, size_t(tokens) * hidden_ * sizeof(float)), "clear routed (prefill)");
     if (nvfp4_experts_ && expert_stager_) {
         // Routing bookkeeping + speculative next-layer reads, mirroring the
@@ -6365,29 +6741,66 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     check(insignia::glm53::nvfp4_quantize_activation_rows(
                               input, hidden_, &users[size_t(base)], count, nv_workspace_4096_),
                           "quantize expert input (batched prefill)");
-                    check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
-                              expert_stager_->gate_weight(), expert_stager_->gate_scale(),
-                              expert_stager_->gate_global(int(slot)),
-                              expert_stager_->up_weight(), expert_stager_->up_scale(),
-                              expert_stager_->up_global(int(slot)),
-                              nv_workspace_4096_, count,
-                              c_gateu_.get(), c_up_.get(), &users[size_t(base)],
-                              moe_intermediate_, hidden_), "routed expert gate/up (batched prefill)");
+                    check(expert_stager_->packed_direct_active()
+                              ? insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_packed(
+                                    expert_stager_->gate_weight(),
+                                    expert_stager_->gate_packed_scale(),
+                                    expert_stager_->gate_global(int(slot)),
+                                    expert_stager_->up_weight(),
+                                    expert_stager_->up_packed_scale(),
+                                    expert_stager_->up_global(int(slot)),
+                                    nv_workspace_4096_, count, c_gateu_.get(), c_up_.get(),
+                                    &users[size_t(base)], moe_intermediate_, hidden_, 8)
+                              : insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
+                                    expert_stager_->gate_weight(), expert_stager_->gate_scale(),
+                                    expert_stager_->gate_global(int(slot)),
+                                    expert_stager_->up_weight(), expert_stager_->up_scale(),
+                                    expert_stager_->up_global(int(slot)),
+                                    nv_workspace_4096_, count, c_gateu_.get(), c_up_.get(),
+                                    &users[size_t(base)], moe_intermediate_, hidden_),
+                          "routed expert gate/up (batched prefill)");
                     check(insignia::glm53::quantize_swiglu_activation_rows(
                               c_gateu_.get(), c_up_.get(), moe_intermediate_, &users[size_t(base)],
                               count, nv_workspace_2048_), "quantize routed SwiGLU (batched prefill)");
                     if (retain_down_results) {
-                        check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
-                                  expert_stager_->down_weight(), expert_stager_->down_scale(),
-                                  expert_stager_->down_global(int(slot)), nv_workspace_2048_,
-                                  count, c_expert_out_.get(), &out_ids[size_t(base)],
-                                  hidden_, moe_intermediate_), "routed expert down (ordered batched)");
+                        check(expert_stager_->packed_direct_active()
+                                  ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_packed_scale(),
+                                        expert_stager_->down_global(int(slot)),
+                                        nv_workspace_2048_, count, c_expert_out_.get(),
+                                        &out_ids[size_t(base)], hidden_, moe_intermediate_,
+                                        kNvfp4PackedDownStoreCtaWarps[size_t(count)])
+                                  : nvfp4_fixed_rows_
+                                  ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_scale(),
+                                        expert_stager_->down_global(int(slot)),
+                                        nv_workspace_2048_, count, c_expert_out_.get(),
+                                        &out_ids[size_t(base)], hidden_, moe_intermediate_,
+                                        kNvfp4DownStoreCtaWarps[size_t(count)])
+                                  : insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_scale(),
+                                        expert_stager_->down_global(int(slot)),
+                                        nv_workspace_2048_, count, c_expert_out_.get(),
+                                        &out_ids[size_t(base)], hidden_, moe_intermediate_),
+                              "routed expert down (ordered batched)");
                     } else {
-                        check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
-                                  expert_stager_->down_weight(), expert_stager_->down_scale(),
-                                  expert_stager_->down_global(int(slot)), nv_workspace_2048_,
-                                  count, c_routed_.get(), &users[size_t(base)], &combine[size_t(base)],
-                                  hidden_, moe_intermediate_), "routed expert down (batched prefill)");
+                        check(expert_stager_->packed_direct_active()
+                                  ? insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_packed_scale(),
+                                        expert_stager_->down_global(int(slot)), nv_workspace_2048_,
+                                        count, c_routed_.get(), &users[size_t(base)],
+                                        &combine[size_t(base)], hidden_, moe_intermediate_,
+                                        kNvfp4PackedDownAccCtaWarps[size_t(count)])
+                                  : insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
+                                        expert_stager_->down_weight(), expert_stager_->down_scale(),
+                                        expert_stager_->down_global(int(slot)), nv_workspace_2048_,
+                                        count, c_routed_.get(), &users[size_t(base)],
+                                        &combine[size_t(base)], hidden_, moe_intermediate_),
+                              "routed expert down (batched prefill)");
                     }
                 }
             }
@@ -6536,12 +6949,78 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
         prompt_tokens, insignia::glm53::DFlash2Drafter::kMaxCtx) : 0;
     const size_t capture_floats = size_t(5) * df_tokens * hidden_;
 
+    constexpr int kWholeMoeMaxPrompt = 8192;
+    bool whole_moe = prefill_whole_layer_moe_;
+    const char *whole_fallback = nullptr;
+    if (whole_moe && prompt_tokens > kWholeMoeMaxPrompt)
+        whole_fallback = "prompt exceeds the 8192-row sidecar cap";
+    else if (whole_moe && (!nvfp4_experts_ || !expert_stager_ ||
+                           moe_experts_ != 288 || moe_topk_ != 8))
+        whole_fallback = "engine is not exact Top-8 NVFP4";
+    else if (whole_moe && prefill_approx_moe_)
+        whole_fallback = "approximate/cache-aware prompt routing is enabled";
+    else if (whole_moe && (kda_archive_ || df_retry_replay_))
+        whole_fallback = "verify/retry state is active";
+    else if (whole_moe && (moe_metrics_ || falsifier_trace_))
+        whole_fallback = "MoE metrics/falsifier instrumentation is active";
+    if (whole_fallback) whole_moe = false;
+
+    // The arena's first allocation permanently fixes the decode slot count
+    // from then-free VRAM.  Prime before prompt/capture/sidecar allocations.
+    if (whole_moe) expert_stager_->prime_device_arena();
+
     // Every persistent allocation happens before embedding or recurrent-state
     // mutation. A failed explicit mode therefore leaves the Runner untouched.
     DeviceBuffer<float> prompt_device(vram_store ? prompt_floats : 0);
     DeviceBuffer<float> capture_device(vram_store ? capture_floats : 0);
     std::vector<float> prompt_host(vram_store ? 0 : prompt_floats);
     std::vector<float> capture_host(vram_store ? 0 : capture_floats);
+    DeviceBuffer<float> whole_normalized;
+    DeviceBuffer<float> whole_expert_out;
+    DeviceBuffer<float> whole_post;
+    DeviceBuffer<float> whole_comb;
+    if (whole_moe) {
+        const size_t whole_floats = size_t(prompt_tokens) *
+            (size_t(hidden_) + size_t(moe_topk_) * hidden_ + 4 + 16);
+        size_t free_bytes = 0, total_bytes = 0;
+        const cudaError_t info = cudaMemGetInfo(&free_bytes, &total_bytes);
+        constexpr size_t kAllocationReserve = 64ull << 20;
+        if (info != cudaSuccess || whole_floats >
+                (free_bytes > kAllocationReserve
+                    ? (free_bytes - kAllocationReserve) / sizeof(float) : 0)) {
+            cudaGetLastError();
+            whole_moe = false;
+            whole_fallback = "insufficient post-arena VRAM for exact sidecars";
+        } else {
+            try {
+                whole_normalized.reset(size_t(prompt_tokens) * hidden_);
+                whole_expert_out.reset(
+                    size_t(prompt_tokens) * moe_topk_ * hidden_);
+                whole_post.reset(size_t(prompt_tokens) * 4);
+                whole_comb.reset(size_t(prompt_tokens) * 16);
+            } catch (const std::runtime_error &) {
+                cudaGetLastError();
+                whole_normalized.reset(0);
+                whole_expert_out.reset(0);
+                whole_post.reset(0);
+                whole_comb.reset(0);
+                whole_moe = false;
+                whole_fallback = "exact sidecar allocation failed";
+            }
+        }
+    }
+    if (prefill_whole_layer_moe_ && !whole_moe)
+        std::printf("whole-layer MoE fallback: %s\n",
+                    whole_fallback ? whole_fallback : "unsupported mode");
+
+    std::vector<std::array<int, 8>> whole_routes(
+        whole_moe ? size_t(prompt_tokens) : 0);
+    std::vector<std::array<float, 8>> whole_weights(
+        whole_moe ? size_t(prompt_tokens) : 0);
+    std::vector<int> whole_users(
+        whole_moe ? size_t(prompt_tokens) * moe_topk_ : 0);
+    std::vector<int> whole_out_ids(
+        whole_moe ? size_t(prompt_tokens) * moe_topk_ : 0);
 
     const TensorLocation &embedding = model_.tensor("model.language_model.embed_tokens.weight");
     require(embedding.type == TensorType::bf16 && embedding.shape.size() == 2 &&
@@ -6561,11 +7040,396 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
     const uint64_t h2d_records_before = expert_stager_ ?
         expert_stager_->packed_h2d_records() : 0;
     uint64_t prompt_h2d = 0, prompt_d2h = 0;
+    uint64_t whole_layers = 0, whole_union_experts = 0;
+    uint64_t whole_upload_calls = 0, whole_legacy_upload_calls = 0;
+    uint64_t whole_user_rows = 0;
+    double whole_phase_a = 0.0, whole_phase_b = 0.0, whole_phase_c = 0.0;
     const auto all_begin = std::chrono::steady_clock::now();
     const int layers = int(model_.layers());
 
     for (int layer = 0; layer < layers; ++layer) {
         const auto layer_begin = std::chrono::steady_clock::now();
+        if (whole_moe && is_sparse_[size_t(layer)]) {
+            ++whole_layers;
+            const std::string base = layer_stem(layer);
+            const std::string moe_stem = base + "mlp.";
+
+            // Phase A: run attention and the exact CPU router at the original
+            // <=128-row call boundaries.  FFN-normalized rows and its mHC
+            // coefficients survive until the globally staged expert pass.
+            auto phase_begin = std::chrono::steady_clock::now();
+            for (int pos0 = 0; pos0 < prompt_tokens; pos0 += kMaxChunk()) {
+                const int count = std::min(kMaxChunk(), prompt_tokens - pos0);
+                if (early_multi_route_on_) ++early_multi_batch_;
+                float *incoming = vram_store ?
+                    prompt_device.get() + size_t(pos0) * stream_stride : c_stream_a_.get();
+                if (layer == 0) {
+                    for (int row = 0; row < count; ++row) {
+                        uint16_t *device_row = reinterpret_cast<uint16_t *>(stager_.load(
+                            embedding, uint64_t(tokens[size_t(pos0 + row)]) * hidden_ * 2,
+                            hidden_ * 2));
+                        embed_repeat_kernel<<<16, 256>>>(
+                            device_row, incoming + size_t(row) * stream_stride, hidden_);
+                    }
+                    check(cudaGetLastError(),
+                          "embedding repeat launch (whole-layer MoE)");
+                } else if (!vram_store) {
+                    const size_t bytes = size_t(count) * stream_stride * sizeof(float);
+                    check(cudaMemcpy(incoming,
+                                     prompt_host.data() + size_t(pos0) * stream_stride,
+                                     bytes, cudaMemcpyHostToDevice),
+                          "restore prompt streams for whole-layer attention");
+                    prompt_h2d += bytes;
+                }
+
+                mhc_multi(base + "hc_attn", incoming, c_collapsed_, count);
+                rms(base + "input_layernorm.weight", c_collapsed_, c_normalized_,
+                    count, hidden_);
+                if (early_multi_route_on_)
+                    early_route_multi(layer, c_normalized_, count);
+                if (is_mla_[size_t(layer)])
+                    mla_multi(layer, c_normalized_, c_attn_, count, pos0);
+                else
+                    kda_multi(layer, c_normalized_, c_attn_, count, pos0);
+                for (int row = 0; row < count; ++row)
+                    check(insignia::glm53::mhc_mix(
+                              incoming + size_t(row) * stream_stride,
+                              c_attn_.get() + size_t(row) * hidden_,
+                              c_post_.get() + size_t(row) * 4,
+                              c_comb_.get() + size_t(row) * 16,
+                              c_stream_b_.get() + size_t(row) * stream_stride,
+                              hidden_),
+                          "attention mHC mix (whole-layer MoE)");
+
+                mhc_multi(base + "hc_ffn", c_stream_b_, c_collapsed_, count);
+                rms(base + "post_attention_layernorm.weight", c_collapsed_,
+                    c_normalized_, count, hidden_);
+                check(cudaMemcpy(whole_normalized.get() + size_t(pos0) * hidden_,
+                                 c_normalized_.get(),
+                                 size_t(count) * hidden_ * sizeof(float),
+                                 cudaMemcpyDeviceToDevice),
+                      "retain whole-layer FFN normalized rows");
+                check(cudaMemcpy(whole_post.get() + size_t(pos0) * 4,
+                                 c_post_.get(), size_t(count) * 4 * sizeof(float),
+                                 cudaMemcpyDeviceToDevice),
+                      "retain whole-layer FFN post coefficients");
+                check(cudaMemcpy(whole_comb.get() + size_t(pos0) * 16,
+                                 c_comb_.get(), size_t(count) * 16 * sizeof(float),
+                                 cudaMemcpyDeviceToDevice),
+                      "retain whole-layer FFN combine coefficients");
+
+                WholeMoeRouteSink route_sink{
+                    whole_routes.data(), whole_weights.data(), pos0};
+                require(!whole_moe_route_sink_, "nested whole-layer route sink");
+                whole_moe_route_sink_ = &route_sink;
+                try {
+                    moe_multi(layer, c_normalized_, c_ffn_, count);
+                } catch (...) {
+                    whole_moe_route_sink_ = nullptr;
+                    throw;
+                }
+                whole_moe_route_sink_ = nullptr;
+
+                const size_t stream_bytes =
+                    size_t(count) * stream_stride * sizeof(float);
+                if (vram_store) {
+                    check(cudaMemcpy(prompt_device.get() + size_t(pos0) * stream_stride,
+                                     c_stream_b_.get(), stream_bytes,
+                                     cudaMemcpyDeviceToDevice),
+                          "retain whole-layer post-attention streams");
+                } else {
+                    check(cudaMemcpy(prompt_host.data() + size_t(pos0) * stream_stride,
+                                     c_stream_b_.get(), stream_bytes,
+                                     cudaMemcpyDeviceToHost),
+                          "spill whole-layer post-attention streams");
+                    prompt_d2h += stream_bytes;
+                }
+            }
+            whole_phase_a += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - phase_begin).count();
+
+            // Phase B: deduplicate the complete prompt's expert union.  Each
+            // expert is loaded/uploaded once, and every down row lands at the
+            // stable token*8+pick sidecar ID used by Phase C.
+            phase_begin = std::chrono::steady_clock::now();
+            std::array<int, 288> union_experts{};
+            int union_count = 0;
+            for (int row = 0; row < prompt_tokens; ++row)
+                for (int pick = 0; pick < moe_topk_; ++pick) {
+                    const int expert = whole_routes[size_t(row)][size_t(pick)];
+                    if (std::find(union_experts.begin(),
+                                  union_experts.begin() + union_count, expert) ==
+                        union_experts.begin() + union_count)
+                        union_experts[size_t(union_count++)] = expert;
+                }
+            for (int pos0 = 0; pos0 < prompt_tokens; pos0 += kMaxChunk()) {
+                const int end = std::min(pos0 + kMaxChunk(), prompt_tokens);
+                std::array<int, 288> chunk_experts{};
+                int chunk_count = 0;
+                for (int row = pos0; row < end; ++row)
+                    for (int pick = 0; pick < moe_topk_; ++pick) {
+                        const int expert = whole_routes[size_t(row)][size_t(pick)];
+                        if (std::find(chunk_experts.begin(),
+                                      chunk_experts.begin() + chunk_count, expert) ==
+                            chunk_experts.begin() + chunk_count)
+                            chunk_experts[size_t(chunk_count++)] = expert;
+                    }
+                whole_legacy_upload_calls += uint64_t(chunk_count);
+            }
+            require(union_count > 0 && union_count <= moe_experts_,
+                    "invalid whole-layer expert union");
+            whole_union_experts += uint64_t(union_count);
+            // stage_layer() claims every union window until its batch is
+            // consumed.  A small host tier cannot legally claim more windows
+            // than it owns: take_window() would otherwise find no victim and
+            // abort before Phase B starts.  Per-batch load_batch() already
+            // provides the exact fallback and still uploads every union expert
+            // once, so only issue whole-union read-ahead when it fits.
+            if (expert_stager_->cache_slots() >= union_count)
+                expert_stager_->stage_layer(layer, union_experts.data(), union_count);
+            constexpr std::array<int, 8> local_ids{0, 1, 2, 3, 4, 5, 6, 7};
+            for (int base_expert = 0; base_expert < union_count; base_expert += 8) {
+                const int batch_count = std::min(8, union_count - base_expert);
+                std::array<int, 8> batch{};
+                for (int slot = 0; slot < 8; ++slot)
+                    batch[size_t(slot)] = union_experts[size_t(
+                        std::min(base_expert + slot, union_count - 1))];
+                const uint8_t populate_mask =
+                    uint8_t((1u << unsigned(batch_count)) - 1u);
+                expert_stager_->load_batch(
+                    layer, batch, batch_count, true, populate_mask);
+                for (int slot = 0; slot < batch_count; ++slot) {
+                    const int expert = union_experts[size_t(base_expert + slot)];
+                    expert_stager_->upload(slot);
+                    ++whole_upload_calls;
+                    int user_count = 0;
+                    for (int row = 0; row < prompt_tokens; ++row)
+                        for (int pick = 0; pick < moe_topk_; ++pick)
+                            if (whole_routes[size_t(row)][size_t(pick)] == expert) {
+                                whole_users[size_t(user_count)] = row;
+                                whole_out_ids[size_t(user_count)] = row * moe_topk_ + pick;
+                                ++user_count;
+                            }
+                    whole_user_rows += uint64_t(user_count);
+                    for (int base_user = 0; base_user < user_count;
+                         base_user += kMaxVerify) {
+                        const int count = std::min(kMaxVerify, user_count - base_user);
+                        check(insignia::glm53::nvfp4_quantize_activation_rows(
+                                  whole_normalized.get(), hidden_,
+                                  whole_users.data() + base_user, count,
+                                  nv_workspace_4096_),
+                              "quantize whole-layer expert input");
+                        check(expert_stager_->packed_direct_active()
+                                  ? insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_packed(
+                                        expert_stager_->gate_weight(),
+                                        expert_stager_->gate_packed_scale(),
+                                        expert_stager_->gate_global(slot),
+                                        expert_stager_->up_weight(),
+                                        expert_stager_->up_packed_scale(),
+                                        expert_stager_->up_global(slot),
+                                        nv_workspace_4096_, count, c_gateu_.get(),
+                                        c_up_.get(), local_ids.data(),
+                                        moe_intermediate_, hidden_, 8)
+                                  : insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
+                                        expert_stager_->gate_weight(),
+                                        expert_stager_->gate_scale(),
+                                        expert_stager_->gate_global(slot),
+                                        expert_stager_->up_weight(),
+                                        expert_stager_->up_scale(),
+                                        expert_stager_->up_global(slot),
+                                        nv_workspace_4096_, count, c_gateu_.get(),
+                                        c_up_.get(), local_ids.data(),
+                                        moe_intermediate_, hidden_),
+                              "whole-layer routed expert gate/up");
+                        check(insignia::glm53::quantize_swiglu_activation_rows(
+                                  c_gateu_.get(), c_up_.get(), moe_intermediate_,
+                                  local_ids.data(), count, nv_workspace_2048_),
+                              "quantize whole-layer routed SwiGLU");
+                        check(expert_stager_->packed_direct_active()
+                                  ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_packed_scale(),
+                                        expert_stager_->down_global(slot),
+                                        nv_workspace_2048_, count,
+                                        whole_expert_out.get(),
+                                        whole_out_ids.data() + base_user,
+                                        hidden_, moe_intermediate_,
+                                        kNvfp4PackedDownStoreCtaWarps[size_t(count)])
+                                  : nvfp4_fixed_rows_
+                                  ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_scale(),
+                                        expert_stager_->down_global(slot),
+                                        nv_workspace_2048_, count,
+                                        whole_expert_out.get(),
+                                        whole_out_ids.data() + base_user,
+                                        hidden_, moe_intermediate_,
+                                        kNvfp4DownStoreCtaWarps[size_t(count)])
+                                  : insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
+                                        expert_stager_->down_weight(),
+                                        expert_stager_->down_scale(),
+                                        expert_stager_->down_global(slot),
+                                        nv_workspace_2048_, count,
+                                        whole_expert_out.get(),
+                                        whole_out_ids.data() + base_user,
+                                        hidden_, moe_intermediate_),
+                              "whole-layer routed expert down");
+                    }
+                }
+            }
+            whole_phase_b += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - phase_begin).count();
+
+            // Phase C: restore each post-attention chunk, replay the original
+            // independent 64-row first-seen expert orders, then perform the
+            // one deferred FFN mHC mix.  Its result is scratch, so persist it
+            // explicitly as the next layer's prompt state.
+            phase_begin = std::chrono::steady_clock::now();
+            for (int pos0 = 0; pos0 < prompt_tokens; pos0 += kMaxChunk()) {
+                const int count = std::min(kMaxChunk(), prompt_tokens - pos0);
+                const size_t stream_bytes =
+                    size_t(count) * stream_stride * sizeof(float);
+                if (vram_store) {
+                    check(cudaMemcpy(c_stream_b_.get(),
+                                     prompt_device.get() + size_t(pos0) * stream_stride,
+                                     stream_bytes, cudaMemcpyDeviceToDevice),
+                          "restore whole-layer post-attention streams");
+                } else {
+                    check(cudaMemcpy(c_stream_b_.get(),
+                                     prompt_host.data() + size_t(pos0) * stream_stride,
+                                     stream_bytes, cudaMemcpyHostToDevice),
+                          "restore spilled whole-layer post-attention streams");
+                    prompt_h2d += stream_bytes;
+                }
+
+                const float *normalized =
+                    whole_normalized.get() + size_t(pos0) * hidden_;
+                mlp_multi(moe_stem + "shared_experts.", normalized,
+                          c_ffn_, count, shared_intermediate_);
+                check(cudaMemset(c_routed_, 0,
+                                 size_t(count) * hidden_ * sizeof(float)),
+                      "clear whole-layer routed output");
+                for (int block0 = 0; block0 < count; block0 += 64) {
+                    const int block_end = std::min(block0 + 64, count);
+                    std::array<int, 288> block_experts{};
+                    int block_count = 0;
+                    for (int local_row = block0; local_row < block_end; ++local_row) {
+                        const int row = pos0 + local_row;
+                        for (int pick = 0; pick < moe_topk_; ++pick) {
+                            const int expert = whole_routes[size_t(row)][size_t(pick)];
+                            if (std::find(block_experts.begin(),
+                                          block_experts.begin() + block_count, expert) ==
+                                block_experts.begin() + block_count)
+                                block_experts[size_t(block_count++)] = expert;
+                        }
+                    }
+                    for (int expert_slot = 0; expert_slot < block_count; ++expert_slot) {
+                        const int expert = block_experts[size_t(expert_slot)];
+                        for (int local_row = block0; local_row < block_end; ++local_row) {
+                            const int row = pos0 + local_row;
+                            for (int pick = 0; pick < moe_topk_; ++pick)
+                                if (whole_routes[size_t(row)][size_t(pick)] == expert)
+                                    scale_add_kernel<<<16, 256>>>(
+                                        c_routed_.get() + size_t(local_row) * hidden_,
+                                        whole_expert_out.get() +
+                                            (size_t(row) * moe_topk_ + size_t(pick)) * hidden_,
+                                        whole_weights[size_t(row)][size_t(pick)], hidden_);
+                        }
+                    }
+                }
+                check(cudaGetLastError(), "whole-layer routed replay launch");
+                for (int row = 0; row < count; ++row)
+                    add_kernel<<<16, 256>>>(
+                        c_ffn_.get() + size_t(row) * hidden_,
+                        c_routed_.get() + size_t(row) * hidden_, hidden_);
+                check(cudaGetLastError(), "whole-layer MoE combine launch");
+
+                float *final_streams = vram_store ?
+                    prompt_device.get() + size_t(pos0) * stream_stride : c_stream_a_.get();
+                for (int row = 0; row < count; ++row)
+                    check(insignia::glm53::mhc_mix(
+                              c_stream_b_.get() + size_t(row) * stream_stride,
+                              c_ffn_.get() + size_t(row) * hidden_,
+                              whole_post.get() + size_t(pos0 + row) * 4,
+                              whole_comb.get() + size_t(pos0 + row) * 16,
+                              final_streams + size_t(row) * stream_stride,
+                              hidden_),
+                          "FFN mHC mix (whole-layer MoE)");
+
+                int capture_idx = -1;
+                if (df_ && pos0 < df_tokens)
+                    for (int ci = 0; ci < 5; ++ci)
+                        if (kDfCaptureLayers[ci] == layer) capture_idx = ci;
+                if (capture_idx >= 0) {
+                    for (int row = 0; row < count; ++row)
+                        average_streams_kernel<<<16, 256>>>(
+                            final_streams + size_t(row) * stream_stride,
+                            c_collapsed_.get() + size_t(row) * hidden_, hidden_);
+                    const int valid = std::min(count, df_tokens - pos0);
+                    const size_t bytes = size_t(valid) * hidden_ * sizeof(float);
+                    const size_t offset =
+                        (size_t(capture_idx) * df_tokens + size_t(pos0)) * hidden_;
+                    if (vram_store) {
+                        check(cudaMemcpy(capture_device.get() + offset,
+                                         c_collapsed_.get(), bytes,
+                                         cudaMemcpyDeviceToDevice),
+                              "retain whole-layer DFlash capture");
+                    } else {
+                        check(cudaMemcpy(capture_host.data() + offset,
+                                         c_collapsed_.get(), bytes,
+                                         cudaMemcpyDeviceToHost),
+                              "spill whole-layer DFlash capture");
+                        prompt_d2h += bytes;
+                    }
+                }
+
+                if (deep_checks_) {
+                    const int one = 1;
+                    int valid = 0;
+                    check(cudaMemcpy(finite_, &one, sizeof(one),
+                                     cudaMemcpyHostToDevice),
+                          "initialize whole-layer finite flag");
+                    finite_kernel<<<16, 256>>>(
+                        final_streams, count * kStreams * hidden_, finite_);
+                    check(cudaMemcpy(&valid, finite_.get(), sizeof(valid),
+                                     cudaMemcpyDeviceToHost),
+                          "read whole-layer finite flag");
+                    require(valid, "non-finite residual stream after whole-layer prefill layer " +
+                                   std::to_string(layer));
+                }
+                if (!vram_store && layer + 1 < layers) {
+                    check(cudaMemcpy(
+                              prompt_host.data() + size_t(pos0) * stream_stride,
+                              final_streams, stream_bytes, cudaMemcpyDeviceToHost),
+                          "persist whole-layer FFN result");
+                    prompt_d2h += stream_bytes;
+                }
+                if (!deep_checks_ && layer + 1 == layers) {
+                    const int one = 1;
+                    int valid = 0;
+                    check(cudaMemcpy(finite_, &one, sizeof(one),
+                                     cudaMemcpyHostToDevice),
+                          "initialize finite flag");
+                    finite_kernel<<<16, 256>>>(
+                        final_streams, count * kStreams * hidden_, finite_);
+                    check(cudaMemcpy(&valid, finite_.get(), sizeof(valid),
+                                     cudaMemcpyDeviceToHost),
+                          "read finite flag");
+                    require(valid,
+                            "non-finite residual stream after full-layer-major prefill");
+                }
+            }
+            whole_phase_c += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - phase_begin).count();
+            if (trace_layers_) {
+                std::printf("prefill full-lm layer %02d/%02d whole-moe %.3f s\n",
+                            layer + 1, layers,
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - layer_begin).count());
+                std::fflush(stdout);
+            }
+            continue;
+        }
         for (int pos0 = 0; pos0 < prompt_tokens; pos0 += kMaxChunk()) {
             const int count = std::min(kMaxChunk(), prompt_tokens - pos0);
             if (early_multi_route_on_) ++early_multi_batch_;
@@ -6668,13 +7532,29 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
     const uint64_t io_after = expert_stager_ ? expert_stager_->io_bytes() : 0;
     const uint64_t h2d_records_after = expert_stager_ ?
         expert_stager_->packed_h2d_records() : 0;
+    const uint64_t whole_sidecar_bytes = uint64_t(
+        whole_normalized.size() + whole_expert_out.size() +
+        whole_post.size() + whole_comb.size()) * sizeof(float);
     std::printf("prefill_full_lm store=%s tokens=%d prompt_h2d=%llu prompt_d2h=%llu "
-                "records_read=%llu io_bytes=%llu expert_h2d_records=%llu wall=%.3f s\n",
+                "records_read=%llu io_bytes=%llu expert_h2d_records=%llu "
+                "whole_moe=%d whole_layers=%llu whole_union=%llu whole_uploads=%llu "
+                "whole_legacy_uploads=%llu whole_uploads_saved=%llu "
+                "whole_rows=%llu whole_sidecar_bytes=%llu phase_a=%.3f phase_b=%.3f "
+                "phase_c=%.3f wall=%.3f s\n",
                 store.c_str(), prompt_tokens,
                 (unsigned long long)prompt_h2d, (unsigned long long)prompt_d2h,
                 (unsigned long long)(records_after - records_before),
                 (unsigned long long)(io_after - io_before),
-                (unsigned long long)(h2d_records_after - h2d_records_before), seconds);
+                (unsigned long long)(h2d_records_after - h2d_records_before),
+                whole_moe ? 1 : 0,
+                (unsigned long long)whole_layers,
+                (unsigned long long)whole_union_experts,
+                (unsigned long long)whole_upload_calls,
+                (unsigned long long)whole_legacy_upload_calls,
+                (unsigned long long)(whole_legacy_upload_calls - whole_upload_calls),
+                (unsigned long long)whole_user_rows,
+                (unsigned long long)whole_sidecar_bytes,
+                whole_phase_a, whole_phase_b, whole_phase_c, seconds);
     std::fflush(stdout);
 }
 
@@ -6923,7 +7803,7 @@ std::vector<std::pair<int, float>> Runner::step(
     check(cudaMemcpy(host_logits.data(), logits_.get(), host_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
           "download logits");
     if (df_calibration_guard_js_ > 0.0f || df_retry_top1_drop_ > 0.0f)
-        df_prior_logits_host_ = host_logits;
+        retain_df_prior_logits(logits_.get(), host_logits.data());
     if (const char *dump_path = std::getenv("INSIGNIA_GLM53_LOGITS_DUMP")) {
         static std::FILE *dump = nullptr;
         if (!dump) dump = std::fopen(dump_path, "wb");
@@ -6953,6 +7833,15 @@ std::vector<std::pair<int, float>> Runner::step(
         std::printf("  QD8 expert O_DIRECT %.3f GiB / %.3f s (%.2f GB/s)\n",
                     expert_io_bytes() / double(1ull << 30), expert_io_seconds(),
                     expert_io_bytes() / expert_io_seconds() / 1.0e9);
+    if (expert_stager_ &&
+        (stripe_model_ || model_.alt_shard_count() || expert_stager_->stripe_fallbacks()))
+        std::printf("  expert drives C %llu records/%.3f GiB, E %llu records/%.3f GiB, "
+                    "%llu exact-C fallbacks\n",
+                    (unsigned long long)expert_stager_->drive_records(0),
+                    expert_stager_->drive_bytes(0) / double(1ull << 30),
+                    (unsigned long long)expert_stager_->drive_records(1),
+                    expert_stager_->drive_bytes(1) / double(1ull << 30),
+                    (unsigned long long)expert_stager_->stripe_fallbacks());
     if (expert_stager_ && expert_stager_->cache_lookups())
         std::printf("  NVFP4 cache %llu/%llu hits (%.1f%%, %.3f GiB NVMe+H2D avoided; %d slots)\n",
                     (unsigned long long)expert_stager_->cache_hits(),
@@ -7121,7 +8010,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
             "usage: %s MODEL_ROOT MODEL.index [TOKENS=154820] [LAYERS=0(all)] [GENERATE=1] [8BIT_PREFIX]\n"
             "  INSIGNIA_GLM53_MTP=K enables K-token MTP speculative decode (greedy-exact)\n"
-            "  INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR=0|1 overrides automatic multi-chunk prefill\n",
+            "  INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR=0|1 overrides automatic multi-chunk prefill\n"
+            "  INSIGNIA_GLM53_PREFILL_WHOLE_LAYER_MOE=1 enables exact three-phase sparse prefill\n",
             argv[0]);
         return 64;
     }
@@ -7192,10 +8082,15 @@ int main(int argc, char **argv) {
                 int position = int(tokens.size()) - 1;
                 int root = tokens.back();
                 int truth0 = top.front().first;
-                double accept_total = 0.0, draft_total = 0.0, verify_total = 0.0;
+                // Renewal reward is accepted draft work, not merely output
+                // committed by the round.  Empty rounds and the k=1 scalar
+                // bypass advance the output stream but accept no draft.
+                double committed_total = 0.0, accepted_draft_total = 0.0;
+                double draft_total = 0.0, verify_total = 0.0;
                 double fallback_total = 0.0;
                 int rounds = 0, verified_rounds = 0, empty_rounds = 0;
-                std::array<int, 8> accept_hist{};
+                // kDrafts is eight; index eight must be representable.
+                std::array<int, 9> accept_hist{};
                 const int verify_k = [] {
                     const char *value = std::getenv("INSIGNIA_GLM53_DF_VERIFY_K");
                     return std::clamp(value ? std::atoi(value) : 4, 1,
@@ -7324,8 +8219,8 @@ int main(int argc, char **argv) {
                         }
                         ++rounds;
                         ++v2_scalar_rounds;
-                        ++accept_hist[1];
-                        accept_total += 1.0;
+                        ++accept_hist[0];
+                        committed_total += 1;
                         if (v2_costtrace)
                             std::printf("costtrace,%d,0,1,0.000,%.3f,0,%.0f,%.4f,%.3f,%d\n",
                                         rounds, scalar_ms,
@@ -7354,7 +8249,7 @@ int main(int argc, char **argv) {
                         ++accept_hist[0];
                         generated.push_back(truth0);
                         ++rounds;
-                        accept_total += 1;
+                        committed_total += 1;
                         // Empty rounds are matched=0 samples; skipping the
                         // EMA update leaves k inflated through empty streaks,
                         // widening verify unions exactly when acceptance is
@@ -7482,7 +8377,8 @@ int main(int argc, char **argv) {
                     root = candidates[size_t(matched - 1)];
                     truth0 = arg[size_t(matched - 1)];
                     position += matched;
-                    accept_total += matched;
+                    committed_total += matched;
+                    accepted_draft_total += matched;
                     ++rounds;
                     std::fflush(stdout);
                 }
@@ -7491,6 +8387,7 @@ int main(int argc, char **argv) {
                 // fallback.
                 while (int(generated.size()) < generate) {
                     generated.push_back(truth0);
+                    committed_total += 1;
                     if (int(generated.size()) >= generate) break;
                     top = runner.step(truth0, position + 1, layers, true);
                     truth0 = top.front().first;
@@ -7505,7 +8402,7 @@ int main(int argc, char **argv) {
                             "draft %.1f ms/spec round + verify %.1f ms/verified round (%d verified), "
                             "fallback %.1f ms)\n",
                             tokens.size(), elapsed, generate, rounds, verify_k,
-                            accept_total / rounds, empty_rounds,
+                            accepted_draft_total / std::max(1, rounds), empty_rounds,
                             1000.0 * decode_seconds / generate,
                             1000.0 * draft_total /
                                 std::max(1, rounds - v2_scalar_rounds),
@@ -7517,6 +8414,13 @@ int main(int argc, char **argv) {
                     if (accept_hist[size_t(count)])
                         std::printf(" %d:%d", count, accept_hist[size_t(count)]);
                 std::printf("\n");
+                std::printf("  renewal rewards %.2f accepted-draft/round, "
+                            "%.2f committed/round; %.3f accepted-draft/s, "
+                            "%.3f committed/s\n",
+                            accepted_draft_total / std::max(1, rounds),
+                            committed_total / std::max(1, rounds),
+                            accepted_draft_total / std::max(1.0e-9, decode_seconds),
+                            committed_total / std::max(1.0e-9, decode_seconds));
                 if (v2_scalar_rounds)
                     std::printf("  adaptive controller bypassed speculation for %d k=1 rounds\n",
                                 v2_scalar_rounds);

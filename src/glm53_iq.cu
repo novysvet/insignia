@@ -4,12 +4,10 @@
 #include <cuda_runtime.h>
 
 #include <bit>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 
 namespace {
 
@@ -50,11 +48,6 @@ __device__ __align__(128) uint32_t kIQ3GridDevice[256] = {
 #include "insignia_iq3xxs_grid.inc"
 };
 
-// Optional compute-for-cache trade: fold each possible four-bit sign mask into
-// the IQ3 vector codebook.  The 16 KiB table replaces packed-byte compare and
-// subtract instructions without adding a byte to an expert record.
-__device__ __align__(128) uint32_t kIQ3SignedGridDevice[16 * 256];
-
 __device__ __forceinline__ uint32_t load_u32_any(const uint8_t *pointer) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
     const auto *aligned = reinterpret_cast<const uint32_t *>(address & ~uintptr_t(3));
@@ -80,7 +73,6 @@ __device__ __forceinline__ uint32_t apply_iq3_signs(
     return __vsub4(values ^ negative, negative);
 }
 
-template <bool SIGNED_GRID>
 __device__ __forceinline__ void decode_iq3_pair(
     uint32_t pair_indices, uint32_t auxiliary, int pair,
     uint32_t &decoded0, uint32_t &decoded1) {
@@ -89,16 +81,11 @@ __device__ __forceinline__ void decode_iq3_pair(
     const uint32_t code1 = (pair_indices >> (shift + 8)) & 255u;
     const uint32_t sign8 =
         unpack_iq_sign8((auxiliary >> (7 * pair)) & 127u);
-    if constexpr (SIGNED_GRID) {
-        decoded0 = __ldg(kIQ3SignedGridDevice + ((sign8 & 15u) << 8) + code0);
-        decoded1 = __ldg(kIQ3SignedGridDevice + ((sign8 >> 4) << 8) + code1);
-    } else {
-        const uint32_t grid0 = __ldg(kIQ3GridDevice + code0);
-        const uint32_t grid1 = __ldg(kIQ3GridDevice + code1);
-        const uint32_t signs = sign8 * 0x01010101u;
-        decoded0 = apply_iq3_signs(grid0, signs, 0x08040201u);
-        decoded1 = apply_iq3_signs(grid1, signs, 0x80402010u);
-    }
+    const uint32_t grid0 = __ldg(kIQ3GridDevice + code0);
+    const uint32_t grid1 = __ldg(kIQ3GridDevice + code1);
+    const uint32_t signs = sign8 * 0x01010101u;
+    decoded0 = apply_iq3_signs(grid0, signs, 0x08040201u);
+    decoded1 = apply_iq3_signs(grid1, signs, 0x80402010u);
 }
 
 __device__ __forceinline__ int2 iq4_lookup8(uint32_t q4) {
@@ -204,7 +191,7 @@ __global__ __launch_bounds__(128, 4) void iq_quantize_swiglu_x32_rows_kernel(
     }
 }
 
-template <int R, int BLOCKS, bool REPACKED, bool SIGNED_GRID>
+template <int R, int BLOCKS, bool REPACKED>
 __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
     const uint8_t *__restrict__ weights,
     const uint32_t *__restrict__ xq,
@@ -259,8 +246,7 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
             for (int pair = 0; pair < 4; ++pair) {
                 const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
                 uint32_t decoded0, decoded1;
-                decode_iq3_pair<SIGNED_GRID>(pair_indices, aux, pair,
-                                              decoded0, decoded1);
+                decode_iq3_pair(pair_indices, aux, pair, decoded0, decoded1);
 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     const uint32_t *activation =
@@ -283,8 +269,8 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
 #pragma unroll
             for (int pair = 0; pair < 4; ++pair) {
                 const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
-                decode_iq3_pair<SIGNED_GRID>(pair_indices, aux, pair,
-                    decoded[2 * pair + 0], decoded[2 * pair + 1]);
+                decode_iq3_pair(pair_indices, aux, pair,
+                                decoded[2 * pair + 0], decoded[2 * pair + 1]);
             }
 #pragma unroll
             for (int r = 0; r < R; ++r) {
@@ -372,11 +358,11 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     }
 }
 
-template <int R, int BLOCKS, bool REPACKED, bool SIGNED_GRID>
+template <int R, int BLOCKS, bool REPACKED>
 cudaError_t launch_iq3(const uint8_t *weights, const uint32_t *xq,
                        const float *xscale, int words_per_row, float *y,
                        IQRowOut out, int rows, cudaStream_t stream) {
-    iq3_xxs_rows_kernel<R, BLOCKS, REPACKED, SIGNED_GRID>
+    iq3_xxs_rows_kernel<R, BLOCKS, REPACKED>
         <<<rows / 8, 256, 0, stream>>>(weights, xq, xscale,
                                       words_per_row, y, out);
     return cudaPeekAtLastError();
@@ -397,39 +383,7 @@ bool valid_geometry(int rows, int cols, int count) {
            count > 0 && count <= kIQMaxRows;
 }
 
-bool iq3_signed_grid_enabled() {
-    static const bool enabled = [] {
-        const char *value = std::getenv("INSIGNIA_GLM53_IQ3_SIGNED_GRID");
-        return value && value[0] != '0';
-    }();
-    return enabled;
-}
-
-cudaError_t ensure_iq3_signed_grid() {
-    static std::once_flag once;
-    static cudaError_t status = cudaSuccess;
-    std::call_once(once, [] {
-        std::array<uint32_t, 16 * 256> table{};
-        for (uint32_t signs = 0; signs < 16; ++signs) {
-            for (uint32_t code = 0; code < 256; ++code) {
-                const uint32_t values = kIQ3GridHost[code];
-                uint32_t packed = 0;
-                for (uint32_t byte = 0; byte < 4; ++byte) {
-                    const uint8_t magnitude = uint8_t(values >> (8 * byte));
-                    const uint8_t value = signs & (1u << byte)
-                        ? uint8_t(-int(magnitude)) : magnitude;
-                    packed |= uint32_t(value) << (8 * byte);
-                }
-                table[signs * 256 + code] = packed;
-            }
-        }
-        status = cudaMemcpyToSymbol(kIQ3SignedGridDevice, table.data(),
-                                    table.size() * sizeof(uint32_t));
-    });
-    return status;
-}
-
-template <bool REPACKED, bool SIGNED_GRID>
+template <bool REPACKED>
 cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
                          int count, float *y, const int *y_ids,
                          int rows, int cols, cudaStream_t stream) {
@@ -442,9 +396,9 @@ cudaError_t dispatch_iq3(const uint8_t *weights, const void *workspace,
 #define INSIGNIA_IQ3_CASE(R)                                                       \
     case R:                                                                        \
         return cols == 4096                                                        \
-            ? launch_iq3<R, 16, REPACKED, SIGNED_GRID>(                            \
+            ? launch_iq3<R, 16, REPACKED>(                                         \
                   weights, xq, xscale, int(aligned / 4), y, out, rows, stream)     \
-            : launch_iq3<R, 8, REPACKED, SIGNED_GRID>(                             \
+            : launch_iq3<R, 8, REPACKED>(                                          \
                   weights, xq, xscale, int(aligned / 4), y, out, rows, stream)
     switch (count) {
         INSIGNIA_IQ3_CASE(1); INSIGNIA_IQ3_CASE(2);
@@ -558,14 +512,8 @@ cudaError_t iq3_xxs_gemv_rows(
     const int *y_ids, int rows, int cols, cudaStream_t stream) {
     if (!weights || !workspace || !y || !y_ids || !valid_geometry(rows, cols, count))
         return cudaErrorInvalidValue;
-    if (iq3_signed_grid_enabled()) {
-        const cudaError_t status = ensure_iq3_signed_grid();
-        if (status != cudaSuccess) return status;
-        return dispatch_iq3<false, true>(weights, workspace, count, y, y_ids,
-                                         rows, cols, stream);
-    }
-    return dispatch_iq3<false, false>(weights, workspace, count, y, y_ids,
-                                      rows, cols, stream);
+    return dispatch_iq3<false>(weights, workspace, count, y, y_ids,
+                               rows, cols, stream);
 }
 
 void iq3_xxs_repack_cpu(const uint8_t *source, uint8_t *destination,
@@ -591,14 +539,8 @@ cudaError_t iq3_xxs_gemv_repacked_rows(
     const int *y_ids, int rows, int cols, cudaStream_t stream) {
     if (!weights || !workspace || !y || !y_ids || !valid_geometry(rows, cols, count))
         return cudaErrorInvalidValue;
-    if (iq3_signed_grid_enabled()) {
-        const cudaError_t status = ensure_iq3_signed_grid();
-        if (status != cudaSuccess) return status;
-        return dispatch_iq3<true, true>(weights, workspace, count, y, y_ids,
-                                        rows, cols, stream);
-    }
-    return dispatch_iq3<true, false>(weights, workspace, count, y, y_ids,
-                                     rows, cols, stream);
+    return dispatch_iq3<true>(weights, workspace, count, y, y_ids,
+                              rows, cols, stream);
 }
 
 cudaError_t iq4_xs_gemv_rows(

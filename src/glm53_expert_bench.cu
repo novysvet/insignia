@@ -214,7 +214,6 @@ __global__ __launch_bounds__(256) void nvfp4_dp4a_kernel(
     if (!lane) y[row] = sum;
 }
 
-#if !defined(INSIGNIA_GLM53_NO_MAIN)
 // Exact arithmetic decoder proposed by the E2M1 embedding proof.  Four code
 // bytes are evaluated lane-wise with CUDA's packed-u8 video intrinsics; the
 // resulting coefficient bytes are identical to c_e2i.  This prototype keeps
@@ -241,6 +240,19 @@ __device__ __forceinline__ void unpack_e2_tablefree(
     second = decode_e2x4_tablefree(__byte_perm(even, odd, 0x7362));
 }
 
+template <bool TABLE_FREE>
+__device__ __forceinline__ void unpack_e2_selected(
+    uint32_t packed,
+    const unsigned long long *__restrict__ table,
+    uint32_t &first,
+    uint32_t &second) {
+    if constexpr (TABLE_FREE)
+        unpack_e2_tablefree(packed, first, second);
+    else
+        unpack_e2(packed, table, first, second);
+}
+
+#if !defined(INSIGNIA_GLM53_NO_MAIN)
 __global__ __launch_bounds__(256) void nvfp4_dp4a_tablefree_kernel(
     const uint32_t *__restrict__ weights,
     const uint8_t *__restrict__ scales,
@@ -955,7 +967,7 @@ __device__ __forceinline__ uint8_t packed_decode_tile32(
     return uint8_t(decoded);
 }
 
-template <int B, int CTA_WARPS>
+template <int B, int CTA_WARPS, bool TABLE_FREE = false>
 __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_fixed_rows_kernel(
     const uint32_t *__restrict__ weights,
     Nvfp4PackedScaleView scales,
@@ -967,13 +979,15 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_fixed_rows_k
     int words_per_row,
     float global_scale,
     Nvfp4FixedRowIds<B> out) {
-    __shared__ unsigned long long e2_table[256];
+    __shared__ unsigned long long e2_table[TABLE_FREE ? 1 : 256];
     __shared__ uint32_t scale_table[256];
     for (int code = threadIdx.x; code < 256; code += blockDim.x) {
-        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
-        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
-        e2_table[code] = static_cast<unsigned long long>(lo) |
-                         (static_cast<unsigned long long>(hi) << 32);
+        if constexpr (!TABLE_FREE) {
+            const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+            const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+            e2_table[code] = static_cast<unsigned long long>(lo) |
+                             (static_cast<unsigned long long>(hi) << 32);
+        }
         scale_table[code] = uint32_t(scales.codebook[code & 15]) |
                             (uint32_t(scales.codebook[code >> 4]) << 8) |
                             (((code & 15) == scales.escape_symbol ? 1u : 0u) << 16) |
@@ -994,8 +1008,8 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_fixed_rows_k
             scales, scale_table, row, groups, uint32_t(tile), cursor);
         const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
         uint32_t w0, w1, w2, w3;
-        unpack_e2(packed.x, e2_table, w0, w1);
-        unpack_e2(packed.y, e2_table, w2, w3);
+        unpack_e2_selected<TABLE_FREE>(packed.x, e2_table, w0, w1);
+        unpack_e2_selected<TABLE_FREE>(packed.y, e2_table, w2, w3);
         const float base_scale = 0.5f * c_e4m3[scale_byte] * global_scale;
 #pragma unroll
         for (int r = 0; r < B; ++r) {
@@ -1016,7 +1030,7 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_fixed_rows_k
     }
 }
 
-template <int B, int CTA_WARPS>
+template <int B, int CTA_WARPS, bool TABLE_FREE = false>
 __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_pair_fixed_rows_kernel(
     const uint32_t *__restrict__ weights_a,
     Nvfp4PackedScaleView scale_a,
@@ -1032,14 +1046,16 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_pair_fixed_r
     float global_a,
     float global_b,
     Nvfp4FixedRowIds<B> out) {
-    __shared__ unsigned long long e2_table[256];
+    __shared__ unsigned long long e2_table[TABLE_FREE ? 1 : 256];
     __shared__ uint32_t table_a[256];
     __shared__ uint32_t table_b[256];
     for (int code = threadIdx.x; code < 256; code += blockDim.x) {
-        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
-        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
-        e2_table[code] = static_cast<unsigned long long>(lo) |
-                         (static_cast<unsigned long long>(hi) << 32);
+        if constexpr (!TABLE_FREE) {
+            const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+            const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+            e2_table[code] = static_cast<unsigned long long>(lo) |
+                             (static_cast<unsigned long long>(hi) << 32);
+        }
         table_a[code] = uint32_t(scale_a.codebook[code & 15]) |
                         (uint32_t(scale_a.codebook[code >> 4]) << 8) |
                         (((code & 15) == scale_a.escape_symbol ? 1u : 0u) << 16) |
@@ -1069,10 +1085,10 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_pair_fixed_r
         const uint2 packed_a = __ldcs(reinterpret_cast<const uint2 *>(row_a + group * 2));
         const uint2 packed_b = __ldcs(reinterpret_cast<const uint2 *>(row_b + group * 2));
         uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
-        unpack_e2(packed_a.x, e2_table, a0, a1);
-        unpack_e2(packed_a.y, e2_table, a2, a3);
-        unpack_e2(packed_b.x, e2_table, b0, b1);
-        unpack_e2(packed_b.y, e2_table, b2, b3);
+        unpack_e2_selected<TABLE_FREE>(packed_a.x, e2_table, a0, a1);
+        unpack_e2_selected<TABLE_FREE>(packed_a.y, e2_table, a2, a3);
+        unpack_e2_selected<TABLE_FREE>(packed_b.x, e2_table, b0, b1);
+        unpack_e2_selected<TABLE_FREE>(packed_b.y, e2_table, b2, b3);
 #pragma unroll
         for (int r = 0; r < B; ++r) {
             const uint32_t *xg = xq + static_cast<size_t>(r) * words_per_row + group * 4;
@@ -1105,7 +1121,7 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_pair_fixed_r
     }
 }
 
-template <int B, int CTA_WARPS>
+template <int B, int CTA_WARPS, bool TABLE_FREE = false>
 __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_acc_fixed_rows_kernel(
     const uint32_t *__restrict__ weights,
     Nvfp4PackedScaleView scales,
@@ -1117,13 +1133,15 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_acc_fixed_ro
     int words_per_row,
     float global_scale,
     Nvfp4RowOut out) {
-    __shared__ unsigned long long e2_table[256];
+    __shared__ unsigned long long e2_table[TABLE_FREE ? 1 : 256];
     __shared__ uint32_t scale_table[256];
     for (int code = threadIdx.x; code < 256; code += blockDim.x) {
-        const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
-        const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
-        e2_table[code] = static_cast<unsigned long long>(lo) |
-                         (static_cast<unsigned long long>(hi) << 32);
+        if constexpr (!TABLE_FREE) {
+            const uint32_t lo = uint32_t(uint8_t(c_e2i[code & 15])) * 0x01010101u;
+            const uint32_t hi = uint32_t(uint8_t(c_e2i[code >> 4])) * 0x01010101u;
+            e2_table[code] = static_cast<unsigned long long>(lo) |
+                             (static_cast<unsigned long long>(hi) << 32);
+        }
         scale_table[code] = uint32_t(scales.codebook[code & 15]) |
                             (uint32_t(scales.codebook[code >> 4]) << 8) |
                             (((code & 15) == scales.escape_symbol ? 1u : 0u) << 16) |
@@ -1144,8 +1162,8 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_acc_fixed_ro
             scales, scale_table, row, groups, uint32_t(tile), cursor);
         const uint2 packed = __ldcs(reinterpret_cast<const uint2 *>(row_weights + group * 2));
         uint32_t w0, w1, w2, w3;
-        unpack_e2(packed.x, e2_table, w0, w1);
-        unpack_e2(packed.y, e2_table, w2, w3);
+        unpack_e2_selected<TABLE_FREE>(packed.x, e2_table, w0, w1);
+        unpack_e2_selected<TABLE_FREE>(packed.y, e2_table, w2, w3);
         const float base_scale = 0.5f * c_e4m3[scale_byte] * global_scale;
 #pragma unroll
         for (int r = 0; r < B; ++r) {
@@ -1169,7 +1187,7 @@ __global__ __launch_bounds__(CTA_WARPS * 32) void nvfp4_dp4a_packed_acc_fixed_ro
     }
 }
 
-template <int B, int CTA_WARPS>
+template <int B, int CTA_WARPS, bool TABLE_FREE = false>
 cudaError_t launch_nvfp4_packed_fixed_rows(
     const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
     const void *workspace, float *y, const int *ids,
@@ -1180,14 +1198,14 @@ cudaError_t launch_nvfp4_packed_fixed_rows(
     const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
     const auto *xscale = reinterpret_cast<const float *>(
         reinterpret_cast<const uint8_t *>(workspace) + B * aligned);
-    nvfp4_dp4a_packed_fixed_rows_kernel<B, CTA_WARPS>
+    nvfp4_dp4a_packed_fixed_rows_kernel<B, CTA_WARPS, TABLE_FREE>
         <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
             reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale, y,
             rows, cols / 16, int(aligned / 4), global_scale, out);
     return cudaPeekAtLastError();
 }
 
-template <int B, int CTA_WARPS>
+template <int B, int CTA_WARPS, bool TABLE_FREE = false>
 cudaError_t launch_nvfp4_packed_pair_fixed_rows(
     const uint8_t *weights_a, Nvfp4PackedScaleView scale_a, float global_a,
     const uint8_t *weights_b, Nvfp4PackedScaleView scale_b, float global_b,
@@ -1199,7 +1217,7 @@ cudaError_t launch_nvfp4_packed_pair_fixed_rows(
     const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
     const auto *xscale = reinterpret_cast<const float *>(
         reinterpret_cast<const uint8_t *>(workspace) + B * aligned);
-    nvfp4_dp4a_packed_pair_fixed_rows_kernel<B, CTA_WARPS>
+    nvfp4_dp4a_packed_pair_fixed_rows_kernel<B, CTA_WARPS, TABLE_FREE>
         <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
             reinterpret_cast<const uint32_t *>(weights_a), scale_a,
             reinterpret_cast<const uint32_t *>(weights_b), scale_b,
@@ -1208,7 +1226,7 @@ cudaError_t launch_nvfp4_packed_pair_fixed_rows(
     return cudaPeekAtLastError();
 }
 
-template <int B, int CTA_WARPS>
+template <int B, int CTA_WARPS, bool TABLE_FREE = false>
 cudaError_t launch_nvfp4_packed_acc_fixed_rows(
     const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
     const void *workspace, float *y, const int *ids, const float *combine,
@@ -1223,7 +1241,7 @@ cudaError_t launch_nvfp4_packed_acc_fixed_rows(
     const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
     const auto *xscale = reinterpret_cast<const float *>(
         reinterpret_cast<const uint8_t *>(workspace) + B * aligned);
-    nvfp4_dp4a_packed_acc_fixed_rows_kernel<B, CTA_WARPS>
+    nvfp4_dp4a_packed_acc_fixed_rows_kernel<B, CTA_WARPS, TABLE_FREE>
         <<<(rows + CTA_WARPS - 1) / CTA_WARPS, CTA_WARPS * 32, 0, stream>>>(
             reinterpret_cast<const uint32_t *>(weights), scales, xq, xscale, y,
             rows, cols / 16, int(aligned / 4), global_scale, out);
@@ -1233,14 +1251,21 @@ cudaError_t launch_nvfp4_packed_acc_fixed_rows(
 cudaError_t launch_nvfp4_packed_fixed_rows_runtime(
     const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
     const void *workspace, float *y, const int *ids, int count,
-    int rows, int cols, int cta_warps, cudaStream_t stream = nullptr) {
+    int rows, int cols, int cta_warps, cudaStream_t stream = nullptr,
+    bool table_free = false) {
 #define INSIGNIA_PACKED_STORE_CASE(B)                                                \
     case B:                                                                          \
-        return cta_warps == 4                                                        \
-            ? launch_nvfp4_packed_fixed_rows<B, 4>(                                  \
-                  weights, scales, global_scale, workspace, y, ids, rows, cols, stream) \
-            : launch_nvfp4_packed_fixed_rows<B, 8>(                                  \
-                  weights, scales, global_scale, workspace, y, ids, rows, cols, stream)
+        return table_free                                                            \
+            ? (cta_warps == 4                                                       \
+                ? launch_nvfp4_packed_fixed_rows<B, 4, true>(                       \
+                      weights, scales, global_scale, workspace, y, ids, rows, cols, stream) \
+                : launch_nvfp4_packed_fixed_rows<B, 8, true>(                       \
+                      weights, scales, global_scale, workspace, y, ids, rows, cols, stream)) \
+            : (cta_warps == 4                                                       \
+                ? launch_nvfp4_packed_fixed_rows<B, 4, false>(                      \
+                      weights, scales, global_scale, workspace, y, ids, rows, cols, stream) \
+                : launch_nvfp4_packed_fixed_rows<B, 8, false>(                      \
+                      weights, scales, global_scale, workspace, y, ids, rows, cols, stream))
     if (cta_warps != 4 && cta_warps != 8) return cudaErrorInvalidValue;
     switch (count) {
         INSIGNIA_PACKED_STORE_CASE(1);
@@ -1260,16 +1285,25 @@ cudaError_t launch_nvfp4_packed_pair_fixed_rows_runtime(
     const uint8_t *weights_a, Nvfp4PackedScaleView scale_a, float global_a,
     const uint8_t *weights_b, Nvfp4PackedScaleView scale_b, float global_b,
     const void *workspace, float *y_a, float *y_b, const int *ids, int count,
-    int rows, int cols, int cta_warps, cudaStream_t stream = nullptr) {
+    int rows, int cols, int cta_warps, cudaStream_t stream = nullptr,
+    bool table_free = false) {
 #define INSIGNIA_PACKED_PAIR_CASE(B)                                                \
     case B:                                                                         \
-        return cta_warps == 4                                                       \
-            ? launch_nvfp4_packed_pair_fixed_rows<B, 4>(                            \
-                  weights_a, scale_a, global_a, weights_b, scale_b, global_b,       \
-                  workspace, y_a, y_b, ids, rows, cols, stream)                     \
-            : launch_nvfp4_packed_pair_fixed_rows<B, 8>(                            \
-                  weights_a, scale_a, global_a, weights_b, scale_b, global_b,       \
-                  workspace, y_a, y_b, ids, rows, cols, stream)
+        return table_free                                                           \
+            ? (cta_warps == 4                                                      \
+                ? launch_nvfp4_packed_pair_fixed_rows<B, 4, true>(                 \
+                      weights_a, scale_a, global_a, weights_b, scale_b, global_b,   \
+                      workspace, y_a, y_b, ids, rows, cols, stream)                 \
+                : launch_nvfp4_packed_pair_fixed_rows<B, 8, true>(                 \
+                      weights_a, scale_a, global_a, weights_b, scale_b, global_b,   \
+                      workspace, y_a, y_b, ids, rows, cols, stream))                \
+            : (cta_warps == 4                                                      \
+                ? launch_nvfp4_packed_pair_fixed_rows<B, 4, false>(                \
+                      weights_a, scale_a, global_a, weights_b, scale_b, global_b,   \
+                      workspace, y_a, y_b, ids, rows, cols, stream)                 \
+                : launch_nvfp4_packed_pair_fixed_rows<B, 8, false>(                \
+                      weights_a, scale_a, global_a, weights_b, scale_b, global_b,   \
+                      workspace, y_a, y_b, ids, rows, cols, stream))
     if (cta_warps != 4 && cta_warps != 8) return cudaErrorInvalidValue;
     switch (count) {
         INSIGNIA_PACKED_PAIR_CASE(1);
@@ -1288,16 +1322,25 @@ cudaError_t launch_nvfp4_packed_pair_fixed_rows_runtime(
 cudaError_t launch_nvfp4_packed_acc_fixed_rows_runtime(
     const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
     const void *workspace, float *y, const int *ids, const float *combine,
-    int count, int rows, int cols, int cta_warps, cudaStream_t stream = nullptr) {
+    int count, int rows, int cols, int cta_warps, cudaStream_t stream = nullptr,
+    bool table_free = false) {
 #define INSIGNIA_PACKED_ACC_CASE(B)                                                 \
     case B:                                                                         \
-        return cta_warps == 4                                                       \
-            ? launch_nvfp4_packed_acc_fixed_rows<B, 4>(                             \
-                  weights, scales, global_scale, workspace, y, ids, combine,        \
-                  rows, cols, stream)                                               \
-            : launch_nvfp4_packed_acc_fixed_rows<B, 8>(                             \
-                  weights, scales, global_scale, workspace, y, ids, combine,        \
-                  rows, cols, stream)
+        return table_free                                                           \
+            ? (cta_warps == 4                                                      \
+                ? launch_nvfp4_packed_acc_fixed_rows<B, 4, true>(                  \
+                      weights, scales, global_scale, workspace, y, ids, combine,   \
+                      rows, cols, stream)                                          \
+                : launch_nvfp4_packed_acc_fixed_rows<B, 8, true>(                  \
+                      weights, scales, global_scale, workspace, y, ids, combine,   \
+                      rows, cols, stream))                                         \
+            : (cta_warps == 4                                                      \
+                ? launch_nvfp4_packed_acc_fixed_rows<B, 4, false>(                 \
+                      weights, scales, global_scale, workspace, y, ids, combine,   \
+                      rows, cols, stream)                                          \
+                : launch_nvfp4_packed_acc_fixed_rows<B, 8, false>(                 \
+                      weights, scales, global_scale, workspace, y, ids, combine,   \
+                      rows, cols, stream))
     if (cta_warps != 4 && cta_warps != 8) return cudaErrorInvalidValue;
     switch (count) {
         INSIGNIA_PACKED_ACC_CASE(1);
@@ -3822,16 +3865,25 @@ int main(int argc, char **argv) {
     std::array<float, 8> multiplicity_pair_8w_ms{};
     std::array<float, 8> packed_store_4w_ms{};
     std::array<float, 8> packed_store_8w_ms{};
+    std::array<float, 8> packed_store_tablefree_4w_ms{};
+    std::array<float, 8> packed_store_tablefree_8w_ms{};
     std::array<float, 8> packed_pair_4w_ms{};
     std::array<float, 8> packed_pair_8w_ms{};
+    std::array<float, 8> packed_pair_tablefree_4w_ms{};
+    std::array<float, 8> packed_pair_tablefree_8w_ms{};
     std::array<float, 8> packed_acc_base_ms{};
     std::array<float, 8> packed_acc_4w_ms{};
     std::array<float, 8> packed_acc_8w_ms{};
+    std::array<float, 8> packed_acc_tablefree_4w_ms{};
+    std::array<float, 8> packed_acc_tablefree_8w_ms{};
     std::array<bool, 8> multiplicity_store_exact{};
     std::array<bool, 8> multiplicity_pair_exact{};
     std::array<bool, 8> packed_store_exact{};
     std::array<bool, 8> packed_pair_exact{};
     std::array<bool, 8> packed_acc_exact{};
+    std::array<bool, 8> packed_store_tablefree_exact{};
+    std::array<bool, 8> packed_pair_tablefree_exact{};
+    std::array<bool, 8> packed_acc_tablefree_exact{};
     constexpr std::array<float, 8> packed_combine{
         0.03125f, -0.0625f, 0.09375f, -0.125f,
         0.15625f, -0.1875f, 0.21875f, -0.25f};
@@ -3869,6 +3921,23 @@ int main(int argc, char **argv) {
             std::memcmp(baseline_store.data(), packed_store_4.data(),
                         baseline_store.size() * sizeof(float)) == 0 &&
             std::memcmp(baseline_store.data(), packed_store_8.data(),
+                        baseline_store.size() * sizeof(float)) == 0;
+        cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                       header.rows, header.cols, 4, nullptr, true),
+                   "packed table-free store 4w");
+        std::vector<float> packed_store_tablefree_4 = fetch_rows(d_rows_dp, count);
+        cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                       header.rows, header.cols, 8, nullptr, true),
+                   "packed table-free store 8w");
+        std::vector<float> packed_store_tablefree_8 = fetch_rows(d_rows_dp, count);
+        packed_store_tablefree_exact[size_t(count - 1)] =
+            std::memcmp(baseline_store.data(), packed_store_tablefree_4.data(),
+                        baseline_store.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_store.data(), packed_store_tablefree_8.data(),
                         baseline_store.size() * sizeof(float)) == 0;
 
         cuda_check(insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
@@ -3917,6 +3986,33 @@ int main(int argc, char **argv) {
                         baseline_pair_a.size() * sizeof(float)) == 0 &&
             std::memcmp(baseline_pair_b.data(), packed_pair_8b.data(),
                         baseline_pair_b.size() * sizeof(float)) == 0;
+        cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                       ids_0_7.data(), count, header.rows, header.cols, 4,
+                       nullptr, true),
+                   "packed table-free pair 4w");
+        std::vector<float> packed_pair_tablefree_4a = fetch_rows(d_rows_dp, count);
+        std::vector<float> packed_pair_tablefree_4b = fetch_rows(d_rows_reference, count);
+        cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                       ids_0_7.data(), count, header.rows, header.cols, 8,
+                       nullptr, true),
+                   "packed table-free pair 8w");
+        std::vector<float> packed_pair_tablefree_8a = fetch_rows(d_rows_dp, count);
+        std::vector<float> packed_pair_tablefree_8b = fetch_rows(d_rows_reference, count);
+        packed_pair_tablefree_exact[size_t(count - 1)] =
+            std::memcmp(baseline_pair_a.data(), packed_pair_tablefree_4a.data(),
+                        baseline_pair_a.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_b.data(), packed_pair_tablefree_4b.data(),
+                        baseline_pair_b.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_a.data(), packed_pair_tablefree_8a.data(),
+                        baseline_pair_a.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_pair_b.data(), packed_pair_tablefree_8b.data(),
+                        baseline_pair_b.size() * sizeof(float)) == 0;
 
         cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
                    "clear packed accumulate baseline");
@@ -3946,6 +4042,29 @@ int main(int argc, char **argv) {
             std::memcmp(baseline_acc.data(), packed_acc_4.data(),
                         baseline_acc.size() * sizeof(float)) == 0 &&
             std::memcmp(baseline_acc.data(), packed_acc_8.data(),
+                        baseline_acc.size() * sizeof(float)) == 0;
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear packed table-free accumulate 4w");
+        cuda_check(launch_nvfp4_packed_acc_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, ids_0_7.data(),
+                       packed_combine.data(), count, header.rows, header.cols, 4,
+                       nullptr, true),
+                   "packed table-free accumulate 4w");
+        std::vector<float> packed_acc_tablefree_4 = fetch_rows(d_rows_dp, count);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear packed table-free accumulate 8w");
+        cuda_check(launch_nvfp4_packed_acc_fixed_rows_runtime(
+                       d_nvw, packed_scale_view, header.global_scale,
+                       d_rows_dp_workspace, d_rows_dp, ids_0_7.data(),
+                       packed_combine.data(), count, header.rows, header.cols, 8,
+                       nullptr, true),
+                   "packed table-free accumulate 8w");
+        std::vector<float> packed_acc_tablefree_8 = fetch_rows(d_rows_dp, count);
+        packed_acc_tablefree_exact[size_t(count - 1)] =
+            std::memcmp(baseline_acc.data(), packed_acc_tablefree_4.data(),
+                        baseline_acc.size() * sizeof(float)) == 0 &&
+            std::memcmp(baseline_acc.data(), packed_acc_tablefree_8.data(),
                         baseline_acc.size() * sizeof(float)) == 0;
 
         constexpr int multiplicity_iterations = 500;
@@ -4005,6 +4124,20 @@ int main(int argc, char **argv) {
                            header.rows, header.cols, 8),
                        "timed packed direct store 8w");
         }, multiplicity_iterations);
+        packed_store_tablefree_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                           header.rows, header.cols, 4, nullptr, true),
+                       "timed packed table-free store 4w");
+        }, multiplicity_iterations);
+        packed_store_tablefree_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, ids_0_7.data(), count,
+                           header.rows, header.cols, 8, nullptr, true),
+                       "timed packed table-free store 8w");
+        }, multiplicity_iterations);
         packed_pair_4w_ms[size_t(count - 1)] = benchmark([&] {
             cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
                            d_nvw, packed_scale_view, header.global_scale,
@@ -4020,6 +4153,24 @@ int main(int argc, char **argv) {
                            d_rows_dp_workspace, d_rows_dp, d_rows_reference,
                            ids_0_7.data(), count, header.rows, header.cols, 8),
                        "timed packed direct pair 8w");
+        }, multiplicity_iterations);
+        packed_pair_tablefree_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), count, header.rows, header.cols, 4,
+                           nullptr, true),
+                       "timed packed table-free pair 4w");
+        }, multiplicity_iterations);
+        packed_pair_tablefree_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_pair_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, d_rows_reference,
+                           ids_0_7.data(), count, header.rows, header.cols, 8,
+                           nullptr, true),
+                       "timed packed table-free pair 8w");
         }, multiplicity_iterations);
         packed_acc_base_ms[size_t(count - 1)] = benchmark([&] {
             cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
@@ -4041,6 +4192,22 @@ int main(int argc, char **argv) {
                            d_rows_dp_workspace, count, d_rows_dp, ids_0_7.data(),
                            packed_combine.data(), header.rows, header.cols, 8),
                        "timed packed accumulate 8w");
+        }, multiplicity_iterations);
+        packed_acc_tablefree_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_acc_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, ids_0_7.data(),
+                           packed_combine.data(), count, header.rows, header.cols, 4,
+                           nullptr, true),
+                       "timed packed table-free accumulate 4w");
+        }, multiplicity_iterations);
+        packed_acc_tablefree_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(launch_nvfp4_packed_acc_fixed_rows_runtime(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_rows_dp_workspace, d_rows_dp, ids_0_7.data(),
+                           packed_combine.data(), count, header.rows, header.cols, 8,
+                           nullptr, true),
+                       "timed packed table-free accumulate 8w");
         }, multiplicity_iterations);
     }
 
@@ -4331,6 +4498,19 @@ int main(int argc, char **argv) {
                     1000.0f * packed_acc_4w_ms[i],
                     1000.0f * packed_acc_8w_ms[i],
                     packed_acc_exact[i] ? "YES" : "NO");
+        std::printf("  R=%d packed_tablefree_store_us 4w=%.3f 8w=%.3f exact=%s "
+                    "packed_tablefree_pair_us 4w=%.3f 8w=%.3f exact=%s "
+                    "packed_tablefree_acc_us 4w=%.3f 8w=%.3f exact=%s\n",
+                    count,
+                    1000.0f * packed_store_tablefree_4w_ms[i],
+                    1000.0f * packed_store_tablefree_8w_ms[i],
+                    packed_store_tablefree_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_pair_tablefree_4w_ms[i],
+                    1000.0f * packed_pair_tablefree_8w_ms[i],
+                    packed_pair_tablefree_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_acc_tablefree_4w_ms[i],
+                    1000.0f * packed_acc_tablefree_8w_ms[i],
+                    packed_acc_tablefree_exact[i] ? "YES" : "NO");
     }
     std::puts("down-projection NVFP4 A/B (4096x2048, GEMV-only medians):");
     for (int count = 1; count <= dp_rows; ++count) {
@@ -4362,6 +4542,9 @@ int main(int argc, char **argv) {
         all_exact(sweep_imma_exact) && all_exact(multiplicity_store_exact) &&
         all_exact(multiplicity_pair_exact) && all_exact(packed_store_exact) &&
         all_exact(packed_pair_exact) && all_exact(packed_acc_exact) &&
+        all_exact(packed_store_tablefree_exact) &&
+        all_exact(packed_pair_tablefree_exact) &&
+        all_exact(packed_acc_tablefree_exact) &&
         all_exact(down_store_exact) &&
         all_exact(packed_down_store_exact) && all_exact(packed_down_acc_exact);
 

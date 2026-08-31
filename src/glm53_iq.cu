@@ -371,8 +371,8 @@ __global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
     int rows,
     int cols) {
     using namespace nvcuda;
-    __shared__ __align__(128) __half shared_a[16 * 16];
-    __shared__ __align__(128) __half shared_b[2][16 * 16];
+    __shared__ __align__(128) __half shared_a[16 * 32];
+    __shared__ __align__(128) __half shared_b[2][16 * 32];
     const int thread = threadIdx.x;
     const int warp = thread >> 5;
     const int row_start = blockIdx.x * 16;
@@ -381,54 +381,59 @@ __global__ __launch_bounds__(64, 8) void iq3_xxs_wmma32_kernel(
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
     wmma::fill_fragment(accumulator, 0.0f);
 
-    for (int k0 = 0; k0 < cols; k0 += 16) {
-        // 64 threads each decode one four-value IQ3 codeword.  Four codewords
-        // cover the 16-wide K tile for one output row.
-        const int local_row = thread >> 2;
-        const int local_code = thread & 3;
+    for (int k0 = 0; k0 < cols; k0 += 32) {
+        // Decode the whole 32-value scale/sign group once.  Each thread owns
+        // the same codeword in two output rows, covering 16x32 with 64 lanes.
         const int block_id = k0 >> 8;
         const int subgroup = (k0 >> 5) & 7;
-        const int half_group = (k0 >> 4) & 1;
-        const auto &block = reinterpret_cast<const IQ3XXSBlock *>(
-            weights + static_cast<size_t>(row_start + local_row) * row_bytes)[block_id];
-        const uint32_t auxiliary = load_u32_any(block.qs + 64 + 4 * subgroup);
-        const int pair = 2 * half_group + (local_code >> 1);
-        const int side = local_code & 1;
-        const uint32_t code = block.qs[8 * subgroup + 2 * pair + side];
-        const uint32_t sign8 =
-            unpack_iq_sign8((auxiliary >> (7 * pair)) & 127u);
-        const uint32_t signs = sign8 * 0x01010101u;
-        const uint32_t decoded = apply_iq3_signs(
-            __ldg(kIQ3GridDevice + code), signs,
-            side ? 0x80402010u : 0x08040201u);
-        const float scale = __half2float(block.d) *
-                            (0.25f + 0.5f * float(auxiliary >> 28));
 #pragma unroll
-        for (int byte = 0; byte < 4; ++byte) {
-            const int8_t value = int8_t(decoded >> (8 * byte));
-            shared_a[local_row * 16 + 4 * local_code + byte] =
-                __float2half_rn(float(value) * scale);
+        for (int slot = thread; slot < 16 * 8; slot += 64) {
+            const int local_row = slot >> 3;
+            const int local_code = slot & 7;
+            const auto &block = reinterpret_cast<const IQ3XXSBlock *>(
+                weights + static_cast<size_t>(row_start + local_row) * row_bytes)[block_id];
+            const uint32_t auxiliary =
+                load_u32_any(block.qs + 64 + 4 * subgroup);
+            const int pair = local_code >> 1;
+            const int side = local_code & 1;
+            const uint32_t code = block.qs[8 * subgroup + 2 * pair + side];
+            const uint32_t sign8 =
+                unpack_iq_sign8((auxiliary >> (7 * pair)) & 127u);
+            const uint32_t signs = sign8 * 0x01010101u;
+            const uint32_t decoded = apply_iq3_signs(
+                __ldg(kIQ3GridDevice + code), signs,
+                side ? 0x80402010u : 0x08040201u);
+            const float scale = __half2float(block.d) *
+                                (0.25f + 0.5f * float(auxiliary >> 28));
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) {
+                const int8_t value = int8_t(decoded >> (8 * byte));
+                shared_a[local_row * 32 + 4 * local_code + byte] =
+                    __float2half_rn(float(value) * scale);
+            }
         }
 
         // The input tile is stored exactly in the col-major layout expected by
         // matrix_b: [K, token].  Each thread converts eight FP32 activations.
 #pragma unroll
-        for (int item = thread; item < 32 * 16; item += 64) {
-            const int local_token = item >> 4;
-            const int local_k = item & 15;
-            shared_b[local_token >> 4][local_k + (local_token & 15) * 16] =
+        for (int item = thread; item < 32 * 32; item += 64) {
+            const int local_token = item >> 5;
+            const int local_k = item & 31;
+            shared_b[local_token >> 4][local_k + (local_token & 15) * 32] =
                 __float2half_rn(x[static_cast<size_t>(token_start + local_token) * cols +
                                    k0 + local_k]);
         }
         __syncthreads();
-
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                       wmma::row_major> a_fragment;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                       wmma::col_major> b_fragment;
-        wmma::load_matrix_sync(a_fragment, shared_a, 16);
-        wmma::load_matrix_sync(b_fragment, shared_b[warp], 16);
-        wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                           wmma::row_major> a_fragment;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                           wmma::col_major> b_fragment;
+            wmma::load_matrix_sync(a_fragment, shared_a + 16 * half, 32);
+            wmma::load_matrix_sync(b_fragment, shared_b[warp] + 16 * half, 32);
+            wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+        }
         __syncthreads();
     }
     wmma::store_matrix_sync(
@@ -444,8 +449,8 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
     int rows,
     int cols) {
     using namespace nvcuda;
-    __shared__ __align__(128) __half shared_a[16 * 16];
-    __shared__ __align__(128) __half shared_b[2][16 * 16];
+    __shared__ __align__(128) __half shared_a[16 * 32];
+    __shared__ __align__(128) __half shared_b[2][16 * 32];
     const int thread = threadIdx.x;
     const int warp = thread >> 5;
     const int row_start = blockIdx.x * 16;
@@ -453,12 +458,11 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
     wmma::fill_fragment(accumulator, 0.0f);
 
-    for (int k0 = 0; k0 < cols; k0 += 16) {
+    for (int k0 = 0; k0 < cols; k0 += 32) {
         const int local_row = thread >> 2;
         const int local_word = thread & 3;
         const int block_id = k0 >> 8;
         const int subgroup = (k0 >> 5) & 7;
-        const int half_group = (k0 >> 4) & 1;
         const IQ4XSBlock &block =
             weights[static_cast<size_t>(row_start + local_row) * BLOCKS + block_id];
         const int low =
@@ -469,29 +473,34 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
         const int2 decoded8 = iq4_lookup8(__ldcs(
             reinterpret_cast<const uint32_t *>(block.qs + 16 * subgroup) +
             local_word));
-        const uint32_t decoded = uint32_t(half_group ? decoded8.y : decoded8.x);
 #pragma unroll
         for (int byte = 0; byte < 4; ++byte) {
-            const int8_t value = int8_t(decoded >> (8 * byte));
-            shared_a[local_row * 16 + 4 * local_word + byte] =
-                __float2half_rn(float(value) * scale);
+            const int8_t low_value = int8_t(uint32_t(decoded8.x) >> (8 * byte));
+            const int8_t high_value = int8_t(uint32_t(decoded8.y) >> (8 * byte));
+            shared_a[local_row * 32 + 4 * local_word + byte] =
+                __float2half_rn(float(low_value) * scale);
+            shared_a[local_row * 32 + 16 + 4 * local_word + byte] =
+                __float2half_rn(float(high_value) * scale);
         }
 #pragma unroll
-        for (int item = thread; item < 32 * 16; item += 64) {
-            const int local_token = item >> 4;
-            const int local_k = item & 15;
-            shared_b[local_token >> 4][local_k + (local_token & 15) * 16] =
+        for (int item = thread; item < 32 * 32; item += 64) {
+            const int local_token = item >> 5;
+            const int local_k = item & 31;
+            shared_b[local_token >> 4][local_k + (local_token & 15) * 32] =
                 __float2half_rn(x[static_cast<size_t>(token_start + local_token) * cols +
                                    k0 + local_k]);
         }
         __syncthreads();
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                       wmma::row_major> a_fragment;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                       wmma::col_major> b_fragment;
-        wmma::load_matrix_sync(a_fragment, shared_a, 16);
-        wmma::load_matrix_sync(b_fragment, shared_b[warp], 16);
-        wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                           wmma::row_major> a_fragment;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                           wmma::col_major> b_fragment;
+            wmma::load_matrix_sync(a_fragment, shared_a + 16 * half, 32);
+            wmma::load_matrix_sync(b_fragment, shared_b[warp] + 16 * half, 32);
+            wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+        }
         __syncthreads();
     }
     wmma::store_matrix_sync(

@@ -1,5 +1,78 @@
 # progress
 
+### 2026-08-31 - 4070 Ti SUPER resume, certificate wave, and Q3_K_XL staging
+
+`glm53-dflash2-4070ti-super` was fast-forwarded from `eb83212` to the complete
+4070 SUPER work at `3889c8b`, pushed, and pulled into the authoritative glm-box
+checkout at `C:\\coding\\Insignia-glm53-dflash2`.  The local C:+E: overlay stays
+fail-closed and disabled on the box's single SSD.  The CUDA generator rebuilt
+successfully on the i7-14700KF with the Raptor Lake host flags.
+
+Focused 4070 Ti SUPER validation passes.  FA2 MLA prefill is 47.030 us versus
+496.675 us scalar at 16 rows (10.56x, bit-exact); FP8 tensor-core dense GEMV is
+75.555 us versus 136.369 us BF16 (1.80x); KDA decode is 6.847 us; and the exact
+GPU full-vocabulary logit-metric suite passes.  The exact-prefix splice test's
+first parallel launch failed only its noisy dispatch-performance conjunct when
+the 1024x8 repeated arm was descheduled to 5.95 ms.  Every numerical gate
+passed, an isolated rerun restored 2.33 ms, and three further isolated runs all
+passed.  This was self-induced benchmark contention, not an MLA regression or
+an external contender.  A first expert microbenchmark measured table-free
+NVFP4 at 7.551 us / 624.9 GB/s and fused pair execution at 14.819 us /
+636.8 GB/s, but no dispatch policy is promoted from a single campaign run.
+
+The public `UD-Q3_K_XL` four-shard GGUF download is persistent under a Windows
+Scheduled Task and writes only to `/var/lib/insignia/glm53-q3-k-xl`.  The exact
+HF include is `UD-Q3_K_XL/*` (about 147.2 GB total).  At the latest checkpoint
+31 GiB had landed and the WSL volume still had 404 GiB free.
+
+The incoming Ada dispatch, DFlash capture, KDA shadowing, anytime WSL A/B,
+teacher-forcing/free-run, causal residual, joint adaptive compute, and anytime
+selective-falsifier artifacts were treated as evidence rather than commands.
+Their deterministic CPU suites pass 128/128; the existing logit and MathArena
+tests add 18/18.  The joint controller and selective falsifier are retained as
+offline research tools only: all transition, cost, and risk parameters are
+synthetic, so production activation requires real causal GLM traces, overlap,
+fresh randomized audits, and a fingerprinted fail-closed policy.  The useful
+immediate result is the telemetry/action schema and a proof that expert count,
+draft width, verification, precision, and prefetch generally require joint
+control rather than independent thresholds.
+
+The MathArena quality path now records the exact greedy margin and candidate
+pairwise slack in addition to MSE, raw/centered cosine, relative L2, KL, JS,
+Top-1, Top-10 overlap, NLL, and PPL.  Exact greedy agreement is the default
+combined gate; explicitly approximate campaigns may use
+`--allow-top1-mismatch`, while the configured 3.5% PPL ceiling still applies.
+
+### 2026-08-31 - KDA recurrent-state shadowing and reset control
+
+The KDA shadowing study is complete at `0740c63`; see
+`audits/kda-recurrent-shadowing.md`, `tools/kda_shadowing.py`, and
+`tools/test_kda_shadowing.py`.  The general product-of-operator-norms bound is
+minimax sharp, including with rank-one defects, and the simulator includes an
+alternating nonnormal sequence whose individual spectral radii are all 0.5 but
+whose carried error amplifies by more than 1700x.
+
+The actual GLM KDA map is stronger: `A=(I-beta*k*k^T)D` with normalized key,
+`beta in [0,1]`, and diagonal decay at most one.  It is Frobenius
+nonexpansive and has exact homogeneous and driven energy identities.  A safe
+online certificate needs only two FP32 scalars per head (`M_h,R_h`) plus fused
+vector/error reductions.  The deterministic CPU and SymPy suite passes 14/14,
+all observed errors stay below every applicable bound, the tight adversarial
+case attains the scalar bound, and restricted-boundary reset DP matches
+exhaustive enumeration.
+
+Block rollback is not an exact reset after an approximate state has already
+been committed.  The current one-block archive is 4.2583 MiB per row; extending
+it to 1000 rows would exceed 4.15 GiB and would still be exact only when the
+archived recurrence inputs are exact.  The decision is to allow only an
+instrumented block-local GPU experiment with a genuine exact boundary anchor and an exact
+accepted-prefix reconstruction.  KDA-only replay is insufficient when the
+approximate pass changed later recurrence inputs.  Persistent
+compressed KDA state is rejected until the engine has a measured exact-anchor
+and causal reconstruction design, fused quantization-residual accumulation,
+and a profitable multi-thousand-token certificate.  No GPU timing was claimed
+in this CPU-only study.
+
 ### 2026-08-30 (session 11) - local 4070 SUPER branch; real C:+E: expert overlay
 
 Local work now lives on `codex/glm53-dflash2-4070-super`, forked from the

@@ -1,0 +1,156 @@
+{
+  "block_bruteforce": {
+    "boundaries": [
+      0,
+      2,
+      6,
+      8,
+      10
+    ],
+    "final_exact": true,
+    "net_saving": -0.6000000000000001,
+    "resets": 4,
+    "segment_peaks": [
+      0.19,
+      0.29288000000000003,
+      0.20600000000000002,
+      0.17
+    ]
+  },
+  "block_causal_lazy": {
+    "boundaries": [
+      0,
+      2,
+      6,
+      8,
+      10
+    ],
+    "final_exact": true,
+    "net_saving": -0.6000000000000001,
+    "resets": 4,
+    "segment_peaks": [
+      0.19,
+      0.29288000000000003,
+      0.20600000000000002,
+      0.17
+    ]
+  },
+  "block_dynamic_program": {
+    "boundaries": [
+      0,
+      2,
+      6,
+      8,
+      10
+    ],
+    "final_exact": true,
+    "net_saving": -0.6000000000000001,
+    "resets": 4,
+    "segment_peaks": [
+      0.19,
+      0.29288000000000003,
+      0.20600000000000002,
+      0.17
+    ]
+  },
+  "bruteforce": {
+    "boundaries": [
+      0,
+      1,
+      4,
+      7,
+      10
+    ],
+    "final_exact": true,
+    "net_saving": -0.6000000000000001,
+    "resets": 4,
+    "segment_peaks": [
+      0.08,
+      0.2968,
+      0.2738,
+      0.246
+    ]
+  },
+  "budget": 0.32,
+  "causal_lazy": {
+    "boundaries": [
+      0,
+      3,
+      6,
+      9,
+      10
+    ],
+    "final_exact": true,
+    "net_saving": -0.6000000000000001,
+    "resets": 4,
+    "segment_peaks": [
+      0.23720000000000002,
+      0.23720199999999997,
+      0.2957,
+      0.07
+    ]
+  },
+  "dynamic_program": {
+    "boundaries": [
+      0,
+      1,
+      4,
+      7,
+      10
+    ],
+    "final_exact": true,
+    "net_saving": -0.6000000000000001,
+    "resets": 4,
+    "segment_peaks": [
+      0.08,
+      0.2968,
+      0.2738,
+      0.246
+    ]
+  },
+  "gains": [
+    0.93,
+    1.0,
+    0.88,
+    1.0,
+    0.97,
+    0.82,
+    1.0,
+    0.9,
+    0.95,
+    1.0
+  ],
+  "legal_block_boundaries": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10
+  ],
+  "local_errors": [
+    0.08,
+    0.11,
+    0.07,
+    0.13,
+    0.09,
+    0.06,
+    0.14,
+    0.08,
+    0.1,
+    0.07
+  ],
+  "reset_cost": 0.45,
+  "rollback_snapshot_demo": {
+    "accepted": 2,
+    "exact_replay_gains": [
+      0.95,
+      0.9,
+      0.85
+    ],
+    "genuine_exact_anchor_radius": 0.0,
+    "incoming_radius": 0.2,
+    "restored_radius": 0.171
+  },
+  "token_saving": 0.12
+}

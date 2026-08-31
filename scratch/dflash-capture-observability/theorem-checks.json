@@ -1,0 +1,39 @@
+{
+  "conditional_independent_min_submodularity_gap": 0.0,
+  "conditional_independent_witness": [
+    [],
+    [],
+    1
+  ],
+  "duplicate_information": {
+    "z1": 0.39015969528359973,
+    "z1_z2": 0.39015969528359973,
+    "z2": 0.39015969528359973
+  },
+  "duplicate_min_submodularity_gap": 0.0,
+  "duplicate_witness": [
+    [],
+    [],
+    1
+  ],
+  "fano_block_bits_uniform_256_error_005": 7.313885371041101,
+  "fano_prefix_bits_binary_k8_mean65": 2.187742380679957,
+  "kill_example_net_upper": -0.020000000000000004,
+  "l45_near_duplicate_information": {
+    "conditional_gain_z24_given_z23": 0.00851722323851245,
+    "z23": 1.115550863481191,
+    "z23_z24": 1.1240680867197035,
+    "z24": 1.1159958089298512
+  },
+  "synthetic_only": true,
+  "xor_gamma_q1": 0.0,
+  "xor_gamma_q2": 1.0,
+  "xor_min_submodularity_gap": -1.0,
+  "xor_witness": [
+    [],
+    [
+      1
+    ],
+    2
+  ]
+}

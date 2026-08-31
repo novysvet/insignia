@@ -163,6 +163,22 @@ def centered_metrics(
     )
 
 
+def greedy_margin_slack(
+        reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float]:
+    """Exact top-1 margin and candidate pairwise slack at that token."""
+    exact_top1 = int(np.argmax(reference))
+    candidate_top1 = int(np.argmax(candidate))
+    exact_runner_up = float(np.partition(reference, -2)[-2])
+    if candidate_top1 == exact_top1:
+        candidate_runner_up = float(np.partition(candidate, -2)[-2])
+    else:
+        candidate_runner_up = float(candidate[candidate_top1])
+    return (
+        float(reference[exact_top1]) - exact_runner_up,
+        float(candidate[exact_top1]) - candidate_runner_up,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare two GLM-5.3 logits dumps (INSIGNIA_GLM53_LOGITS_DUMP "
@@ -248,6 +264,7 @@ def main() -> int:
     centered_cos_series, centered_rel_l2_series, centered_mse_series = [], [], []
     kl_series, kl_reverse_series, js_series = [], [], []
     ovlp_series, top1_mismatches, cos_violations = [], [], []
+    exact_margin_series, candidate_slack_series = [], []
     nll_a_sum = nll_b_sum = 0.0
 
     for step, (ra, rb) in enumerate(zip(iter_records(args.a, args.vocab, steps),
@@ -267,6 +284,7 @@ def main() -> int:
         mse = float(np.mean((ra - rb) ** 2))
         centered_cos, centered_rel_l2, centered_mse = centered_metrics(ra, rb)
         kl, kl_reverse, js, lse_a, lse_b = distribution_divergences(ra, rb)
+        exact_margin, candidate_slack = greedy_margin_slack(ra, rb)
 
         nll_a = nll_b = float("nan")
         if targets is not None:
@@ -287,6 +305,8 @@ def main() -> int:
         dmax_series.append(dmax)
         dmean_series.append(dmean)
         ovlp_series.append(ovlp)
+        exact_margin_series.append(exact_margin)
+        candidate_slack_series.append(candidate_slack)
         if not agree:
             top1_mismatches.append(step)
         if cos < args.cos_threshold:
@@ -326,6 +346,10 @@ def main() -> int:
     print(f"top-1  agreement {agree_pct:.2f}% "
           f"({steps - len(top1_mismatches)}/{steps}; mismatches at steps "
           f"{top1_mismatches if top1_mismatches else 'none'})")
+    print(f"greedy exact-margin min {min(exact_margin_series):.6e}  "
+          f"mean {statistics.fmean(exact_margin_series):.6e}")
+    print(f"greedy candidate-slack min {min(candidate_slack_series):.6e}  "
+          f"mean {statistics.fmean(candidate_slack_series):.6e}")
     print(f"cos    steps below {args.cos_threshold}: "
           f"{cos_violations if cos_violations else 'none'}")
     ppl_ratio = None

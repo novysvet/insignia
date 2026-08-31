@@ -1,0 +1,68 @@
+{
+  "availability_timestamps_ns": [
+    "token_start",
+    "prior_logits_available",
+    "hidden_summary_available",
+    "route_selected",
+    "read_issued",
+    "host_read_complete",
+    "h2d_complete",
+    "predictor_start",
+    "predictor_complete",
+    "correction_start",
+    "correction_complete",
+    "layer_complete",
+    "token_commit"
+  ],
+  "causal_context": [
+    "prior_routes",
+    "prior_logit_dump_join_key",
+    "prior_top_ids_values",
+    "prior_logit_margin_entropy",
+    "expert_input_dump_join_key",
+    "fixed_seed_hidden_summary",
+    "cache_tier_slot_recency",
+    "inflight_and_queue_state"
+  ],
+  "cost": [
+    "resident_predictor_bytes_by_tier",
+    "ssd_requested_completed_padded_useful_bytes",
+    "h2d_bytes",
+    "cpu_decode_ops_and_ns",
+    "gpu_predictor_residual_duplicate_ops_and_ns",
+    "synchronization_count_and_ns",
+    "deadline_ns",
+    "deadline_slack_ns",
+    "prediction_miss_rescue_crc_cache_displacement_flags"
+  ],
+  "exact_targets": [
+    "gate_preactivation_dump_join_key",
+    "up_preactivation_dump_join_key",
+    "swiglu_activation_dump_join_key",
+    "down_output_dump_join_key",
+    "weighted_expert_contribution_dump_join_key",
+    "predictor_output_dump_join_key",
+    "canonical_chunk_contribution_dump_join_keys",
+    "layer_output_f32_hash",
+    "target_logits_dump_join_key",
+    "selected_token",
+    "next_recurrent_state_hash"
+  ],
+  "identity": [
+    "model_sha256",
+    "engine_commit",
+    "config_sha256",
+    "source_expert_sha256",
+    "router_weight_f32_bits"
+  ],
+  "record_key": [
+    "run_id",
+    "generation_id",
+    "token_index",
+    "layer",
+    "expert",
+    "router_rank"
+  ],
+  "status": "proposed pre-kernel schema; no real trace is included",
+  "version": 1
+}

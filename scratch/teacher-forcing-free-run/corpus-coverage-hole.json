@@ -1,0 +1,9 @@
+{
+  "corpus_mean_local_kl": 0.0,
+  "corpus_state": "logged",
+  "deployment_state": "deployment",
+  "deployment_to_corpus_density_cap": "infinity",
+  "deployment_trajectory_kl": 4.605170185988092,
+  "p_failure": "0/1",
+  "q_failure": "99/100"
+}

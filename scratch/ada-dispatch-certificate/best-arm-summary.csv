@@ -1,0 +1,16 @@
+direct_certificate_completion_probability,family_epsilon_violation_probability,family_misselection_probability,formal_direct_certificate,max_simple_regret_us,mean_blocks,mean_runs,mean_simple_regret_us,mean_state_misselection_fraction,median_blocks,policy,scenario,trials
+1.0,0.0,0.0,True,0.0,732.0,2928.0,0.0,0.0,708,independent,low_rank_piecewise,3
+1.0,0.0,0.0,True,0.0,748.0,2992.0,0.0,0.0,756,safe_low_rank,low_rank_piecewise,3
+0.0,1.0,1.0,False,0.85,3592.0,14368.0,0.16645833333333335,0.25,3660,monotone,low_rank_piecewise,3
+0.0,0.0,0.0,False,0.0,176.0,704.0,0.0,0.0,180,piecewise,low_rank_piecewise,3
+0.0,0.0,0.0,False,0.0,96.0,384.0,0.0,0.0,84,low_rank,low_rank_piecewise,3
+1.0,0.0,0.0,True,0.0,4492.0,17968.0,0.0,0.0,4560,independent,monotone,3
+1.0,0.0,0.0,True,0.0,4676.0,18704.0,0.0,0.0,4752,safe_low_rank,monotone,3
+0.0,0.0,0.0,False,0.0,1256.0,5024.0,0.0,0.0,1344,monotone,monotone,3
+0.0,0.0,0.3333333333333333,False,0.020000000000000018,916.0,3664.0,0.000277777777777778,0.013888888888888888,912,piecewise,monotone,3
+0.0,1.0,1.0,False,0.6799999999999999,1152.0,4608.0,0.05236111111111111,0.19444444444444445,1344,low_rank,monotone,3
+1.0,0.0,0.0,True,0.0,3228.0,12912.0,0.0,0.0,3240,independent,misspecified,3
+1.0,0.0,0.0,True,0.0,3188.0,12752.0,0.0,0.0,3228,safe_low_rank,misspecified,3
+0.0,1.0,1.0,False,0.75,2956.0,11824.0,0.08348888888888889,0.19444444444444445,3000,monotone,misspecified,3
+0.0,0.3333333333333333,0.3333333333333333,False,0.7106000000000001,840.0,3360.0,0.009869444444444446,0.013888888888888888,852,piecewise,misspecified,3
+0.0,1.0,1.0,False,2.2176,896.0,3584.0,0.14590833333333333,0.20833333333333334,864,low_rank,misspecified,3

@@ -1,0 +1,143 @@
+{
+  "allocation_assumptions": {
+    "block_barriers_per_sm": null,
+    "provenance": "defaults; validate against ncu_occupancy/cudaOccupancy for the exact toolkit+device",
+    "register_allocation_granularity": "warp",
+    "register_allocation_unit": 256,
+    "reserved_shared_bytes_per_block": 1024,
+    "shared_allocation_unit": 256,
+    "warp_register_allocation_granularity": 4
+  },
+  "certificate_hash": "569706ddb2eab7657bad45893b26f57e82879caee272a0f9a656c4576b955326",
+  "dispatch": {
+    "rtx_4070_super_sm89": {
+      "evidence": {
+        "familywise_error_claim": null,
+        "paired_median_cta8_minus_cta4_us": {
+          "down_store": [
+            0.561,
+            0.091,
+            -0.323,
+            0.188,
+            1.008,
+            0.498,
+            0.411,
+            0.608
+          ],
+          "down_weighted": [
+            0.001,
+            0.007,
+            -0.049,
+            -0.033,
+            0.651,
+            0.441,
+            0.479,
+            0.344
+          ],
+          "gate_up_pair": [
+            -0.378,
+            -0.328,
+            -0.702,
+            -0.205,
+            -0.267,
+            -0.453,
+            -0.271,
+            -1.276
+          ]
+        },
+        "raw_data_in_supplied_bundle": false,
+        "raw_path_recorded_in_audit": "/var/lib/insignia/bench-results/s11-down-repeats/",
+        "reason": "summarized medians do not reconstruct simultaneous confidence intervals",
+        "serialized_repetitions": 21,
+        "summary_statistic": "median within-run CTA8-CTA4 difference"
+      },
+      "status": "historical_evidence_requires_raw_recertification",
+      "table": {
+        "down_store": [
+          4,
+          4,
+          8,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "down_weighted": [
+          4,
+          4,
+          8,
+          8,
+          4,
+          4,
+          4,
+          4
+        ],
+        "gate_up_pair": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "packed_down_store": [
+          4,
+          4,
+          8,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      }
+    },
+    "rtx_4070_ti_super_oc": {
+      "familywise_error_claim": null,
+      "status": "unmeasured",
+      "table": null
+    }
+  },
+  "remeasurement_plan": {
+    "remote_rule": "the 4070 Ti SUPER starts unmeasured; no local entry is promoted remotely without a machine-specific interval",
+    "stage_0_compile": "compile the incumbent and CTA4/CTA8 challenger for every affected state; parse ptxas -v; reject infeasible/spilling variants; compare occupancy with cudaOccupancyMaxActiveBlocksPerMultiprocessor",
+    "stage_1_sentinels": [
+      "gate_up_pair:B4",
+      "down_store:B2",
+      "down_store:B4",
+      "down_weighted:B1",
+      "down_weighted:B2",
+      "down_weighted:B3",
+      "down_weighted:B4"
+    ],
+    "stage_2_full_family": "one randomized ABBA/BAAB superblock for every state, then allocate only to unresolved states; a structure model may choose order but cannot certify an unmeasured state",
+    "stopping": "stop when every state has a simultaneous epsilon-optimal direct interval, or when the maximum possible lifetime saving is below remaining tuning cost",
+    "trigger_fingerprint_fields": [
+      "GPU UUID and SM count",
+      "driver/runtime version",
+      "locked core and memory clocks or overclock profile",
+      "source commit and benchmark hash",
+      "nvcc/ptxas version and complete flags",
+      "cubin hash",
+      "register/shared/stack/spill metadata"
+    ]
+  },
+  "schema": "insignia.ada_dispatch_certificate.v1",
+  "source_commit": "0740c63d1b7c24ff603bf81462f4d8430ad239a1",
+  "validity": {
+    "estimand": "clipped paired mean latency under the named machine regime",
+    "iid_assumption": false,
+    "invalidated_by": [
+      "compiler/cubin/resource change",
+      "clock or power profile change",
+      "driver/runtime change",
+      "GPU identity change",
+      "operation-mode/cache-residency state outside the table"
+    ],
+    "required_alpha": 0.05,
+    "required_epsilon_us": 0.1
+  }
+}

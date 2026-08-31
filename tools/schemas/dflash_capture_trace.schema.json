@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://insignia.local/schemas/dflash_capture_trace.schema.json",
+  "title": "Minimum DFlash target-capture exploration trace",
+  "description": "One on-policy speculative round. Raw prompt text and raw hidden states are not required. Estimation of unchosen capture sets requires randomized support and the logged joint action probability.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "round_id",
+    "policy",
+    "cheap_context",
+    "conditioning_state",
+    "candidate_layers",
+    "selected_captures",
+    "draft",
+    "target_outcome",
+    "timing"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "dflash-capture-v1"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "round_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "trajectory_id": {
+      "type": "string"
+    },
+    "prompt_stratum": {
+      "type": "string",
+      "description": "Non-identifying workload or prompt-length stratum."
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "policy_version",
+        "exploration_cohort",
+        "joint_action_probability"
+      ],
+      "properties": {
+        "policy_id": {"type": "string"},
+        "policy_version": {"type": "string"},
+        "exploration_cohort": {"type": "string"},
+        "random_seed": {"type": "integer"},
+        "joint_action_probability": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "Probability of the complete ordered sensing action conditional on logged history."
+        },
+        "baseline_policy_id": {"type": "string"}
+      }
+    },
+    "cheap_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feature_schema_id", "available_before_selection_ns", "values"],
+      "properties": {
+        "feature_schema_id": {"type": "string"},
+        "available_before_selection_ns": {"type": "integer", "minimum": 0},
+        "values": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "Only features causally available before the first capture decision."
+        }
+      }
+    },
+    "conditioning_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "representation_schema_id",
+        "available_before_selection_ns",
+        "values_or_reference"
+      ],
+      "properties": {
+        "representation_schema_id": {
+          "type": "string",
+          "description": "Versioned representation of D: the prompt-derived and drafter causal state used by the frozen evaluator."
+        },
+        "available_before_selection_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "values_or_reference": {
+          "description": "A privacy-safe feature vector or stable content-addressed reference sufficient to reconstruct the evaluator's conditioning state D.",
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "array", "items": {"type": "number"}}
+          ]
+        },
+        "drafter_checkpoint_id": {
+          "type": "string"
+        }
+      }
+    },
+    "candidate_layers": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1, "maximum": 44}
+    },
+    "selected_captures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "selection_order",
+          "layer",
+          "conditional_selection_probability",
+          "encoder_id",
+          "encoded_bits",
+          "logical_bytes",
+          "transferred_bytes",
+          "capture_ready_ns",
+          "transfer_start_ns",
+          "transfer_end_ns",
+          "critical_path_latency_ns",
+          "observation"
+        ],
+        "properties": {
+          "selection_order": {"type": "integer", "minimum": 0},
+          "layer": {"type": "integer", "minimum": 1, "maximum": 44},
+          "conditional_selection_probability": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 1
+          },
+          "encoder_id": {"type": "string"},
+          "encoder_rank": {"type": "integer", "minimum": 0},
+          "encoder_distortion": {"type": "number", "minimum": 0},
+          "encoded_bits": {"type": "integer", "minimum": 0},
+          "logical_bytes": {"type": "integer", "minimum": 0},
+          "transferred_bytes": {"type": "integer", "minimum": 0},
+          "capture_ready_ns": {"type": "integer", "minimum": 0},
+          "transfer_start_ns": {"type": "integer", "minimum": 0},
+          "transfer_end_ns": {"type": "integer", "minimum": 0},
+          "critical_path_latency_ns": {"type": "integer", "minimum": 0},
+          "observation": {
+            "description": "The exact encoded Z_l used by the frozen evaluator, or a stable content-addressed reference to it.",
+            "oneOf": [
+              {"type": "number"},
+              {"type": "string"},
+              {"type": "array", "items": {"type": "number"}}
+            ]
+          }
+        }
+      }
+    },
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["block_token_ids", "block_width", "drafter_start_ns", "drafter_end_ns"],
+      "properties": {
+        "block_token_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "block_width": {"type": "integer", "minimum": 0, "maximum": 8},
+        "drafter_start_ns": {"type": "integer", "minimum": 0},
+        "drafter_end_ns": {"type": "integer", "minimum": 0},
+        "logit_summary": {
+          "type": "array",
+          "items": {"type": "number"},
+          "description": "Optional frozen low-dimensional logit summary used by the estimator."
+        }
+      }
+    },
+    "target_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exact_block_token_ids",
+        "verification_prefix_length",
+        "accepted_draft_tokens",
+        "committed_tokens",
+        "fallback_used"
+      ],
+      "properties": {
+        "exact_block_token_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "verification_prefix_length": {"type": "integer", "minimum": 0, "maximum": 8},
+        "accepted_draft_tokens": {"type": "integer", "minimum": 0, "maximum": 8},
+        "committed_tokens": {"type": "integer", "minimum": 0},
+        "fallback_used": {"type": "boolean"},
+        "target_logit_summary": {
+          "type": "array",
+          "items": {"type": "number"}
+        }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "round_start_ns",
+        "round_end_ns",
+        "verify_start_ns",
+        "verify_end_ns",
+        "capture_critical_path_ns",
+        "fallback_ns"
+      ],
+      "properties": {
+        "round_start_ns": {"type": "integer", "minimum": 0},
+        "round_end_ns": {"type": "integer", "minimum": 0},
+        "verify_start_ns": {"type": "integer", "minimum": 0},
+        "verify_end_ns": {"type": "integer", "minimum": 0},
+        "capture_critical_path_ns": {"type": "integer", "minimum": 0},
+        "fallback_ns": {"type": "integer", "minimum": 0},
+        "overlap_accounting_version": {"type": "string"}
+      }
+    },
+    "hardware_state": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "device_id": {"type": "string"},
+        "queue_depth": {"type": "integer", "minimum": 0},
+        "effective_transfer_bytes_per_second": {"type": "number", "minimum": 0},
+        "clock_or_power_stratum": {"type": "string"}
+      }
+    }
+  }
+}

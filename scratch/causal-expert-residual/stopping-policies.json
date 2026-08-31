@@ -1,0 +1,1059 @@
+[
+  {
+    "expected_error_solutions": [
+      {
+        "bound": 2.2048428420714927,
+        "components": [
+          {
+            "approximate_probability": 0.79150390625,
+            "constraint_value": 2.718356326436491,
+            "expected_cost": 5666.0,
+            "expected_distortion": 2.718356326436491,
+            "prefix_histogram": {
+              "0": 1,
+              "1": 2,
+              "4": 1
+            },
+            "prefixes_by_context": [
+              4,
+              1,
+              1,
+              0
+            ],
+            "probability": 0.44515921810083425,
+            "selective_risk_numerator": 0.11767578125
+          },
+          {
+            "approximate_probability": 0.51318359375,
+            "constraint_value": 1.7928412938044413,
+            "expected_cost": 9086.0,
+            "expected_distortion": 1.7928412938044413,
+            "prefix_histogram": {
+              "0": 1,
+              "1": 1,
+              "4": 2
+            },
+            "prefixes_by_context": [
+              4,
+              1,
+              4,
+              0
+            ],
+            "probability": 0.5548407818991657,
+            "selective_risk_numerator": 0.09228515625
+          }
+        ],
+        "constraint_value": 2.2048428420714927,
+        "distortion_fraction": 0.5,
+        "expected_cost": 7563.5554740951475,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.44096856841429855,
+        "components": [
+          {
+            "approximate_probability": 0.2421875,
+            "constraint_value": 0.6996077939256893,
+            "expected_cost": 13408.0,
+            "expected_distortion": 0.6996077939256893,
+            "prefix_histogram": {
+              "1": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              1
+            ],
+            "probability": 0.4686645830598869,
+            "selective_risk_numerator": 0.00732421875
+          },
+          {
+            "approximate_probability": 0.2421875,
+            "constraint_value": 0.21283575263986998,
+            "expected_cost": 15392.0,
+            "expected_distortion": 0.21283575263986998,
+            "prefix_histogram": {
+              "3": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              3
+            ],
+            "probability": 0.5313354169401131,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.44096856841429855,
+        "distortion_fraction": 0.1,
+        "expected_cost": 14462.169467209183,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.04409685684142985,
+        "components": [
+          {
+            "approximate_probability": 0.2421875,
+            "constraint_value": 0.21283575263986998,
+            "expected_cost": 15392.0,
+            "expected_distortion": 0.21283575263986998,
+            "prefix_histogram": {
+              "3": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              3
+            ],
+            "probability": 0.20718726198245557,
+            "selective_risk_numerator": 0.0
+          },
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 16384.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 4
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "probability": 0.7928127380175445,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.04409685684142985,
+        "distortion_fraction": 0.01,
+        "expected_cost": 16178.470236113404,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 16384.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 4
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.0,
+        "expected_cost": 16384.0,
+        "mode": "expected_distortion"
+      }
+    ],
+    "family": "independent_random",
+    "mean_chunk_energy_in_priority_order": [
+      1.1914320543732446,
+      1.1283699519097241,
+      1.0890827470714615,
+      1.0379313066716527
+    ],
+    "mean_chunk_read_bytes_in_priority_order": [
+      4096.0,
+      4096.0,
+      4096.0,
+      4096.0
+    ],
+    "predictor_only_expected_distortion": 4.4096856841429855,
+    "priority_original_chunk_indices": [
+      1,
+      0,
+      3,
+      2
+    ],
+    "selective_risk_alpha": 0.05,
+    "selective_risk_solution": {
+      "bound": 0.0,
+      "components": [
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": 0.04912109375,
+          "expected_cost": 4096.0,
+          "expected_distortion": 3.2223596284296496,
+          "prefix_histogram": {
+            "1": 4
+          },
+          "prefixes_by_context": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "probability": 0.03269230769230775,
+          "selective_risk_numerator": 0.09912109375
+        },
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": -0.0016601562500000028,
+          "expected_cost": 4950.0,
+          "expected_distortion": 2.9448514807553234,
+          "prefix_histogram": {
+            "1": 3,
+            "2": 1
+          },
+          "prefixes_by_context": [
+            2,
+            1,
+            1,
+            1
+          ],
+          "probability": 0.9673076923076922,
+          "selective_risk_numerator": 0.04833984375
+        }
+      ],
+      "constraint_value": 2.168404344971009e-19,
+      "expected_cost": 4922.080769230769,
+      "mode": "selective_risk"
+    },
+    "tail_error_threshold": 2.069484332075314
+  },
+  {
+    "expected_error_solutions": [
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.0,
+            "expected_cost": 0.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "0": 4
+            },
+            "prefixes_by_context": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.5,
+        "expected_cost": 0.0,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.0,
+            "expected_cost": 0.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "0": 4
+            },
+            "prefixes_by_context": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.1,
+        "expected_cost": 0.0,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.0,
+            "expected_cost": 0.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "0": 4
+            },
+            "prefixes_by_context": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.01,
+        "expected_cost": 0.0,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.0,
+            "expected_cost": 0.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "0": 4
+            },
+            "prefixes_by_context": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.0,
+        "expected_cost": 0.0,
+        "mode": "expected_distortion"
+      }
+    ],
+    "family": "exact_shared_basis",
+    "mean_chunk_energy_in_priority_order": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "mean_chunk_read_bytes_in_priority_order": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "predictor_only_expected_distortion": 0.0,
+    "priority_original_chunk_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "selective_risk_alpha": 0.05,
+    "selective_risk_solution": {
+      "bound": 0.0,
+      "components": [
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": -0.05,
+          "expected_cost": 0.0,
+          "expected_distortion": 0.0,
+          "prefix_histogram": {
+            "0": 4
+          },
+          "prefixes_by_context": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "probability": 1.0,
+          "selective_risk_numerator": 0.0
+        }
+      ],
+      "constraint_value": -0.05,
+      "expected_cost": 0.0,
+      "mode": "selective_risk"
+    },
+    "tail_error_threshold": 0.0
+  },
+  {
+    "expected_error_solutions": [
+      {
+        "bound": 0.011838744518109727,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.012796013191841005,
+            "expected_cost": 2147.509765625,
+            "expected_distortion": 0.012796013191841005,
+            "prefix_histogram": {
+              "0": 2,
+              "2": 2
+            },
+            "prefixes_by_context": [
+              0,
+              0,
+              2,
+              2
+            ],
+            "probability": 0.8031744899031666,
+            "selective_risk_numerator": 0.17626953125
+          },
+          {
+            "approximate_probability": 0.75341796875,
+            "constraint_value": 0.00793247353552143,
+            "expected_cost": 4057.041015625,
+            "expected_distortion": 0.00793247353552143,
+            "prefix_histogram": {
+              "0": 1,
+              "2": 2,
+              "4": 1
+            },
+            "prefixes_by_context": [
+              4,
+              0,
+              2,
+              2
+            ],
+            "probability": 0.19682551009683336,
+            "selective_risk_numerator": 0.09375
+          }
+        ],
+        "constraint_value": 0.011838744518109727,
+        "distortion_fraction": 0.5,
+        "expected_cost": 2523.354227952094,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0023677489036219457,
+        "components": [
+          {
+            "approximate_probability": 0.5029296875,
+            "constraint_value": 0.0030145270926775583,
+            "expected_cost": 5996.822265625,
+            "expected_distortion": 0.0030145270926775583,
+            "prefix_histogram": {
+              "2": 2,
+              "4": 2
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              2,
+              2
+            ],
+            "probability": 0.1994542552701557,
+            "selective_risk_numerator": 0.0
+          },
+          {
+            "approximate_probability": 0.5029296875,
+            "constraint_value": 0.002206605505043766,
+            "expected_cost": 6343.3408203125,
+            "expected_distortion": 0.002206605505043766,
+            "prefix_histogram": {
+              "2": 1,
+              "3": 1,
+              "4": 2
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              2,
+              3
+            ],
+            "probability": 0.8005457447298443,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0023677489036219457,
+        "distortion_fraction": 0.1,
+        "expected_cost": 6274.226220050014,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.00023677489036219454,
+        "components": [
+          {
+            "approximate_probability": 0.25146484375,
+            "constraint_value": 0.0006724773226614328,
+            "expected_cost": 7216.9296875,
+            "expected_distortion": 0.0006724773226614328,
+            "prefix_histogram": {
+              "3": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              3
+            ],
+            "probability": 0.352093494283378,
+            "selective_risk_numerator": 0.0
+          },
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 7744.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 4
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "probability": 0.647906505716622,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.00023677489036219454,
+        "distortion_fraction": 0.01,
+        "expected_cost": 7558.421971938844,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 7744.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 4
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.0,
+        "expected_cost": 7744.0,
+        "mode": "expected_distortion"
+      }
+    ],
+    "family": "shared_basis_sparse_residual",
+    "mean_chunk_energy_in_priority_order": [
+      0.005657290520189093,
+      0.008467071370034234,
+      0.004254077429376135,
+      0.0060961712644236376
+    ],
+    "mean_chunk_read_bytes_in_priority_order": [
+      1698.0,
+      2572.0,
+      1378.0,
+      2096.0
+    ],
+    "predictor_only_expected_distortion": 0.023677489036219454,
+    "priority_original_chunk_indices": [
+      0,
+      2,
+      3,
+      1
+    ],
+    "selective_risk_alpha": 0.05,
+    "selective_risk_solution": {
+      "bound": 0.0,
+      "components": [
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": 0.0671875,
+          "expected_cost": 2572.8388671875,
+          "expected_distortion": 0.011875615121699571,
+          "prefix_histogram": {
+            "0": 1,
+            "1": 1,
+            "2": 2
+          },
+          "prefixes_by_context": [
+            0,
+            1,
+            2,
+            2
+          ],
+          "probability": 0.11225806451612907,
+          "selective_risk_numerator": 0.1171875
+        },
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": -0.008496093750000003,
+          "expected_cost": 3965.5341796875,
+          "expected_distortion": 0.009233342434944678,
+          "prefix_histogram": {
+            "1": 1,
+            "2": 2,
+            "3": 1
+          },
+          "prefixes_by_context": [
+            3,
+            1,
+            2,
+            2
+          ],
+          "probability": 0.8877419354838709,
+          "selective_risk_numerator": 0.04150390625
+        }
+      ],
+      "constraint_value": 0.0,
+      "expected_cost": 3809.1928994455648,
+      "mode": "selective_risk"
+    },
+    "tail_error_threshold": 0.16568980728920973
+  },
+  {
+    "expected_error_solutions": [
+      {
+        "bound": 0.0011352316709351004,
+        "components": [
+          {
+            "approximate_probability": 0.771484375,
+            "constraint_value": 0.0011865709421521428,
+            "expected_cost": 6490.376953125,
+            "expected_distortion": 0.0011865709421521428,
+            "prefix_histogram": {
+              "0": 1,
+              "1": 1,
+              "2": 1,
+              "4": 1
+            },
+            "prefixes_by_context": [
+              1,
+              0,
+              2,
+              4
+            ],
+            "probability": 0.6488866582147651,
+            "selective_risk_numerator": 0.1923828125
+          },
+          {
+            "approximate_probability": 0.771484375,
+            "constraint_value": 0.0010403524277658538,
+            "expected_cost": 7438.611328125,
+            "expected_distortion": 0.0010403524277658538,
+            "prefix_histogram": {
+              "0": 1,
+              "2": 2,
+              "4": 1
+            },
+            "prefixes_by_context": [
+              2,
+              0,
+              2,
+              4
+            ],
+            "probability": 0.3511133417852349,
+            "selective_risk_numerator": 0.1259765625
+          }
+        ],
+        "constraint_value": 0.0011352316709351004,
+        "distortion_fraction": 0.5,
+        "expected_cost": 6823.314693326884,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0002270463341870201,
+        "components": [
+          {
+            "approximate_probability": 0.21728515625,
+            "constraint_value": 0.00031899157537278633,
+            "expected_cost": 12314.4755859375,
+            "expected_distortion": 0.00031899157537278633,
+            "prefix_histogram": {
+              "1": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              1,
+              4,
+              4
+            ],
+            "probability": 0.5754302345767481,
+            "selective_risk_numerator": 0.0517578125
+          },
+          {
+            "approximate_probability": 0.21728515625,
+            "constraint_value": 0.00010243060312808023,
+            "expected_cost": 13912.8251953125,
+            "expected_distortion": 0.00010243060312808023,
+            "prefix_histogram": {
+              "3": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              3,
+              4,
+              4
+            ],
+            "probability": 0.42456976542325187,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0002270463341870201,
+        "distortion_fraction": 0.1,
+        "expected_cost": 12993.08650465419,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 2.270463341870201e-05,
+        "components": [
+          {
+            "approximate_probability": 0.21728515625,
+            "constraint_value": 0.00010243060312808023,
+            "expected_cost": 13912.8251953125,
+            "expected_distortion": 0.00010243060312808023,
+            "prefix_histogram": {
+              "3": 1,
+              "4": 3
+            },
+            "prefixes_by_context": [
+              4,
+              3,
+              4,
+              4
+            ],
+            "probability": 0.22165869110730427,
+            "selective_risk_numerator": 0.0
+          },
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 14712.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 4
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "probability": 0.7783413088926957,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 2.270463341870201e-05,
+        "distortion_fraction": 0.01,
+        "expected_cost": 14534.855958827033,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 14712.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 4
+            },
+            "prefixes_by_context": [
+              4,
+              4,
+              4,
+              4
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.0,
+        "expected_cost": 14712.0,
+        "mode": "expected_distortion"
+      }
+    ],
+    "family": "slowly_drifting",
+    "mean_chunk_energy_in_priority_order": [
+      0.0006264169416942984,
+      0.0005619829057890257,
+      0.0005485734927911119,
+      0.0005445198981858527
+    ],
+    "mean_chunk_read_bytes_in_priority_order": [
+      3678.0,
+      3678.0,
+      3678.0,
+      3678.0
+    ],
+    "predictor_only_expected_distortion": 0.002270463341870201,
+    "priority_original_chunk_indices": [
+      0,
+      3,
+      2,
+      1
+    ],
+    "selective_risk_alpha": 0.05,
+    "selective_risk_solution": {
+      "bound": 0.0,
+      "components": [
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": 0.10771484375,
+          "expected_cost": 5175.779296875,
+          "expected_distortion": 0.0014647960192519234,
+          "prefix_histogram": {
+            "0": 1,
+            "2": 3
+          },
+          "prefixes_by_context": [
+            2,
+            2,
+            0,
+            2
+          ],
+          "probability": 0.010762331838565047,
+          "selective_risk_numerator": 0.15771484375
+        },
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": -0.0011718750000000028,
+          "expected_cost": 7356.0,
+          "expected_distortion": 0.0010821797785249962,
+          "prefix_histogram": {
+            "2": 4
+          },
+          "prefixes_by_context": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "probability": 0.989237668161435,
+          "selective_risk_numerator": 0.048828125
+        }
+      ],
+      "constraint_value": 0.0,
+      "expected_cost": 7332.535741311659,
+      "mode": "selective_risk"
+    },
+    "tail_error_threshold": 0.04784738599011447
+  },
+  {
+    "expected_error_solutions": [
+      {
+        "bound": 0.19665446711954904,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.2824659461896306,
+            "expected_cost": 4096.0,
+            "expected_distortion": 0.2824659461896306,
+            "prefix_histogram": {
+              "1": 2
+            },
+            "prefixes_by_context": [
+              1,
+              1
+            ],
+            "probability": 0.16670000405825466,
+            "selective_risk_numerator": 0.125
+          },
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.17948805168826004,
+            "expected_cost": 8192.0,
+            "expected_distortion": 0.17948805168826004,
+            "prefix_histogram": {
+              "2": 2
+            },
+            "prefixes_by_context": [
+              2,
+              2
+            ],
+            "probability": 0.8332999959417453,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.19665446711954904,
+        "distortion_fraction": 0.5,
+        "expected_cost": 7509.196783377389,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.03933089342390981,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.08877666591727978,
+            "expected_cost": 12288.0,
+            "expected_distortion": 0.08877666591727978,
+            "prefix_histogram": {
+              "3": 2
+            },
+            "prefixes_by_context": [
+              3,
+              3
+            ],
+            "probability": 0.44303188250567443,
+            "selective_risk_numerator": 0.0
+          },
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 16384.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 2
+            },
+            "prefixes_by_context": [
+              4,
+              4
+            ],
+            "probability": 0.5569681174943255,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.03933089342390981,
+        "distortion_fraction": 0.1,
+        "expected_cost": 14569.341409256756,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.003933089342390981,
+        "components": [
+          {
+            "approximate_probability": 1.0,
+            "constraint_value": 0.08877666591727978,
+            "expected_cost": 12288.0,
+            "expected_distortion": 0.08877666591727978,
+            "prefix_histogram": {
+              "3": 2
+            },
+            "prefixes_by_context": [
+              3,
+              3
+            ],
+            "probability": 0.04430318825056744,
+            "selective_risk_numerator": 0.0
+          },
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 16384.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 2
+            },
+            "prefixes_by_context": [
+              4,
+              4
+            ],
+            "probability": 0.9556968117494326,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.003933089342390981,
+        "distortion_fraction": 0.01,
+        "expected_cost": 16202.534140925676,
+        "mode": "expected_distortion"
+      },
+      {
+        "bound": 0.0,
+        "components": [
+          {
+            "approximate_probability": 0.0,
+            "constraint_value": 0.0,
+            "expected_cost": 16384.0,
+            "expected_distortion": 0.0,
+            "prefix_histogram": {
+              "4": 2
+            },
+            "prefixes_by_context": [
+              4,
+              4
+            ],
+            "probability": 1.0,
+            "selective_risk_numerator": 0.0
+          }
+        ],
+        "constraint_value": 0.0,
+        "distortion_fraction": 0.0,
+        "expected_cost": 16384.0,
+        "mode": "expected_distortion"
+      }
+    ],
+    "family": "route_only_adversary",
+    "mean_chunk_energy_in_priority_order": [
+      0.11084298804946566,
+      0.10297789450137125,
+      0.09071138577097966,
+      0.08877666591727948
+    ],
+    "mean_chunk_read_bytes_in_priority_order": [
+      4096.0,
+      4096.0,
+      4096.0,
+      4096.0
+    ],
+    "predictor_only_expected_distortion": 0.3933089342390981,
+    "priority_original_chunk_indices": [
+      0,
+      1,
+      3,
+      2
+    ],
+    "selective_risk_alpha": 0.05,
+    "selective_risk_solution": {
+      "bound": 0.0,
+      "components": [
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": 0.075,
+          "expected_cost": 4096.0,
+          "expected_distortion": 0.2824659461896306,
+          "prefix_histogram": {
+            "1": 2
+          },
+          "prefixes_by_context": [
+            1,
+            1
+          ],
+          "probability": 0.4,
+          "selective_risk_numerator": 0.125
+        },
+        {
+          "approximate_probability": 1.0,
+          "constraint_value": -0.05,
+          "expected_cost": 8192.0,
+          "expected_distortion": 0.17948805168826004,
+          "prefix_histogram": {
+            "2": 2
+          },
+          "prefixes_by_context": [
+            2,
+            2
+          ],
+          "probability": 0.6,
+          "selective_risk_numerator": 0.0
+        }
+      ],
+      "constraint_value": 0.0,
+      "expected_cost": 6553.6,
+      "mode": "selective_risk"
+    },
+    "tail_error_threshold": 0.619046341295153
+  }
+]

@@ -1,0 +1,144 @@
+{
+  "expert_route": {
+    "rows": [
+      {
+        "expert_k": 4,
+        "prefetch": 0,
+        "current_tokens": 1.0,
+        "current_ms": 1.0,
+        "next_route": "cold-B",
+        "next_tokens": 1.0,
+        "next_ms": 10.0,
+        "myopic_tps": 1000.0,
+        "two_block_tps": 181.8181818181818
+      },
+      {
+        "expert_k": 4,
+        "prefetch": 1,
+        "current_tokens": 1.0,
+        "current_ms": 1.4,
+        "next_route": "wrong-prefetch-B",
+        "next_tokens": 1.0,
+        "next_ms": 11.0,
+        "myopic_tps": 714.2857142857143,
+        "two_block_tps": 161.29032258064515
+      },
+      {
+        "expert_k": 8,
+        "prefetch": 0,
+        "current_tokens": 1.0,
+        "current_ms": 2.0,
+        "next_route": "warm-A",
+        "next_tokens": 1.0,
+        "next_ms": 1.0,
+        "myopic_tps": 500.0,
+        "two_block_tps": 666.6666666666666
+      },
+      {
+        "expert_k": 8,
+        "prefetch": 1,
+        "current_tokens": 1.0,
+        "current_ms": 2.2,
+        "next_route": "hot-A",
+        "next_tokens": 1.0,
+        "next_ms": 0.6,
+        "myopic_tps": 454.5454545454545,
+        "two_block_tps": 714.2857142857142
+      }
+    ],
+    "myopic_choice": {
+      "expert_k": 4,
+      "prefetch": 0,
+      "current_tokens": 1.0,
+      "current_ms": 1.0,
+      "next_route": "cold-B",
+      "next_tokens": 1.0,
+      "next_ms": 10.0,
+      "myopic_tps": 1000.0,
+      "two_block_tps": 181.8181818181818
+    },
+    "dynamic_choice": {
+      "expert_k": 8,
+      "prefetch": 1,
+      "current_tokens": 1.0,
+      "current_ms": 2.2,
+      "next_route": "hot-A",
+      "next_tokens": 1.0,
+      "next_ms": 0.6,
+      "myopic_tps": 454.5454545454545,
+      "two_block_tps": 714.2857142857142
+    },
+    "cross_difference": 68.1469068565842,
+    "separable": false
+  },
+  "draft_checkpoint": {
+    "rows": [
+      {
+        "draft_k": 2,
+        "checkpoint": "delta",
+        "committed": 1.8,
+        "time_ms": 2.0,
+        "tps": 900.0
+      },
+      {
+        "draft_k": 2,
+        "checkpoint": "full",
+        "committed": 1.8,
+        "time_ms": 2.4,
+        "tps": 750.0
+      },
+      {
+        "draft_k": 4,
+        "checkpoint": "delta",
+        "committed": 3.2,
+        "time_ms": 11.0,
+        "tps": 290.90909090909093
+      },
+      {
+        "draft_k": 4,
+        "checkpoint": "full",
+        "committed": 3.2,
+        "time_ms": 3.6,
+        "tps": 888.8888888888889
+      }
+    ],
+    "independent_draft_choice": 4,
+    "independent_checkpoint_choice": "delta",
+    "independent_combination": {
+      "draft_k": 4,
+      "checkpoint": "delta",
+      "committed": 3.2,
+      "time_ms": 11.0,
+      "tps": 290.90909090909093
+    },
+    "joint_choice": {
+      "draft_k": 2,
+      "checkpoint": "delta",
+      "committed": 1.8,
+      "time_ms": 2.0,
+      "tps": 900.0
+    },
+    "cross_difference": 747.9797979797979,
+    "separable": false
+  },
+  "locally_sensible_unstable": {
+    "baseline": 100.0,
+    "one_at_a_time": {
+      "expert_k_4": 104.0,
+      "draft_k_4": 105.0,
+      "approx_verify": 103.0,
+      "fp8": 102.5,
+      "prefetch_1": 104.5
+    },
+    "additive_prediction": 119.0,
+    "interaction_penalties": {
+      "low_expert_x_approx_future_route": 10.0,
+      "draft4_x_delta_checkpoint": 15.0,
+      "prefetch_x_checkpoint_queue": 9.0,
+      "low_expert_x_fp8_quality_fallback": 7.0
+    },
+    "actual_combination": 78.0,
+    "all_individual_improve": true,
+    "combination_worse_than_baseline": true
+  }
+}

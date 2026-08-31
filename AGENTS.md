@@ -89,8 +89,11 @@ under WSL2 for the GLM path:
 - CPU: AMD Ryzen 5 5600X, 6 cores / 12 threads. Host RAM: 15.9 GiB
   (`.wslconfig` caps the WSL guest at 14 GiB).
 - Storage: two SSDs — C: (980 PRO, carries the WSL vhdx) and E: (DRAM-less,
-  carries the repo + original checkpoints). Dual-SSD expert striping exists
-  (`INSIGNIA_GLM53_ALT_SHARD_DIR` + `tools/stripe_copy.py`).
+  carries the repo + original checkpoints). Dual-SSD expert striping uses a
+  verified E:-backed `/stripe` mount, a route/miss-weighted overlay index
+  (`INSIGNIA_GLM53_STRIPE_INDEX`), and `INSIGNIA_GLM53_ALT_SHARD_DIR=/stripe`.
+  Whole-shard `tools/stripe_copy.py` is deliberately disabled; build overlays
+  with `build/repack-glm53-stripe.sh`.
 - Pinned host memory ceiling: 6.6–9.25 GiB (Windows' ~50%-of-RAM lockable law;
   cudaHostRegister and GDS are dead on WSL2). Reader-pool sweet spot: 4 threads
   (virtio-blk ceiling ~5.8 GB/s).
@@ -230,7 +233,7 @@ checks. Wait for coherent token parity before claiming the engine is correct.
   (`VRAM_BUDGET_MB`), readers (`READERS`), speculative mode (`DFLASH2`,
   `DFLASH2_FP8`, `DF_VERIFY_K`, `DF_SEQ_VERIFY`/`DF_BATCH_VERIFY`), MLA modes
   (`KV_FP8`, `MLA_LEGACY` exact oracle, `SCALAR_MLA_PREFILL`,
-  `MLA_BF16_ABSORB`), striping (`ALT_SHARD_DIR`), prefetch (`CCT`,
+  `MLA_BF16_ABSORB`), striping (`STRIPE_INDEX` + `ALT_SHARD_DIR`), prefetch (`CCT`,
   `PREFETCH`), and the trace/dump hooks (`ROUTE_TRACE`, `LAYER_DUMP`,
   `MLA_DUMP`, `DF_DUMP`, `LOGITS_DUMP`).
 - `INSIGNIA_GLM53_DFLASH2_FP8` must point at

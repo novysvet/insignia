@@ -1,0 +1,12 @@
+{
+  "epsilon": 1e-07,
+  "high_rounding_bound": 45.254833995939045,
+  "high_scale": 2.0,
+  "high_small_value": 0.0,
+  "input_gap": 2.0000004496978363e-07,
+  "local_lipschitz_ratio": 9765.622804210278,
+  "low_rounding_bound": 22.627416997969522,
+  "low_scale": 1.0,
+  "low_small_value": 0.001953125,
+  "output_gap": 0.001953125
+}

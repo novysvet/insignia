@@ -1,0 +1,38 @@
+{
+  "bad_deployment": {
+    "cumulative_loss": 8.0,
+    "fast_rounds": 8,
+    "final_state": "collapsed",
+    "selective_risk": 1.0,
+    "visited_states": [
+      "anchor",
+      "collapsed",
+      "collapsed",
+      "collapsed",
+      "collapsed",
+      "collapsed",
+      "collapsed",
+      "collapsed"
+    ]
+  },
+  "bad_log_sha256": "d1c0199e9e710b09709d32c5fab389612644bfcd977a6839964793ce94f3480c",
+  "good_deployment": {
+    "cumulative_loss": 0.0,
+    "fast_rounds": 8,
+    "final_state": "anchor",
+    "selective_risk": 0.0,
+    "visited_states": [
+      "anchor",
+      "anchor",
+      "anchor",
+      "anchor",
+      "anchor",
+      "anchor",
+      "anchor",
+      "anchor"
+    ]
+  },
+  "good_log_sha256": "d1c0199e9e710b09709d32c5fab389612644bfcd977a6839964793ce94f3480c",
+  "logging_policy": "always_exact_no_shadow",
+  "logs_identical": true
+}

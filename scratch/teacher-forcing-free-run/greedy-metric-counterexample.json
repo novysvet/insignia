@@ -1,0 +1,19 @@
+{
+  "candidate": [
+    -1e-06,
+    0.0,
+    -1000000.0
+  ],
+  "candidate_top1": 1,
+  "centered_cosine": 1.0,
+  "exact": [
+    0.0,
+    -1e-06,
+    -1000000.0
+  ],
+  "exact_top1": 0,
+  "margin": 1e-06,
+  "mse": 6.666666666666667e-13,
+  "pairwise_slack": -1e-06,
+  "raw_cosine": 1.0
+}

@@ -304,9 +304,15 @@ def parse_comparison(text: str) -> dict[str, Any]:
 
     top1 = re.search(r"^top-1\s+agreement\s+([0-9.]+)%\s+\((\d+)/(\d+);", text,
                      re.MULTILINE)
+    exact_margin = re.search(
+        r"^greedy exact-margin\s+min\s+([0-9.eE+-]+)\s+mean\s+([0-9.eE+-]+)",
+        text, re.MULTILINE)
+    candidate_slack = re.search(
+        r"^greedy candidate-slack\s+min\s+([0-9.eE+-]+)\s+mean\s+([0-9.eE+-]+)",
+        text, re.MULTILINE)
     ppl = re.search(r"ppl A\s+([0-9.]+)\s+->\s+B\s+([0-9.]+)", text)
-    if not top1 or not ppl:
-        raise RuntimeError("compare_logits output lacks top-1 or PPL summary")
+    if not top1 or not exact_margin or not candidate_slack or not ppl:
+        raise RuntimeError("compare_logits output lacks greedy-margin, top-1, or PPL summary")
     ppl_a, ppl_b = float(ppl.group(1)), float(ppl.group(2))
     return {
         "cosine_mean": metric("cos"),
@@ -321,6 +327,10 @@ def parse_comparison(text: str) -> dict[str, Any]:
         "top1_percent": float(top1.group(1)),
         "top1_matches": int(top1.group(2)),
         "steps": int(top1.group(3)),
+        "exact_margin_min": float(exact_margin.group(1)),
+        "exact_margin_mean": float(exact_margin.group(2)),
+        "candidate_slack_min": float(candidate_slack.group(1)),
+        "candidate_slack_mean": float(candidate_slack.group(2)),
         "ppl_exact": ppl_a,
         "ppl_candidate": ppl_b,
         "ppl_ratio": ppl_b / ppl_a,
@@ -344,6 +354,11 @@ def compare_quality(args: argparse.Namespace, forced_file: pathlib.Path,
     result = parse_comparison(process.stdout)
     result["ppl_budget_fraction"] = args.max_ppl_delta
     result["ppl_gate_pass"] = result["ppl_delta_fraction"] <= args.max_ppl_delta
+    result["top1_gate_pass"] = result["top1_matches"] == result["steps"]
+    result["quality_gate_pass"] = (
+        result["ppl_gate_pass"] and
+        (args.allow_top1_mismatch or result["top1_gate_pass"])
+    )
     return result
 
 
@@ -376,8 +391,8 @@ def write_report(path: pathlib.Path, row: dict[str, Any], policies: list[str],
     if quality:
         lines += [
             "", "## Same-token full-vocabulary quality", "",
-            "| policy | top-1 | cosine | MSE | KL | JS | PPL exact→candidate | delta | 3.5% gate |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| policy | top-1 | min greedy slack | cosine | MSE | KL | JS | PPL exact→candidate | delta | greedy gate | PPL gate | combined |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
         ]
         for policy in policies:
             if policy == "exact":
@@ -385,11 +400,14 @@ def write_report(path: pathlib.Path, row: dict[str, Any], policies: list[str],
             item = quality[policy]
             lines.append(
                 f"| {policy} | {item['top1_percent']:.2f}% | "
+                f"{item['candidate_slack_min']:.4g} | "
                 f"{item['cosine_mean']:.6f} | {item['mse_mean']:.4g} | "
                 f"{item['kl_mean']:.4g} | {item['js_mean']:.4g} | "
                 f"{item['ppl_exact']:.4f}→{item['ppl_candidate']:.4f} | "
                 f"{100.0 * item['ppl_delta_fraction']:+.2f}% | "
-                f"{'PASS' if item['ppl_gate_pass'] else 'REJECT'} |"
+                f"{'PASS' if item['top1_gate_pass'] else 'REJECT'} | "
+                f"{'PASS' if item['ppl_gate_pass'] else 'REJECT'} | "
+                f"{'PASS' if item['quality_gate_pass'] else 'REJECT'} |"
             )
     lines += ["", "## Problem", "", str(row["problem"]), "",
               "## Formal statement", "", "```lean",
@@ -447,6 +465,8 @@ def main() -> None:
     parser.add_argument("--quality-tokens", type=int, default=64,
                         help="same-token full-vocab comparison length; 0 disables")
     parser.add_argument("--max-ppl-delta", type=float, default=.035)
+    parser.add_argument("--allow-top1-mismatch", action="store_true",
+                        help="permit greedy-token mismatches; PPL gate still applies")
     parser.add_argument("--verify-k", type=int, default=4)
     parser.add_argument("--no-dflash", action="store_true",
                         help="disable DFlash2; compatible only with --policy exact")
@@ -562,12 +582,13 @@ def main() -> None:
                     continue
                 quality[policy] = compare_quality(
                     args, forced_file, dumps["exact"], dumps[policy], policy, case_dir)
-                gate = "PASS" if quality[policy]["ppl_gate_pass"] else "REJECT"
+                gate = "PASS" if quality[policy]["quality_gate_pass"] else "REJECT"
                 print(f"    {policy}: cosine {quality[policy]['cosine_mean']:.6f}, "
                       f"MSE {quality[policy]['mse_mean']:.4g}, "
+                      f"min greedy slack {quality[policy]['candidate_slack_min']:.4g}, "
                       f"PPL {100.0 * quality[policy]['ppl_delta_fraction']:+.2f}% "
                       f"[{gate}]", flush=True)
-                any_rejected |= not quality[policy]["ppl_gate_pass"]
+                any_rejected |= not quality[policy]["quality_gate_pass"]
 
         write_report(case_dir / "report.md", row, policies, results, quality, tokenizer)
         item = {

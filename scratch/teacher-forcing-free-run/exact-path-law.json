@@ -1,0 +1,117 @@
+{
+  "chain_rule_trajectory_kl": 0.8925742052568391,
+  "direct_trajectory_kl": 0.8925742052568391,
+  "horizon": 4,
+  "p_mass": "1/1",
+  "paths": [
+    {
+      "failure": false,
+      "p": "1/1",
+      "q": "256/625",
+      "tokens": "0000"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "64/625",
+      "tokens": "0001"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "16/125",
+      "tokens": "0010"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "0011"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "4/25",
+      "tokens": "0100"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "0101"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "0110"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "0111"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "1/5",
+      "tokens": "1000"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1001"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1010"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1011"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1100"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1101"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1110"
+    },
+    {
+      "failure": true,
+      "p": "0/1",
+      "q": "0/1",
+      "tokens": "1111"
+    }
+  ],
+  "q_failure": "369/625",
+  "q_mass": "1/1",
+  "symbolic_trajectory_kl": {
+    "float": 0.8925742052568391,
+    "infinite": false,
+    "terms": [
+      {
+        "argument": "5/4",
+        "coefficient": "4/1"
+      }
+    ]
+  },
+  "vocabulary_size": 2
+}

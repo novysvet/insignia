@@ -1,0 +1,6 @@
+family,experts,chunks,full_expert_bytes,raw_full_bytes,resident_predictor_bytes,resident_directory_bytes,residual_file_bytes,residual_logical_bytes,residual_extent_bytes,mean_residual_extent_bytes_per_expert,exact_total_bytes,exact_total_ratio,mean_read_ratio,changed_byte_fraction,zero_chunk_fraction,alignment,zero_chunks,sparse_chunks,raw_chunks,exact_byte_roundtrip
+independent_random,8,4,16384,131072,0,1088,135168,131072,131072,16384.0,135168,1.03125,1.0,0.996307373046875,0.0,4096,0,0,32,True
+exact_shared_basis,8,4,16384,131072,18432,1088,4096,0,0,0.0,22528,0.171875,0.0,0.0,1.0,4096,32,0,0,True
+shared_basis_sparse_residual,8,4,16384,131072,18432,1088,65536,31015,61440,7680.0,83968,0.640625,0.46875,0.04732513427734375,0.53125,4096,17,15,0,True
+slowly_drifting,8,4,16384,131072,16384,1088,118784,114688,114688,14336.0,135168,1.03125,0.875,0.6480941772460938,0.125,4096,4,0,28,True
+route_only_adversary,8,4,16384,131072,16384,1088,135168,131072,131072,16384.0,151552,1.15625,1.0,0.8460693359375,0.0,4096,0,0,32,True

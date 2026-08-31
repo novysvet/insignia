@@ -1,0 +1,31 @@
+pooled 12 replications
+best fixed action: k4_d2_exact_bf16_pf1
+scenario             policy                    tok/s      ppl/tok    hard [95% U]     cat/tok   fallback
+calibrated           best_fixed                 29.584    0.001470  0.0328 [ 0.0813]  0.000000    0.0000
+calibrated           exact_joint                37.489    0.001788  0.0290 [ 0.0722]  0.000062    0.0000
+calibrated           independent_thresholds     27.688    0.000814  0.0094 [ 0.0515]  0.000061    0.0000
+calibrated           myopic_voi                 35.248    0.007572  0.1845 [ 0.2702]  0.000441    0.0000
+calibrated           primal_dual_joint          34.402    0.003286  0.0894 [ 0.1531]  0.000000    0.0000
+calibrated           robust_safe_joint          35.778    0.000342  0.0000 [ 0.0356]  0.000000    0.2255
+calibrated           safe_exact_fixed           24.170    0.000000  0.0000 [ 0.0287]  0.000000    0.0000
+distribution_shift   best_fixed                 24.609    0.003558  0.0735 [ 0.1301]  0.000508    0.0000
+distribution_shift   exact_joint                30.590    0.004130  0.0873 [ 0.1496]  0.000288    0.0000
+distribution_shift   independent_thresholds     22.626    0.004216  0.0873 [ 0.1496]  0.000204    0.0000
+distribution_shift   myopic_voi                 28.719    0.018775  0.2692 [ 0.3616]  0.001215    0.0000
+distribution_shift   primal_dual_joint          26.191    0.003960  0.1353 [ 0.2038]  0.000065    0.0000
+distribution_shift   robust_safe_joint          27.471    0.001426  0.0240 [ 0.0682]  0.000145    0.4017
+distribution_shift   safe_exact_fixed           20.738    0.000000  0.0000 [ 0.0300]  0.000000    0.0000
+interaction_trap     best_fixed                 28.294    0.002267  0.0320 [ 0.0794]  0.000000    0.0000
+interaction_trap     exact_joint                36.090    0.002053  0.0275 [ 0.0778]  0.000000    0.0000
+interaction_trap     independent_thresholds     23.878    0.002725  0.0791 [ 0.1361]  0.000136    0.0000
+interaction_trap     myopic_voi                 30.561    0.043437  0.4561 [ 0.5475]  0.002735    0.0000
+interaction_trap     primal_dual_joint          29.510    0.003619  0.1288 [ 0.1966]  0.000121    0.0000
+interaction_trap     robust_safe_joint          33.322    0.000427  0.0196 [ 0.0687]  0.000000    0.2872
+interaction_trap     safe_exact_fixed           23.380    0.000000  0.0000 [ 0.0265]  0.000000    0.0000
+kill criteria:
+  controller_cost_exceeds_predicted_saving: False
+  safe_exploration_lacks_overlap: False
+  no_material_robust_gain_over_best_fixed: False
+  robust_gain_over_best_fixed: 0.20938386965429956
+  robust_transformed_gain_per_round: 0.4736332996690953
+  kill_controller: False

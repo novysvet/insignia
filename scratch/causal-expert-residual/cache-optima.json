@@ -1,0 +1,1992 @@
+[
+  {
+    "problem": {
+      "basis_placements": [
+        {
+          "available": true,
+          "fixed_cost": 0.0,
+          "name": "none",
+          "ram_bytes": 0,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.1,
+          "name": "ram-basis",
+          "ram_bytes": 6,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.02,
+          "name": "vram-basis",
+          "ram_bytes": 0,
+          "vram_bytes": 4
+        }
+      ],
+      "items": [
+        {
+          "name": "expert-0",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.5
+        },
+        {
+          "name": "expert-1",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.3
+        },
+        {
+          "name": "expert-2",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.2
+        }
+      ],
+      "max_expected_distortion": 0.0,
+      "max_expected_risk": 0.02,
+      "ram_capacity": 10,
+      "vram_capacity": 8
+    },
+    "scenario": "tight-exact",
+    "solution": {
+      "basis": "ram-basis",
+      "choices": [
+        [
+          "expert-0",
+          "basis+residual"
+        ],
+        [
+          "expert-1",
+          "basis+residual"
+        ],
+        [
+          "expert-2",
+          "basis+residual"
+        ]
+      ],
+      "chunk_choices": [
+        [
+          "expert-0",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-0",
+          "tail",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "tail",
+          "ram"
+        ],
+        [
+          "expert-2",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "tail",
+          "ram"
+        ]
+      ],
+      "enumerated_configurations": 6591,
+      "expected_cost": 0.6489999999999999,
+      "expected_distortion": 0.0,
+      "expected_risk": 0.0,
+      "ram_bytes": 10,
+      "vram_bytes": 8
+    }
+  },
+  {
+    "problem": {
+      "basis_placements": [
+        {
+          "available": true,
+          "fixed_cost": 0.0,
+          "name": "none",
+          "ram_bytes": 0,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.1,
+          "name": "ram-basis",
+          "ram_bytes": 6,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.02,
+          "name": "vram-basis",
+          "ram_bytes": 0,
+          "vram_bytes": 4
+        }
+      ],
+      "items": [
+        {
+          "name": "expert-0",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.5
+        },
+        {
+          "name": "expert-1",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.3
+        },
+        {
+          "name": "expert-2",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.2
+        }
+      ],
+      "max_expected_distortion": 0.03,
+      "max_expected_risk": 0.02,
+      "ram_capacity": 10,
+      "vram_capacity": 8
+    },
+    "scenario": "tight-approximate",
+    "solution": {
+      "basis": "ram-basis",
+      "choices": [
+        [
+          "expert-0",
+          "low-precision"
+        ],
+        [
+          "expert-1",
+          "basis+residual"
+        ],
+        [
+          "expert-2",
+          "basis+residual"
+        ]
+      ],
+      "chunk_choices": [
+        [
+          "expert-1",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "tail",
+          "ram"
+        ],
+        [
+          "expert-2",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "tail",
+          "ram"
+        ]
+      ],
+      "enumerated_configurations": 6591,
+      "expected_cost": 0.62,
+      "expected_distortion": 0.025,
+      "expected_risk": 0.01,
+      "ram_bytes": 10,
+      "vram_bytes": 8
+    }
+  },
+  {
+    "problem": {
+      "basis_placements": [
+        {
+          "available": true,
+          "fixed_cost": 0.0,
+          "name": "none",
+          "ram_bytes": 0,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.1,
+          "name": "ram-basis",
+          "ram_bytes": 6,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.02,
+          "name": "vram-basis",
+          "ram_bytes": 0,
+          "vram_bytes": 4
+        }
+      ],
+      "items": [
+        {
+          "name": "expert-0",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.5
+        },
+        {
+          "name": "expert-1",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.3
+        },
+        {
+          "name": "expert-2",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.2
+        }
+      ],
+      "max_expected_distortion": 0.0,
+      "max_expected_risk": 0.02,
+      "ram_capacity": 18,
+      "vram_capacity": 10
+    },
+    "scenario": "balanced-exact",
+    "solution": {
+      "basis": "ram-basis",
+      "choices": [
+        [
+          "expert-0",
+          "basis+residual"
+        ],
+        [
+          "expert-1",
+          "basis+residual"
+        ],
+        [
+          "expert-2",
+          "basis+residual"
+        ]
+      ],
+      "chunk_choices": [
+        [
+          "expert-0",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-0",
+          "tail",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "tail",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "tail",
+          "ram"
+        ]
+      ],
+      "enumerated_configurations": 6591,
+      "expected_cost": 0.5943999999999999,
+      "expected_distortion": 0.0,
+      "expected_risk": 0.0,
+      "ram_bytes": 8,
+      "vram_bytes": 10
+    }
+  },
+  {
+    "problem": {
+      "basis_placements": [
+        {
+          "available": true,
+          "fixed_cost": 0.0,
+          "name": "none",
+          "ram_bytes": 0,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.1,
+          "name": "ram-basis",
+          "ram_bytes": 6,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.02,
+          "name": "vram-basis",
+          "ram_bytes": 0,
+          "vram_bytes": 4
+        }
+      ],
+      "items": [
+        {
+          "name": "expert-0",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.5
+        },
+        {
+          "name": "expert-1",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.3
+        },
+        {
+          "name": "expert-2",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.2
+        }
+      ],
+      "max_expected_distortion": 0.03,
+      "max_expected_risk": 0.02,
+      "ram_capacity": 18,
+      "vram_capacity": 10
+    },
+    "scenario": "balanced-approximate",
+    "solution": {
+      "basis": "ram-basis",
+      "choices": [
+        [
+          "expert-0",
+          "low-precision"
+        ],
+        [
+          "expert-1",
+          "basis+residual"
+        ],
+        [
+          "expert-2",
+          "basis+residual"
+        ]
+      ],
+      "chunk_choices": [
+        [
+          "expert-1",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "tail",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "tail",
+          "ram"
+        ]
+      ],
+      "enumerated_configurations": 6591,
+      "expected_cost": 0.5654,
+      "expected_distortion": 0.025,
+      "expected_risk": 0.01,
+      "ram_bytes": 8,
+      "vram_bytes": 10
+    }
+  },
+  {
+    "problem": {
+      "basis_placements": [
+        {
+          "available": true,
+          "fixed_cost": 0.0,
+          "name": "none",
+          "ram_bytes": 0,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.1,
+          "name": "ram-basis",
+          "ram_bytes": 6,
+          "vram_bytes": 0
+        },
+        {
+          "available": true,
+          "fixed_cost": 0.02,
+          "name": "vram-basis",
+          "ram_bytes": 0,
+          "vram_bytes": 4
+        }
+      ],
+      "items": [
+        {
+          "name": "expert-0",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.5
+        },
+        {
+          "name": "expert-1",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.3
+        },
+        {
+          "name": "expert-2",
+          "options": [
+            {
+              "distortion": 0.0,
+              "expected_cost": 10.0,
+              "name": "disk-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 3.0,
+              "name": "ram-full",
+              "ram_bytes": 8,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.2,
+              "name": "vram-full",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.0,
+              "vram_bytes": 8
+            },
+            {
+              "distortion": 0.0,
+              "expected_cost": 0.35,
+              "name": "basis+residual",
+              "ram_bytes": 0,
+              "requires_basis": true,
+              "residual_chunks": [
+                {
+                  "access_probability": 1.0,
+                  "name": "head",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                },
+                {
+                  "access_probability": 0.35,
+                  "name": "tail",
+                  "placements": [
+                    {
+                      "expected_access_cost": 2.4,
+                      "name": "disk",
+                      "ram_bytes": 0,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.6,
+                      "name": "ram",
+                      "ram_bytes": 2,
+                      "vram_bytes": 0
+                    },
+                    {
+                      "expected_access_cost": 0.08,
+                      "name": "vram",
+                      "ram_bytes": 0,
+                      "vram_bytes": 2
+                    }
+                  ]
+                }
+              ],
+              "risk": 0.0,
+              "vram_bytes": 0
+            },
+            {
+              "distortion": 0.05,
+              "expected_cost": 0.4,
+              "name": "low-precision",
+              "ram_bytes": 0,
+              "requires_basis": false,
+              "residual_chunks": [],
+              "risk": 0.02,
+              "vram_bytes": 4
+            }
+          ],
+          "probability": 0.2
+        }
+      ],
+      "max_expected_distortion": 0.0,
+      "max_expected_risk": 0.02,
+      "ram_capacity": 30,
+      "vram_capacity": 16
+    },
+    "scenario": "roomy-exact",
+    "solution": {
+      "basis": "ram-basis",
+      "choices": [
+        [
+          "expert-0",
+          "vram-full"
+        ],
+        [
+          "expert-1",
+          "basis+residual"
+        ],
+        [
+          "expert-2",
+          "basis+residual"
+        ]
+      ],
+      "chunk_choices": [
+        [
+          "expert-1",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-1",
+          "tail",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "head",
+          "vram"
+        ],
+        [
+          "expert-2",
+          "tail",
+          "vram"
+        ]
+      ],
+      "enumerated_configurations": 6591,
+      "expected_cost": 0.42900000000000005,
+      "expected_distortion": 0.0,
+      "expected_risk": 0.0,
+      "ram_bytes": 6,
+      "vram_bytes": 16
+    }
+  }
+]

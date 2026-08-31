@@ -82,11 +82,15 @@ kl      mean 8.594e-03  median 0.1  max 1
 klrev   mean 9.321e-03  median 0.1  max 1
 js      mean 2.092e-03  median 0.1  max 1
 top-1  agreement 97.92% (94/96; mismatches at steps [4, 9])
+greedy exact-margin min 1.250000e-01  mean 2.500000e-01
+greedy candidate-slack min -3.000000e-02  mean 2.000000e-01
 nll delta (B-A) total +2.0  ppl A 1.1587 -> B 1.1893
 """
         result = benchmark.parse_comparison(output)
         self.assertEqual(result["top1_matches"], 94)
         self.assertEqual(result["steps"], 96)
+        self.assertAlmostEqual(result["exact_margin_min"], 0.125)
+        self.assertAlmostEqual(result["candidate_slack_min"], -0.03)
         self.assertAlmostEqual(result["cosine_mean"], 0.984966)
         self.assertAlmostEqual(result["relative_l2_mean"], 0.1234)
         self.assertAlmostEqual(result["centered_cosine_mean"], 0.995123)

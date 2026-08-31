@@ -1,0 +1,8 @@
+{
+  "action": "MEASURE:fixture",
+  "certified_gap": 4675.65,
+  "lower_bound": 1624.3500000000004,
+  "perfect_information_upper_bound": 6300.0,
+  "rollout_action": "MEASURE:fixture",
+  "value": 2622.9360000000806
+}

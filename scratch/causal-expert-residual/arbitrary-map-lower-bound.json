@@ -1,0 +1,10 @@
+{
+  "experts": 8,
+  "external_bits_for_exhaustive_queries": 1048576,
+  "independent_cells": 512,
+  "mean_external_bits_per_query": 2048.0,
+  "output_bits": 2048,
+  "query_points_per_expert": 64,
+  "resident_bits": 0,
+  "total_representation_bits": 1048576
+}

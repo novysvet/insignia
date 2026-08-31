@@ -4,7 +4,12 @@ import unittest
 
 import numpy as np
 
-from compare_logits import centered_metrics, distribution_divergences, relative_l2
+from compare_logits import (
+    centered_metrics,
+    distribution_divergences,
+    greedy_margin_slack,
+    relative_l2,
+)
 
 
 class DistributionDivergenceTest(unittest.TestCase):
@@ -44,6 +49,13 @@ class DistributionDivergenceTest(unittest.TestCase):
         self.assertAlmostEqual(rel_l2, 0.0, places=14)
         self.assertAlmostEqual(mse, 0.0, places=14)
         self.assertGreater(relative_l2(reference, candidate), 0.0)
+
+    def test_greedy_margin_slack_is_exact_pairwise_condition(self):
+        reference = np.array([4.0, 3.0, -2.0], dtype=np.float64)
+        candidate = np.array([3.5, 3.25, 8.0], dtype=np.float64)
+        margin, slack = greedy_margin_slack(reference, candidate)
+        self.assertEqual(margin, 1.0)
+        self.assertEqual(slack, -4.5)
 
 
 if __name__ == "__main__":

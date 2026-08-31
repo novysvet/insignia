@@ -1,0 +1,179 @@
+{
+  "confidence_update": {
+    "intended": {
+      "delta": 0.00625,
+      "kind": "audit-capture-mixture-e-process",
+      "max_rho": 0.2192926829268292,
+      "mixture_weights": [
+        0.02,
+        0.03,
+        0.05,
+        0.08,
+        0.12,
+        0.17,
+        0.23,
+        0.3
+      ],
+      "observed_audit_value": 0.0,
+      "resolved_audits": 0,
+      "rhos": [
+        0.017543414634146336,
+        0.03508682926829267,
+        0.06140195121951218,
+        0.09210292682926827,
+        0.12718975609756095,
+        0.15789073170731702,
+        0.18420585365853653,
+        0.20613512195121944
+      ],
+      "update": "lambda_t(rho)=-log(1-rho*b_t/q_t)/b_t"
+    },
+    "proposal": {
+      "delta": 0.00625,
+      "kind": "audit-capture-mixture-e-process",
+      "max_rho": 0.17981999999999998,
+      "mixture_weights": [
+        0.02,
+        0.03,
+        0.05,
+        0.08,
+        0.12,
+        0.17,
+        0.23,
+        0.3
+      ],
+      "observed_audit_value": 0.0,
+      "resolved_audits": 0,
+      "rhos": [
+        0.014385599999999998,
+        0.028771199999999997,
+        0.0503496,
+        0.07552439999999999,
+        0.10429559999999997,
+        0.12947039999999999,
+        0.15104879999999998,
+        0.16903079999999998
+      ],
+      "update": "lambda_t(rho)=-log(1-rho*b_t/q_t)/b_t"
+    }
+  },
+  "default_action": "exact",
+  "fingerprints": {
+    "certificate": "2942e0c6d62b39efab700950a4ba54f7f7a6347f5f4f9bb800dc098aef798bd0",
+    "runtime": "SHA-256 over certificate, request/round, prefix/history, target/draft summaries, route/cache/hidden state, support, score, threshold, q_t, B_t; the certificate separately binds q_min/q_max, the causal cost model, and reset policy"
+  },
+  "initial_plan": {
+    "candidate_count": 60,
+    "expected_saved_ms_per_round": 283.97182194528705,
+    "information_price": 10.0,
+    "mean_audit_probability": 0.17999999999999997,
+    "screening_method": "adaptive_historical_cell_and_window_screen_no_coverage_claim",
+    "screening_risk": 0.023736306538537266,
+    "screening_selected_mass": 3493.2000000000007,
+    "supported_keys": [
+      "s0c0e0d0",
+      "s1c0e0d0",
+      "s2c0e0d0",
+      "s3c0e0d0"
+    ],
+    "threshold": 0.11770541412341556
+  },
+  "random_audit": {
+    "logged_fields": [
+      "request_id",
+      "round_id",
+      "wall_clock",
+      "epoch_id",
+      "causal_context_digest",
+      "prefix_digest",
+      "history_digest",
+      "target_logits_summary_digest",
+      "draft_logits_summary_digest",
+      "route_state_digest",
+      "cache_state_digest",
+      "hidden_summary_digest",
+      "q_t",
+      "q_min",
+      "q_max",
+      "audit_uniform",
+      "audit_indicator",
+      "random_key_id",
+      "random_key_commitment",
+      "random_domain",
+      "severity_bound",
+      "certificate_fingerprint",
+      "runtime_state_fingerprint",
+      "support_key",
+      "proposal_indicator",
+      "score",
+      "threshold",
+      "cost_model_digest",
+      "predicted_fast_gain_ms",
+      "predicted_audit_gain_ms",
+      "predicted_cache_shadow_terms",
+      "realized_fast_ms",
+      "realized_exact_ms",
+      "realized_audit_ms",
+      "label_due_round",
+      "label_arrival_round",
+      "eventual_block_severity",
+      "action_committed",
+      "block_id",
+      "block_width",
+      "first_divergence_row",
+      "fast_shadow_digest",
+      "exact_digest",
+      "pre_state_digest",
+      "post_state_digest",
+      "cache_generation_before",
+      "cache_generation_after",
+      "proposal_loss_upper",
+      "intended_loss_upper",
+      "committed_loss_upper",
+      "fast_commit_count",
+      "pathwise_budget",
+      "reset_reason"
+    ],
+    "order": [
+      "observe causal context and finish optional feature acquisition",
+      "fail to exact before any coin if certificate, support, delay, or prospective pathwise gate is invalid",
+      "freeze a terminal fast proposal, score, threshold, support, B_t, predictable cost forecast, q_t, and both fingerprints",
+      "append the frozen decision tuple before revealing the coin",
+      "draw audit uniform from the independent audit broker",
+      "audit iff uniform < q_t",
+      "audit runs fast in rollback shadow, runs exact, commits exact",
+      "nonaudit commits fast and receives no imputed label"
+    ],
+    "q_max": 0.48,
+    "q_min": 0.18,
+    "rng": {
+      "construction": "uint64(HMAC-SHA256(epoch_secret, domain || request_id || round_id || runtime_state_fingerprint)) / 2^64",
+      "controller_access": "epoch secret and audit uniform hidden until decision freeze",
+      "replay": "precommit key hash and key id; disclose key after epoch closure",
+      "theorem_assumption": "independent Bernoulli coin or standard PRF security"
+    }
+  },
+  "reset": {
+    "action_during_reset": "exact commit with fast shadow for fresh labels",
+    "benchmark_support_reset_streak": 0,
+    "error_allocation": "delta_e = delta / 2^(e+2); old ledgers retained",
+    "evidence_split": "chronological train/design/later empirical stress screen with no coverage claim; accepted deployment coverage starts from fresh future audit e-values",
+    "failure_to_recertify_or_negative_reserve": "exact forever",
+    "monotone_safety_guard": "new score is max(reset score, immutable launch sentinel score), and the reset threshold may not exceed the launch sentinel threshold",
+    "pathwise_reserve": "freeze each closed epoch upper bound; carry only beta0 + epsilon*K_prior - U_prior into the new ledger",
+    "rows": 2400,
+    "triggers": [
+      "predeclared traffic-epoch change point",
+      "optional persistent unsupported support key when that trigger is enabled",
+      "audit label delay exceeds contract",
+      "local anytime intended-risk upper exceeds epsilon",
+      "model or certificate fingerprint changes"
+    ]
+  },
+  "threshold_policy": {
+    "audit_probability": "clip(B*sqrt(information_price/opportunity_cost), q_min, q_max)",
+    "fast_candidate": "current fingerprint valid, score <= frozen threshold, support key enabled, delay contract valid, no reset active, and the prospective pathwise gate passes",
+    "opportunity_cost": "pre-coin predicted fast gain minus predicted audit gain, both including cache shadow value; realized current cost is forbidden",
+    "pathwise_gate": "permit the unaudited branch only when its prospective committed-loss upper endpoint is <= carried_reserve + epsilon*(K+1)"
+  }
+}

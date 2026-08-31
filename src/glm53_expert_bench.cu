@@ -2644,7 +2644,7 @@ cudaError_t nvfp4_gemv2_dp4a_quantized_rows_fixed(
 cudaError_t nvfp4_gemv_dp4a_quantized_rows_packed(
     const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
     const void *workspace, int count, float *y, const int *y_ids,
-    int rows, int cols, int cta_warps, cudaStream_t stream) {
+    int rows, int cols, int cta_warps, bool table_free, cudaStream_t stream) {
     const size_t logical = static_cast<size_t>(rows) * size_t(cols / 16);
     const size_t packed_bytes = logical / 2u;
     if ((cols != 2048 && cols != 4096) || !nvfp4_workspace_bytes(cols) ||
@@ -2658,14 +2658,14 @@ cudaError_t nvfp4_gemv_dp4a_quantized_rows_packed(
         return cudaErrorInvalidValue;
     return launch_nvfp4_packed_fixed_rows_runtime(
         weights, scales, global_scale, workspace, y, y_ids, count,
-        rows, cols, cta_warps, stream);
+        rows, cols, cta_warps, stream, table_free);
 }
 
 cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows_packed(
     const uint8_t *weights, Nvfp4PackedScaleView scales, float global_scale,
     const void *workspace, int count, float *y, const int *y_ids,
     const float *combine, int rows, int cols, int cta_warps,
-    cudaStream_t stream) {
+    bool table_free, cudaStream_t stream) {
     const size_t logical = static_cast<size_t>(rows) * size_t(cols / 16);
     const size_t packed_bytes = logical / 2u;
     if ((cols != 2048 && cols != 4096) || !nvfp4_workspace_bytes(cols) ||
@@ -2680,14 +2680,14 @@ cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows_packed(
         return cudaErrorInvalidValue;
     return launch_nvfp4_packed_acc_fixed_rows_runtime(
         weights, scales, global_scale, workspace, y, y_ids, combine, count,
-        rows, cols, cta_warps, stream);
+        rows, cols, cta_warps, stream, table_free);
 }
 
 cudaError_t nvfp4_gemv2_dp4a_quantized_rows_packed(
     const uint8_t *weights_a, Nvfp4PackedScaleView scales_a, float global_scale_a,
     const uint8_t *weights_b, Nvfp4PackedScaleView scales_b, float global_scale_b,
     const void *workspace, int count, float *y_a, float *y_b, const int *y_ids,
-    int rows, int cols, int cta_warps, cudaStream_t stream) {
+    int rows, int cols, int cta_warps, bool table_free, cudaStream_t stream) {
     const size_t logical = static_cast<size_t>(rows) * size_t(cols / 16);
     const size_t packed_bytes = logical / 2u;
     const auto valid = [&](const Nvfp4PackedScaleView &view) {
@@ -2704,7 +2704,8 @@ cudaError_t nvfp4_gemv2_dp4a_quantized_rows_packed(
         return cudaErrorInvalidValue;
     return launch_nvfp4_packed_pair_fixed_rows_runtime(
         weights_a, scales_a, global_scale_a, weights_b, scales_b, global_scale_b,
-        workspace, y_a, y_b, y_ids, count, rows, cols, cta_warps, stream);
+        workspace, y_a, y_b, y_ids, count, rows, cols, cta_warps, stream,
+        table_free);
 }
 
 #if !defined(INSIGNIA_GLM53_NO_MAIN)
@@ -3699,12 +3700,18 @@ int main(int argc, char **argv) {
     std::array<float, dp_rows> down_store_8w_ms{};
     std::array<float, dp_rows> packed_down_store_4w_ms{};
     std::array<float, dp_rows> packed_down_store_8w_ms{};
+    std::array<float, dp_rows> packed_down_store_tablefree_4w_ms{};
+    std::array<float, dp_rows> packed_down_store_tablefree_8w_ms{};
     std::array<float, dp_rows> packed_down_acc_base_ms{};
     std::array<float, dp_rows> packed_down_acc_4w_ms{};
     std::array<float, dp_rows> packed_down_acc_8w_ms{};
+    std::array<float, dp_rows> packed_down_acc_tablefree_4w_ms{};
+    std::array<float, dp_rows> packed_down_acc_tablefree_8w_ms{};
     std::array<bool, dp_rows> down_store_exact{};
     std::array<bool, dp_rows> packed_down_store_exact{};
     std::array<bool, dp_rows> packed_down_acc_exact{};
+    std::array<bool, dp_rows> packed_down_store_tablefree_exact{};
+    std::array<bool, dp_rows> packed_down_acc_tablefree_exact{};
     for (int count = 1; count <= dp_rows; ++count) {
         cuda_check(insignia::glm53::nvfp4_quantize_activation_rows(
                        d_down_x_rows, down_cols, ids_0_7.data(), count,
@@ -3757,6 +3764,26 @@ int main(int argc, char **argv) {
         }
         packed_down_store_exact[size_t(count - 1)] = store_exact;
 
+        bool store_tablefree_exact = true;
+        for (const int cta_warps : {4, 8}) {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_rows, down_cols, cta_warps, true),
+                       "down-shape packed table-free store");
+            cuda_check(cudaDeviceSynchronize(),
+                       "down-shape packed table-free store completion");
+            std::vector<float> actual(static_cast<size_t>(count) * down_rows);
+            cuda_check(cudaMemcpy(actual.data(), d_rows_dp,
+                                  actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                       "down-shape packed table-free store D2H");
+            store_tablefree_exact = store_tablefree_exact &&
+                std::memcmp(down_store_oracle.data(), actual.data(),
+                            actual.size() * sizeof(float)) == 0;
+        }
+        packed_down_store_tablefree_exact[size_t(count - 1)] =
+            store_tablefree_exact;
+
         cuda_check(cudaMemset(d_rows_reference, 0, row_output_bytes),
                    "clear down-shape accumulate oracle");
         cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
@@ -3792,6 +3819,28 @@ int main(int argc, char **argv) {
         }
         packed_down_acc_exact[size_t(count - 1)] = acc_exact;
 
+        bool acc_tablefree_exact = true;
+        for (const int cta_warps : {4, 8}) {
+            cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                       "clear down-shape packed table-free accumulate");
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_combine.data(), down_rows, down_cols, cta_warps, true),
+                       "down-shape packed table-free accumulate");
+            cuda_check(cudaDeviceSynchronize(),
+                       "down-shape packed table-free accumulate completion");
+            std::vector<float> actual(static_cast<size_t>(count) * down_rows);
+            cuda_check(cudaMemcpy(actual.data(), d_rows_dp,
+                                  actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                       "down-shape packed table-free accumulate D2H");
+            acc_tablefree_exact = acc_tablefree_exact &&
+                std::memcmp(down_acc_oracle.data(), actual.data(),
+                            actual.size() * sizeof(float)) == 0;
+        }
+        packed_down_acc_tablefree_exact[size_t(count - 1)] =
+            acc_tablefree_exact;
+
         constexpr int down_iterations = 500;
         down_store_base_ms[size_t(count - 1)] = benchmark([&] {
             cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows(
@@ -3825,6 +3874,20 @@ int main(int argc, char **argv) {
                            down_rows, down_cols, 8),
                        "timed down-shape packed store 8w");
         }, down_iterations);
+        packed_down_store_tablefree_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_rows, down_cols, 4, true),
+                       "timed down-shape packed table-free store 4w");
+        }, down_iterations);
+        packed_down_store_tablefree_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_rows, down_cols, 8, true),
+                       "timed down-shape packed table-free store 8w");
+        }, down_iterations);
         cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
                    "clear timed down-shape accumulate baseline");
         packed_down_acc_base_ms[size_t(count - 1)] = benchmark([&] {
@@ -3851,6 +3914,24 @@ int main(int argc, char **argv) {
                            d_down_workspace, count, d_rows_dp, ids_0_7.data(),
                            down_combine.data(), down_rows, down_cols, 8),
                        "timed down-shape packed accumulate 8w");
+        }, down_iterations);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear timed down-shape packed table-free accumulate 4w");
+        packed_down_acc_tablefree_4w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_combine.data(), down_rows, down_cols, 4, true),
+                       "timed down-shape packed table-free accumulate 4w");
+        }, down_iterations);
+        cuda_check(cudaMemset(d_rows_dp, 0, row_output_bytes),
+                   "clear timed down-shape packed table-free accumulate 8w");
+        packed_down_acc_tablefree_8w_ms[size_t(count - 1)] = benchmark([&] {
+            cuda_check(insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
+                           d_nvw, packed_scale_view, header.global_scale,
+                           d_down_workspace, count, d_rows_dp, ids_0_7.data(),
+                           down_combine.data(), down_rows, down_cols, 8, true),
+                       "timed down-shape packed table-free accumulate 8w");
         }, down_iterations);
     }
 
@@ -4530,6 +4611,15 @@ int main(int argc, char **argv) {
                     1000.0f * packed_down_acc_4w_ms[i],
                     1000.0f * packed_down_acc_8w_ms[i],
                     packed_down_acc_exact[i] ? "YES" : "NO");
+        std::printf("  B=%d packed_tablefree_store_us cta4=%.3f cta8=%.3f exact=%s "
+                    "packed_tablefree_acc_us cta4=%.3f cta8=%.3f exact=%s\n",
+                    count,
+                    1000.0f * packed_down_store_tablefree_4w_ms[i],
+                    1000.0f * packed_down_store_tablefree_8w_ms[i],
+                    packed_down_store_tablefree_exact[i] ? "YES" : "NO",
+                    1000.0f * packed_down_acc_tablefree_4w_ms[i],
+                    1000.0f * packed_down_acc_tablefree_8w_ms[i],
+                    packed_down_acc_tablefree_exact[i] ? "YES" : "NO");
     }
 
     const auto all_exact = [](const auto &gates) {
@@ -4546,7 +4636,9 @@ int main(int argc, char **argv) {
         all_exact(packed_pair_tablefree_exact) &&
         all_exact(packed_acc_tablefree_exact) &&
         all_exact(down_store_exact) &&
-        all_exact(packed_down_store_exact) && all_exact(packed_down_acc_exact);
+        all_exact(packed_down_store_exact) && all_exact(packed_down_acc_exact) &&
+        all_exact(packed_down_store_tablefree_exact) &&
+        all_exact(packed_down_acc_tablefree_exact);
 
     cudaFree(d_nvw); cudaFree(d_nvs); cudaFree(d_packed_nvs);
     cudaFree(d_packed_escapes); cudaFree(d_packed_codebook); cudaFree(d_packed_prefix);

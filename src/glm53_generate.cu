@@ -670,6 +670,11 @@ public:
         const bool packed_direct_explicit = packed_direct_setting != nullptr;
         if (packed_direct_setting)
             packed_direct_ = std::atoi(packed_direct_setting) != 0;
+        const char *packed_tablefree_setting =
+            std::getenv("INSIGNIA_GLM53_NVFP4_TABLEFREE");
+        const bool packed_tablefree_explicit = packed_tablefree_setting != nullptr;
+        packed_tablefree_ = !packed_tablefree_setting ||
+                            std::atoi(packed_tablefree_setting) != 0;
         // The model has exactly 42 sparse layers (3..44).  The legacy
         // layer-id mapping carved 46 segments and stranded four complete
         // slices.  Keep the corrected dense mapping A/B-gated until the
@@ -734,6 +739,10 @@ public:
             std::printf("packed scale execution: %s%s\n",
                         packed_direct_ ? "direct XPR1-v2" : "expanded E4M3",
                         packed_direct_explicit ? " (explicit)" : " (default)");
+            if (packed_direct_)
+                std::printf("packed E2M1 decode: %s%s\n",
+                            packed_tablefree_ ? "table-free arithmetic" : "shared LUT",
+                            packed_tablefree_explicit ? " (explicit)" : " (default)");
         }
         if (device_packed_scales_)
             require(packed_fd_ >= 0,
@@ -1164,6 +1173,7 @@ public:
     bool packed_direct_active() const {
         return packed_direct_ && active_slot_is_packed();
     }
+    bool packed_tablefree() const { return packed_tablefree_; }
     insignia::glm53::Nvfp4PackedScaleView packed_scale_view(int projection) const {
         require(packed_direct_active() && projection >= 0 && projection < 3,
                 "packed scale view requested outside direct packed execution");
@@ -2449,7 +2459,7 @@ private:
     cudaStream_t copy_stream_ = nullptr;
     bool stop_ = false, packed_gpu_scales_ = false, stripe_required_ = false;
     bool packed_merge_h2d_ = false, packed_kernel_v2_ = false;
-    bool device_packed_scales_ = false, packed_direct_ = false;
+    bool device_packed_scales_ = false, packed_direct_ = false, packed_tablefree_ = true;
     std::array<int, 8> batch_experts_{};
     std::array<bool, 8> batch_cached_{};
     std::array<bool, 8> batch_admit_{};
@@ -4593,7 +4603,8 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
                             expert_stager_->up_packed_scale(),
                             expert_stager_->up_global(slot),
                             nv_workspace_4096_, 1, gate_, up_, &direct_id,
-                            moe_intermediate_, hidden_, 8)
+                            moe_intermediate_, hidden_, 8,
+                            expert_stager_->packed_tablefree())
                       : insignia::glm53::nvfp4_gemv2_dp4a_quantized(
                             expert_stager_->gate_weight(), expert_stager_->gate_scale(),
                             expert_stager_->gate_global(slot), expert_stager_->up_weight(),
@@ -4609,7 +4620,8 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
                                 expert_stager_->down_packed_scale(),
                                 expert_stager_->down_global(slot), nv_workspace_2048_,
                                 1, routed_, &direct_id, &weight, hidden_, moe_intermediate_,
-                                kNvfp4PackedDownAccCtaWarps[1])
+                                kNvfp4PackedDownAccCtaWarps[1],
+                                expert_stager_->packed_tablefree())
                           : insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
                                 expert_stager_->down_weight(), expert_stager_->down_scale(),
                                 expert_stager_->down_global(slot), nv_workspace_2048_,
@@ -5036,7 +5048,8 @@ void Runner::mtp_moe(const float *input, float *output) {
                         expert_stager_->gate_global(slot), expert_stager_->up_weight(),
                         expert_stager_->up_packed_scale(), expert_stager_->up_global(slot),
                         nv_workspace_4096_, 1, gate_, up_, &direct_id,
-                        moe_intermediate_, hidden_, 8)
+                        moe_intermediate_, hidden_, 8,
+                        expert_stager_->packed_tablefree())
                   : insignia::glm53::nvfp4_gemv2_dp4a_quantized(
                         expert_stager_->gate_weight(), expert_stager_->gate_scale(),
                         expert_stager_->gate_global(slot), expert_stager_->up_weight(),
@@ -5051,7 +5064,8 @@ void Runner::mtp_moe(const float *input, float *output) {
                         expert_stager_->down_weight(), expert_stager_->down_packed_scale(),
                         expert_stager_->down_global(slot), nv_workspace_2048_, 1,
                         routed_, &direct_id, &weight, hidden_, moe_intermediate_,
-                        kNvfp4PackedDownAccCtaWarps[1])
+                        kNvfp4PackedDownAccCtaWarps[1],
+                        expert_stager_->packed_tablefree())
                   : insignia::glm53::nvfp4_gemv_dp4a_acc_quantized(
                         expert_stager_->down_weight(), expert_stager_->down_scale(),
                         expert_stager_->down_global(slot), nv_workspace_2048_, routed_,
@@ -6750,7 +6764,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                     expert_stager_->up_packed_scale(),
                                     expert_stager_->up_global(int(slot)),
                                     nv_workspace_4096_, count, c_gateu_.get(), c_up_.get(),
-                                    &users[size_t(base)], moe_intermediate_, hidden_, 8)
+                                    &users[size_t(base)], moe_intermediate_, hidden_, 8,
+                                    expert_stager_->packed_tablefree())
                               : insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
                                     expert_stager_->gate_weight(), expert_stager_->gate_scale(),
                                     expert_stager_->gate_global(int(slot)),
@@ -6770,7 +6785,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         expert_stager_->down_global(int(slot)),
                                         nv_workspace_2048_, count, c_expert_out_.get(),
                                         &out_ids[size_t(base)], hidden_, moe_intermediate_,
-                                        kNvfp4PackedDownStoreCtaWarps[size_t(count)])
+                                        kNvfp4PackedDownStoreCtaWarps[size_t(count)],
+                                        expert_stager_->packed_tablefree())
                                   : nvfp4_fixed_rows_
                                   ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
                                         expert_stager_->down_weight(),
@@ -6794,7 +6810,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         expert_stager_->down_global(int(slot)), nv_workspace_2048_,
                                         count, c_routed_.get(), &users[size_t(base)],
                                         &combine[size_t(base)], hidden_, moe_intermediate_,
-                                        kNvfp4PackedDownAccCtaWarps[size_t(count)])
+                                        kNvfp4PackedDownAccCtaWarps[size_t(count)],
+                                        expert_stager_->packed_tablefree())
                                   : insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows(
                                         expert_stager_->down_weight(), expert_stager_->down_scale(),
                                         expert_stager_->down_global(int(slot)), nv_workspace_2048_,
@@ -7229,7 +7246,8 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
                                         expert_stager_->up_global(slot),
                                         nv_workspace_4096_, count, c_gateu_.get(),
                                         c_up_.get(), local_ids.data(),
-                                        moe_intermediate_, hidden_, 8)
+                                        moe_intermediate_, hidden_, 8,
+                                        expert_stager_->packed_tablefree())
                                   : insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows(
                                         expert_stager_->gate_weight(),
                                         expert_stager_->gate_scale(),
@@ -7254,7 +7272,8 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
                                         whole_expert_out.get(),
                                         whole_out_ids.data() + base_user,
                                         hidden_, moe_intermediate_,
-                                        kNvfp4PackedDownStoreCtaWarps[size_t(count)])
+                                        kNvfp4PackedDownStoreCtaWarps[size_t(count)],
+                                        expert_stager_->packed_tablefree())
                                   : nvfp4_fixed_rows_
                                   ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_fixed(
                                         expert_stager_->down_weight(),

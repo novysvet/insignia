@@ -268,6 +268,7 @@ cudaError_t nvfp4_gemv_dp4a_quantized_rows_packed(
     int rows,
     int cols,
     int cta_warps,
+    bool table_free = false,
     cudaStream_t stream = nullptr);
 cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows_packed(
     const uint8_t *weights,
@@ -281,6 +282,7 @@ cudaError_t nvfp4_gemv_dp4a_acc_quantized_rows_packed(
     int rows,
     int cols,
     int cta_warps,
+    bool table_free = false,
     cudaStream_t stream = nullptr);
 cudaError_t nvfp4_gemv2_dp4a_quantized_rows_packed(
     const uint8_t *weights_a,
@@ -297,6 +299,7 @@ cudaError_t nvfp4_gemv2_dp4a_quantized_rows_packed(
     int rows,
     int cols,
     int cta_warps,
+    bool table_free = false,
     cudaStream_t stream = nullptr);
 
 // GLM-5.3's dimensions are part of the ABI: 4 residual streams are baked into

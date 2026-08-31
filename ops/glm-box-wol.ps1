@@ -68,8 +68,11 @@ function Send-WakePacket([string]$TargetMac, [string]$TargetBroadcast) {
 function Enable-TailscaleUnattended {
     $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
     if (-not (Test-Path $tailscale)) { throw "Tailscale is not installed." }
-    & $tailscale up --unattended=true
-    if ($LASTEXITCODE) { throw "tailscale up failed with status $LASTEXITCODE" }
+    # `tailscale up` requires every existing non-default preference to be
+    # repeated. `set` changes only unattended mode, preserving exit-node and
+    # route-advertisement settings already configured on this machine.
+    & $tailscale set --unattended=true
+    if ($LASTEXITCODE) { throw "tailscale set failed with status $LASTEXITCODE" }
 }
 
 function Merge-AdministratorSshKeys([string]$UserName) {

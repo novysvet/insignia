@@ -30,11 +30,32 @@ MODEL_ROOT = os.environ.get("INSIGNIA_WEB_MODEL_ROOT", "/var/lib/insignia/glm53-
 MODEL_INDEX = os.environ.get("INSIGNIA_WEB_MODEL_INDEX", "/var/lib/insignia/glm53-flash-text.index")
 FP8_PREFIX = os.environ.get("INSIGNIA_WEB_FP8_PREFIX", "/var/lib/insignia/glm53-fp8-g64")
 MAX_TOKENS = int(os.environ.get("INSIGNIA_WEB_MAX_TOKENS", "512"))
+SPEED_PROFILE = os.environ.get("INSIGNIA_WEB_SPEED_PROFILE", "top6-cache").lower()
 TOKENIZER = Tokenizer.from_file(TOKENIZER_PATH)
 ENGINE_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 STATE: dict[str, Any] = {"busy": False, "started_at": None, "request_id": None}
 EOS_IDS = {value for value in (TOKENIZER.token_to_id("<|im_end|>"), 151643) if value is not None}
+
+
+def engine_assignments(profile: str, cache_mb: str | None = None) -> list[str]:
+    assignments = [
+        "INSIGNIA_GLM53_DFLASH2=1",
+        "INSIGNIA_GLM53_DFLASH2_FP8=/var/lib/insignia/glm53-dflash2-fp8-fixed",
+        f"INSIGNIA_GLM53_READERS={os.environ.get('INSIGNIA_WEB_READERS', '4')}",
+    ]
+    if profile == "top6-cache":
+        assignments += [
+            "INSIGNIA_GLM53_DF_APPROX_TOPM=6",
+            "INSIGNIA_GLM53_DF_CACHE_ROUTE_K=32",
+            "INSIGNIA_GLM53_DF_CACHE_ROUTE_REGRET=.0010",
+            "INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8",
+        ]
+    elif profile != "exact":
+        raise ValueError("INSIGNIA_WEB_SPEED_PROFILE must be 'top6-cache' or 'exact'")
+    if cache_mb:
+        assignments.append(f"INSIGNIA_GLM53_EXPERT_CACHE_MB={int(cache_mb)}")
+    return assignments
 
 
 def message_text(content: Any) -> str:
@@ -97,10 +118,7 @@ def run_engine(prompt: str, max_tokens: int, request_id: str) -> tuple[str, list
         raise ValueError("prompt plus max_tokens exceeds the current 8192-token engine context")
     command = [
         "wsl.exe", "-d", "Arch", "--", "env",
-        "INSIGNIA_GLM53_DFLASH2=1",
-        "INSIGNIA_GLM53_DFLASH2_FP8=/var/lib/insignia/glm53-dflash2-fp8-fixed",
-        "INSIGNIA_GLM53_EXPERT_CACHE_MB=5120",
-        "INSIGNIA_GLM53_READERS=4",
+        *engine_assignments(SPEED_PROFILE, os.environ.get("INSIGNIA_WEB_EXPERT_CACHE_MB")),
         ENGINE, MODEL_ROOT, MODEL_INDEX, ",".join(map(str, prompt_ids)), "0",
         str(max_tokens), FP8_PREFIX,
     ]
@@ -121,6 +139,7 @@ def run_engine(prompt: str, max_tokens: int, request_id: str) -> tuple[str, list
     ids, timing = parse_engine_output(completed.stdout)
     timing["prompt_tokens"] = len(prompt_ids)
     timing["completion_tokens"] = len(ids)
+    timing["speed_profile"] = SPEED_PROFILE
     return TOKENIZER.decode(ids, skip_special_tokens=True), ids, timing
 
 
@@ -304,6 +323,13 @@ def self_test() -> None:
     assert prompt == "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>2+2?<|assistant|><think>"
     ids, timing = parse_engine_output("greedy IDs 12 13 151643 99\n9-token prompt 1.250 s; 4 greedy tokens in 2 DFLASH2-k4 rounds (2.00 accepted/round, 100.0 ms/token;)\n")
     assert ids == [12, 13] and timing["prefill_seconds"] == 1.25 and timing["decode_ms_per_token"] == 100.0
+    fast = engine_assignments("top6-cache")
+    assert "INSIGNIA_GLM53_DF_APPROX_TOPM=6" in fast
+    assert "INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS=8" in fast
+    assert not any(value.startswith("INSIGNIA_GLM53_EXPERT_CACHE_MB=") for value in fast)
+    exact = engine_assignments("exact", "32768")
+    assert "INSIGNIA_GLM53_DF_APPROX_TOPM=6" not in exact
+    assert "INSIGNIA_GLM53_EXPERT_CACHE_MB=32768" in exact
     print("web API self-test passed")
 
 

@@ -269,6 +269,8 @@ int main(int argc, char **argv) {
     const int out_ids[kTokens] = {3, 7, 1, 6, 0, 5, 2, 4};
     const int linear_ids[kTokens] = {0, 1, 2, 3, 4, 5, 6, 7};
     bool failed = false;
+    check(insignia::glm53::iq3_xxs_prepare_sign_candidates(),
+          "prepare IQ3 sign candidates");
 
     for (MatrixFixture *fixture : {&gate, &down}) {
         for (int count = 1; count <= kTokens; ++count) {
@@ -369,6 +371,59 @@ int main(int argc, char **argv) {
                       pair_up_metrics.relative > 2.0e-2 ||
                       pair_up_metrics.cosine < 0.99980;
         }
+    }
+
+    check(insignia::glm53::iq_quantize_activation_rows(
+              gate.x_device, gate.cols, row_ids, 1, gate.workspace),
+          "prepare IQ3 sign-circuit correctness");
+    check(insignia::glm53::iq3_xxs_gemv2_wim32_rows(
+              gate_wim32_device, up_wim32_device, gate.workspace, 1,
+              gate.output_device, up_output_device, out_ids,
+              gate.rows, gate.cols),
+          "IQ3 sign-circuit baseline");
+    check(cudaDeviceSynchronize(), "IQ3 sign-circuit baseline synchronize");
+    std::vector<float> sign_baseline_gate(size_t(kTokens) * gate.rows);
+    std::vector<float> sign_baseline_up(size_t(kTokens) * gate.rows);
+    check(cudaMemcpy(sign_baseline_gate.data(), gate.output_device,
+                     sign_baseline_gate.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy IQ3 sign baseline gate");
+    check(cudaMemcpy(sign_baseline_up.data(), up_output_device,
+                     sign_baseline_up.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy IQ3 sign baseline up");
+    for (int sign_mode = 1; sign_mode <= 3; ++sign_mode) {
+        check(insignia::glm53::iq3_xxs_gemv2_wim32_sign_x1(
+                  gate_wim32_device, up_wim32_device, gate.workspace,
+                  gate.output_device, up_output_device, out_ids[0],
+                  gate.rows, gate.cols, sign_mode),
+              "IQ3 sign-circuit candidate");
+        check(cudaDeviceSynchronize(), "IQ3 sign candidate synchronize");
+        std::vector<float> candidate_gate(size_t(kTokens) * gate.rows);
+        std::vector<float> candidate_up(size_t(kTokens) * gate.rows);
+        check(cudaMemcpy(candidate_gate.data(), gate.output_device,
+                         candidate_gate.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy IQ3 sign candidate gate");
+        check(cudaMemcpy(candidate_up.data(), up_output_device,
+                         candidate_up.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy IQ3 sign candidate up");
+        const Metrics candidate_gate_metrics = compare(
+            gather(candidate_gate, out_ids, 1, gate.rows),
+            gather(sign_baseline_gate, out_ids, 1, gate.rows));
+        const Metrics candidate_up_metrics = compare(
+            gather(candidate_up, out_ids, 1, gate.rows),
+            gather(sign_baseline_up, out_ids, 1, gate.rows));
+        char gate_label[64], up_label[64];
+        std::snprintf(gate_label, sizeof(gate_label),
+                      "IQ3 sign%d gate exact", sign_mode);
+        std::snprintf(up_label, sizeof(up_label),
+                      "IQ3 sign%d up exact", sign_mode);
+        print_metrics(gate_label, candidate_gate_metrics);
+        print_metrics(up_label, candidate_up_metrics);
+        failed |= candidate_gate_metrics.maximum != 0.0 ||
+                  candidate_up_metrics.maximum != 0.0;
     }
 
     check(insignia::glm53::iq3_xxs_gemm_prefill32(
@@ -543,12 +598,34 @@ int main(int argc, char **argv) {
         const float gate_up_pair_x1_us = benchmark_us(launch_gate_up_pair_x1);
         const float gate_up_pair_wim32_x1_us =
             benchmark_us(launch_gate_up_pair_wim32_x1);
+        float gate_up_sign_x1_us[3]{};
+        for (int sign_mode = 1; sign_mode <= 3; ++sign_mode) {
+            const auto launch_sign_candidate = [&] {
+                check(insignia::glm53::iq3_xxs_gemv2_wim32_sign_x1(
+                          gate_wim32_device, up_wim32_device,
+                          gate.workspace, gate.output_device,
+                          up_output_device, out_ids[0], gate.rows,
+                          gate.cols, sign_mode),
+                      "timed IQ3 sign candidate");
+            };
+            gate_up_sign_x1_us[sign_mode - 1] =
+                benchmark_us(launch_sign_candidate);
+        }
         std::printf("IQ3 gate+up x1 sequential/pair repacked %8.3f/%8.3f us %.3fx\n",
                     gate_up_x1_us, gate_up_pair_x1_us,
                     gate_up_x1_us / gate_up_pair_x1_us);
         std::printf("IQ3 gate+up x1 pair repacked/WIM32 %8.3f/%8.3f us %.3fx\n",
                     gate_up_pair_x1_us, gate_up_pair_wim32_x1_us,
                     gate_up_pair_x1_us / gate_up_pair_wim32_x1_us);
+        std::printf("IQ3 gate+up x1 WIM32/sign1/sign2/sign3 "
+                    "%8.3f/%8.3f/%8.3f/%8.3f us speedups "
+                    "%.3fx/%.3fx/%.3fx\n",
+                    gate_up_pair_wim32_x1_us,
+                    gate_up_sign_x1_us[0], gate_up_sign_x1_us[1],
+                    gate_up_sign_x1_us[2],
+                    gate_up_pair_wim32_x1_us / gate_up_sign_x1_us[0],
+                    gate_up_pair_wim32_x1_us / gate_up_sign_x1_us[1],
+                    gate_up_pair_wim32_x1_us / gate_up_sign_x1_us[2]);
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "restore x8 gate benchmark workspace");

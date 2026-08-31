@@ -154,6 +154,25 @@ cudaError_t iq3_xxs_gemv2_wim32_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Exact x1 sign-circuit A/B arms for the WIM32 fused pair.  Modes are:
+// 1 = multiply/PRMT carrier masks + packed subtract;
+// 2 = carrier masks + packed negate/select;
+// 3 = carrier masks + negative 1 KiB codebook + two LOP3 instructions.
+// Mode 3 requires prepare_sign_candidates once on the same stream.
+cudaError_t iq3_xxs_prepare_sign_candidates(cudaStream_t stream = nullptr);
+
+cudaError_t iq3_xxs_gemv2_wim32_sign_x1(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const void *workspace,
+    float *gate_y,
+    float *up_y,
+    int y_id,
+    int rows,
+    int cols,
+    int sign_mode,
+    cudaStream_t stream = nullptr);
+
 // IQ4_XS uses a nonlinear 16-entry nibble codebook and eight signed scales per
 // 256 values.  The same warp/block map is used so exception layers can be
 // dispatched without a generic matrix engine.

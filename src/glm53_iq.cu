@@ -222,8 +222,8 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_rows_kernel(
             : load_u32_any(auxiliary);
         const int activation_group = block_id * 8 + subgroup;
         const float weight_scale = d * (0.25f + 0.5f * float(aux >> 28));
-        if constexpr (R <= 2) {
-            // The scalar/small-block decode path is occupancy-sensitive on Ada.
+        if constexpr (R == 2) {
+            // The two-row decode path is occupancy-sensitive on Ada.
             // Consume each signed codebook pair immediately so the compiler
             // keeps two decoded words instead of the whole eight-word block.
             // DP4A order within every row is unchanged.

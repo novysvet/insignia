@@ -154,6 +154,27 @@ cudaError_t iq3_xxs_gemv2_wim32_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// WIM64 is the decode-specialized sibling of WIM32.  Each lane's two index
+// words are adjacent and consumed by one aligned 64-bit load; the auxiliary
+// plane remains a coalesced 32-bit warp field.  Only the latency-critical x1
+// fused gate/up path is instantiated until measurements justify more variants.
+void iq3_xxs_repack_wim64_cpu(
+    const uint8_t *source,
+    uint8_t *destination,
+    int rows,
+    int cols);
+
+cudaError_t iq3_xxs_gemv2_wim64_x1(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const void *workspace,
+    float *gate_y,
+    float *up_y,
+    int y_id,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // IQ4_XS uses a nonlinear 16-entry nibble codebook and eight signed scales per
 // 256 values.  The same warp/block map is used so exception layers can be
 // dispatched without a generic matrix engine.

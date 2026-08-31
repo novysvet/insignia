@@ -520,12 +520,16 @@ __global__ __launch_bounds__(128, 4) void iq3_xxs_wmma32_kernel(
                 side ? 0x80402010u : 0x08040201u);
             const float scale = __half2float(block.d) *
                                 (0.25f + 0.5f * float(auxiliary >> 28));
-#pragma unroll
-            for (int byte = 0; byte < 4; ++byte) {
-                const int8_t value = int8_t(decoded >> (8 * byte));
-                shared_a[local_row * 32 + 4 * local_code + byte] =
-                    __float2half_rn(float(value) * scale);
-            }
+            const int8_t value0 = int8_t(decoded);
+            const int8_t value1 = int8_t(decoded >> 8);
+            const int8_t value2 = int8_t(decoded >> 16);
+            const int8_t value3 = int8_t(decoded >> 24);
+            auto *destination = reinterpret_cast<__half2 *>(
+                shared_a + local_row * 32 + 4 * local_code);
+            destination[0] = __floats2half2_rn(float(value0) * scale,
+                                               float(value1) * scale);
+            destination[1] = __floats2half2_rn(float(value2) * scale,
+                                               float(value3) * scale);
         }
 
         // The input tile is stored exactly in the col-major layout expected by
@@ -591,15 +595,24 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
         const int2 decoded8 = iq4_lookup8(__ldcs(
             reinterpret_cast<const uint32_t *>(block.qs + 16 * subgroup) +
             local_word));
-#pragma unroll
-        for (int byte = 0; byte < 4; ++byte) {
-            const int8_t low_value = int8_t(uint32_t(decoded8.x) >> (8 * byte));
-            const int8_t high_value = int8_t(uint32_t(decoded8.y) >> (8 * byte));
-            shared_a[local_row * 32 + 4 * local_word + byte] =
-                __float2half_rn(float(low_value) * scale);
-            shared_a[local_row * 32 + 16 + 4 * local_word + byte] =
-                __float2half_rn(float(high_value) * scale);
-        }
+        const uint32_t low_decoded = uint32_t(decoded8.x);
+        const uint32_t high_decoded = uint32_t(decoded8.y);
+        auto *low_destination = reinterpret_cast<__half2 *>(
+            shared_a + local_row * 32 + 4 * local_word);
+        auto *high_destination = reinterpret_cast<__half2 *>(
+            shared_a + local_row * 32 + 16 + 4 * local_word);
+        low_destination[0] = __floats2half2_rn(
+            float(int8_t(low_decoded)) * scale,
+            float(int8_t(low_decoded >> 8)) * scale);
+        low_destination[1] = __floats2half2_rn(
+            float(int8_t(low_decoded >> 16)) * scale,
+            float(int8_t(low_decoded >> 24)) * scale);
+        high_destination[0] = __floats2half2_rn(
+            float(int8_t(high_decoded)) * scale,
+            float(int8_t(high_decoded >> 8)) * scale);
+        high_destination[1] = __floats2half2_rn(
+            float(int8_t(high_decoded >> 16)) * scale,
+            float(int8_t(high_decoded >> 24)) * scale);
 #pragma unroll
         for (int item = thread; item < 32 * 32; item += 64) {
             const int local_token = item >> 5;
@@ -657,12 +670,16 @@ __global__ __launch_bounds__(128, 4) void q6_k_wmma32_kernel(
             __half2float(block.d) * float(block.scales[scale_index]);
         const uint32_t decoded =
             decode_q6_word(block, half, quadrant, local_word);
-#pragma unroll
-        for (int byte = 0; byte < 4; ++byte) {
-            const int8_t value = int8_t(decoded >> (8 * byte));
-            shared_a[local_row * 32 + 4 * local_word + byte] =
-                __float2half_rn(float(value) * scale);
-        }
+        const int8_t value0 = int8_t(decoded);
+        const int8_t value1 = int8_t(decoded >> 8);
+        const int8_t value2 = int8_t(decoded >> 16);
+        const int8_t value3 = int8_t(decoded >> 24);
+        auto *destination = reinterpret_cast<__half2 *>(
+            shared_a + local_row * 32 + 4 * local_word);
+        destination[0] = __floats2half2_rn(float(value0) * scale,
+                                           float(value1) * scale);
+        destination[1] = __floats2half2_rn(float(value2) * scale,
+                                           float(value3) * scale);
 #pragma unroll
         for (int item = thread; item < 32 * 32; item += 128) {
             const int local_token = item >> 5;

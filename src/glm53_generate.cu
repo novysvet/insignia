@@ -66,6 +66,33 @@ constexpr std::array<int, 9> kNvfp4PackedDownAccCtaWarps{0, 4, 4, 8, 8, 4, 4, 4,
 // 4 warps wins B=5 by ~18% and B=8 by ~6-8%.  This branch targets that box.
 constexpr std::array<int, 9> kNvfp4PackedPairCtaWarps{0, 8, 8, 8, 8, 4, 8, 8, 4};
 
+struct ExpertMask288 {
+    std::array<uint64_t, 5> word{};
+    inline void add(int expert) {
+        word[size_t(expert) >> 6] |= uint64_t(1) << (expert & 63);
+    }
+    inline void merge(const ExpertMask288 &other) {
+#pragma unroll
+        for (int index = 0; index < 5; ++index)
+            word[size_t(index)] |= other.word[size_t(index)];
+    }
+};
+
+inline int expert_mask_count(const ExpertMask288 &mask) {
+    return int(_mm_popcnt_u64(mask.word[0])) + int(_mm_popcnt_u64(mask.word[1])) +
+           int(_mm_popcnt_u64(mask.word[2])) + int(_mm_popcnt_u64(mask.word[3])) +
+           int(_mm_popcnt_u64(mask.word[4]));
+}
+
+inline int expert_mask_intersection_count(const ExpertMask288 &left,
+                                          const ExpertMask288 &right) {
+    return int(_mm_popcnt_u64(left.word[0] & right.word[0])) +
+           int(_mm_popcnt_u64(left.word[1] & right.word[1])) +
+           int(_mm_popcnt_u64(left.word[2] & right.word[2])) +
+           int(_mm_popcnt_u64(left.word[3] & right.word[3])) +
+           int(_mm_popcnt_u64(left.word[4] & right.word[4]));
+}
+
 void check(cudaError_t status, const char *what) {
     if (status != cudaSuccess)
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -2972,6 +2999,14 @@ public:
             if (const char *joint =
                     std::getenv("INSIGNIA_GLM53_DF_CACHE_JOINT_OPTIONS"))
                 df_cache_joint_options_ = std::atoi(joint);
+            if (const char *mask =
+                    std::getenv("INSIGNIA_GLM53_DF_CACHE_MASK_SEARCH"))
+                df_cache_mask_search_ = std::atoi(mask) != 0;
+            if (const char *verify =
+                    std::getenv("INSIGNIA_GLM53_DF_CACHE_MASK_VERIFY"))
+                df_cache_mask_verify_ = std::atoi(verify) != 0;
+            require(!df_cache_mask_verify_ || df_cache_mask_search_,
+                    "cache mask verification requires cache mask search");
             if (const char *guard_retain =
                     std::getenv("INSIGNIA_GLM53_DF_CACHE_GUARD_RETAIN"))
                 df_cache_guard_retain_ = std::atoi(guard_retain);
@@ -2988,8 +3023,10 @@ public:
                             "from top-%d\n",
                             df_cache_route_retain_, df_approx_topm_, df_cache_route_k_);
             if (df_cache_joint_options_)
-                std::printf("DFlash2 joint cache route: %d actions/row, exact union search up to k4\n",
-                            df_cache_joint_options_);
+                std::printf("DFlash2 joint cache route: %d actions/row, exact union search "
+                            "up to k4 (%s)\n", df_cache_joint_options_,
+                            df_cache_mask_search_ ? "adaptive Raptor Lake 288-bit POPCNT" :
+                                                   "byte-array rollback");
             if (df_cache_guard_retain_ != 8)
                 std::printf("DFlash2 cache guard fallback: retain %d\n",
                             df_cache_guard_retain_);
@@ -3512,6 +3549,18 @@ public:
                       const char *dump_path);
     // MTP speculative decoding surface.
     int mtp_k() const { return mtp_draft_total_; }
+    void report_cache_selector() const {
+        if (!df_cache_selector_calls_) return;
+        std::printf("  DFlash cache selector %.3f ms total / %.3f us per layer group "
+                    "across %llu calls (%llu POPCNT / %llu byte%s)\n",
+                    1.0e3 * df_cache_selector_seconds_,
+                    1.0e6 * df_cache_selector_seconds_ / df_cache_selector_calls_,
+                    (unsigned long long)df_cache_selector_calls_,
+                    (unsigned long long)df_cache_selector_mask_calls_,
+                    (unsigned long long)(df_cache_selector_calls_ -
+                                         df_cache_selector_mask_calls_),
+                    df_cache_mask_verify_ ? ", shadow-verified" : "");
+    }
     const float *last_avg() const { return last_avg_.get(); }
     const float *chain_root_hidden() const {
         return (mtp_variant_ == 1 ? last_normed_ : last_avg_).get();
@@ -3742,6 +3791,7 @@ private:
     int df_cache_route_k_ = 0, df_cache_route_retain_ = 7;
     int df_cache_guard_retain_ = 8;
     int df_cache_joint_options_ = 0;
+    bool df_cache_mask_search_ = true, df_cache_mask_verify_ = false;
     float df_cache_route_regret_ = 0.0025f;
     uint64_t df_cache_route_rows_ = 0, df_cache_route_changed_ = 0;
     uint64_t df_cache_route_substitutions_ = 0;
@@ -3750,6 +3800,9 @@ private:
     uint64_t df_cache_joint_groups_ = 0, df_cache_joint_baseline_union_ = 0;
     uint64_t df_cache_joint_selected_union_ = 0;
     int64_t df_cache_joint_disk_saved_ = 0, df_cache_joint_h2d_saved_ = 0;
+    uint64_t df_cache_selector_calls_ = 0;
+    uint64_t df_cache_selector_mask_calls_ = 0;
+    double df_cache_selector_seconds_ = 0.0;
     float df_logit_guard_margin_ = 0.0f;
     bool df_logit_guard_prefix_ = true;
     float df_calibration_guard_js_ = 0.0f;
@@ -6005,6 +6058,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
     // bounded tail substitution rather than a hidden renormalization.
     if (approximate_pass && df_approx_topm_ && df_cache_route_k_ &&
         df_cache_route_regret_ > 0.0f) {
+        const auto selector_started = std::chrono::steady_clock::now();
+        const bool mask_search = df_cache_mask_search_ && df_cache_joint_options_ &&
+            tokens >= 2 && tokens <= 4;
         struct PrunedCacheChoice {
             int expert = -1;
             double regret = 0.0, ratio = 0.0;
@@ -6135,6 +6191,28 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         // prefill chunk. Keep one action per actual row; a fixed-eight array
         // here corrupted the stack as soon as prefill widened the caller.
         std::vector<int> chosen(size_t(tokens), 0);
+        std::array<std::array<ExpertMask288, 8>, 4> option_masks{};
+        ExpertMask288 disk_mask, h2d_mask;
+        if (mask_search) {
+            for (int expert = 0; expert < 288; ++expert) {
+                if (union_disk[size_t(expert)] > 0) disk_mask.add(expert);
+                if (union_h2d[size_t(expert)] > 0) h2d_mask.add(expert);
+            }
+            for (int token = 0; token < tokens; ++token) {
+                ExpertMask288 prefix;
+                const auto &baseline = baseline_experts[size_t(token)];
+                const int prefix_count = guarded[size_t(token)]
+                    ? guarded_exec_k[size_t(token)] : retained;
+                for (int slot = 0; slot < prefix_count; ++slot)
+                    prefix.add(baseline[size_t(slot)]);
+                for (int option = 0; option < int(options[size_t(token)].size()); ++option) {
+                    option_masks[size_t(token)][size_t(option)] = prefix;
+                    if (!guarded[size_t(token)])
+                        option_masks[size_t(token)][size_t(option)].add(
+                            options[size_t(token)][size_t(option)].expert);
+                }
+            }
+        }
         if (df_cache_joint_options_ && tokens <= 4) {
             std::array<int, 8> trial{};
             int best_disk = std::numeric_limits<int>::max();
@@ -6149,30 +6227,76 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     }
                     return;
                 }
-                std::array<uint8_t, 288> seen{};
                 int disk = 0, h2d = 0, union_count = 0;
                 double regret = 0.0;
-                auto add = [&](int expert) {
-                    if (seen[size_t(expert)]) return;
-                    seen[size_t(expert)] = 1;
-                    ++union_count;
-                    require(union_disk[size_t(expert)] >= 0,
-                            "pruned joint union contains an unranked expert");
-                    disk += union_disk[size_t(expert)];
-                    h2d += union_h2d[size_t(expert)];
-                };
-                for (int token = 0; token < tokens; ++token) {
-                    const auto &baseline = baseline_experts[size_t(token)];
-                    if (guarded[size_t(token)]) {
-                        for (int slot = 0; slot < guarded_exec_k[size_t(token)]; ++slot)
-                            add(baseline[size_t(slot)]);
-                    } else {
-                        for (int slot = 0; slot < retained; ++slot)
-                            add(baseline[size_t(slot)]);
-                        const PrunedCacheChoice &action =
-                            options[size_t(token)][size_t(trial[size_t(token)])];
-                        add(action.expert);
-                        regret += action.regret;
+                if (mask_search) {
+                    ExpertMask288 union_mask;
+                    for (int token = 0; token < tokens; ++token) {
+                        union_mask.merge(option_masks[size_t(token)]
+                                                     [size_t(trial[size_t(token)])]);
+                        if (!guarded[size_t(token)])
+                            regret += options[size_t(token)]
+                                             [size_t(trial[size_t(token)])].regret;
+                    }
+                    union_count = expert_mask_count(union_mask);
+                    disk = expert_mask_intersection_count(union_mask, disk_mask);
+                    h2d = expert_mask_intersection_count(union_mask, h2d_mask);
+                    if (df_cache_mask_verify_) {
+                        std::array<uint8_t, 288> seen{};
+                        int ref_disk = 0, ref_h2d = 0, ref_union = 0;
+                        double ref_regret = 0.0;
+                        auto add = [&](int expert) {
+                            if (seen[size_t(expert)]) return;
+                            seen[size_t(expert)] = 1;
+                            ++ref_union;
+                            require(union_disk[size_t(expert)] >= 0,
+                                    "pruned shadow union contains an unranked expert");
+                            ref_disk += union_disk[size_t(expert)];
+                            ref_h2d += union_h2d[size_t(expert)];
+                        };
+                        for (int token = 0; token < tokens; ++token) {
+                            const auto &baseline = baseline_experts[size_t(token)];
+                            if (guarded[size_t(token)]) {
+                                for (int slot = 0;
+                                     slot < guarded_exec_k[size_t(token)]; ++slot)
+                                    add(baseline[size_t(slot)]);
+                            } else {
+                                for (int slot = 0; slot < retained; ++slot)
+                                    add(baseline[size_t(slot)]);
+                                const auto &action = options[size_t(token)]
+                                    [size_t(trial[size_t(token)])];
+                                add(action.expert);
+                                ref_regret += action.regret;
+                            }
+                        }
+                        require(ref_disk == disk && ref_h2d == h2d &&
+                                    ref_union == union_count && ref_regret == regret,
+                                "POPCNT pruned cache objective disagrees with byte shadow");
+                    }
+                } else {
+                    std::array<uint8_t, 288> seen{};
+                    auto add = [&](int expert) {
+                        if (seen[size_t(expert)]) return;
+                        seen[size_t(expert)] = 1;
+                        ++union_count;
+                        require(union_disk[size_t(expert)] >= 0,
+                                "pruned joint union contains an unranked expert");
+                        disk += union_disk[size_t(expert)];
+                        h2d += union_h2d[size_t(expert)];
+                    };
+                    for (int token = 0; token < tokens; ++token) {
+                        const auto &baseline = baseline_experts[size_t(token)];
+                        if (guarded[size_t(token)]) {
+                            for (int slot = 0; slot < guarded_exec_k[size_t(token)]; ++slot)
+                                add(baseline[size_t(slot)]);
+                        } else {
+                            for (int slot = 0; slot < retained; ++slot)
+                                add(baseline[size_t(slot)]);
+                            const PrunedCacheChoice &action =
+                                options[size_t(token)][size_t(trial[size_t(token)])];
+                            add(action.expert);
+                            regret += action.regret;
+                        }
                     }
                 }
                 const bool better = disk < best_disk ||
@@ -6254,9 +6378,15 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_cache_route_disk_saved_ += baseline_action->disk - action.disk;
             df_cache_route_h2d_saved_ += baseline_action->h2d - action.h2d;
         }
+        df_cache_selector_seconds_ += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - selector_started).count();
+        ++df_cache_selector_calls_;
+        df_cache_selector_mask_calls_ += mask_search;
     }
     if (approximate_pass && !df_approx_topm_ && df_cache_joint_options_ &&
         df_cache_route_regret_ > 0.0f) {
+        const auto selector_started = std::chrono::steady_clock::now();
+        const bool mask_search = df_cache_mask_search_ && tokens >= 2 && tokens <= 4;
         struct CacheChoice {
             std::array<int, 8> experts{};
             double regret = 0.0, ratio = 0.0;
@@ -6374,6 +6504,18 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         }
 
         std::vector<int> chosen(size_t(tokens), 0);
+        std::array<std::array<ExpertMask288, 8>, 4> option_masks{};
+        ExpertMask288 disk_mask, h2d_mask;
+        if (mask_search) {
+            for (int expert = 0; expert < 288; ++expert) {
+                if (union_disk[size_t(expert)] > 0) disk_mask.add(expert);
+                if (union_h2d[size_t(expert)] > 0) h2d_mask.add(expert);
+            }
+            for (int token = 0; token < tokens; ++token)
+                for (int option = 0; option < int(options[size_t(token)].size()); ++option)
+                    for (int expert : options[size_t(token)][size_t(option)].experts)
+                        option_masks[size_t(token)][size_t(option)].add(expert);
+        }
         if (tokens <= 4) {
             std::array<int, 8> trial{};
             int best_disk = std::numeric_limits<int>::max();
@@ -6387,22 +6529,62 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                     }
                     return;
                 }
-                std::array<uint8_t, 288> seen{};
                 int disk = 0, h2d = 0, union_count = 0, substitutions = 0;
                 double regret = 0.0;
-                for (int token = 0; token < tokens; ++token) {
-                    const CacheChoice &action =
-                        options[size_t(token)][size_t(trial[size_t(token)])];
-                    regret += action.regret;
-                    substitutions += action.substitutions;
-                    for (int expert : action.experts)
-                        if (!seen[size_t(expert)]) {
-                            seen[size_t(expert)] = 1;
-                            ++union_count;
-                            require(union_disk[size_t(expert)] >= 0,
-                                    "joint cache union contains an unranked expert");
-                            disk += union_disk[size_t(expert)];
-                            h2d += union_h2d[size_t(expert)];
+                if (mask_search) {
+                    ExpertMask288 union_mask;
+                    for (int token = 0; token < tokens; ++token) {
+                        const int option = trial[size_t(token)];
+                        const CacheChoice &action =
+                            options[size_t(token)][size_t(option)];
+                        union_mask.merge(option_masks[size_t(token)][size_t(option)]);
+                        regret += action.regret;
+                        substitutions += action.substitutions;
+                    }
+                    union_count = expert_mask_count(union_mask);
+                    disk = expert_mask_intersection_count(union_mask, disk_mask);
+                    h2d = expert_mask_intersection_count(union_mask, h2d_mask);
+                    if (df_cache_mask_verify_) {
+                        std::array<uint8_t, 288> seen{};
+                        int ref_disk = 0, ref_h2d = 0, ref_union = 0;
+                        int ref_substitutions = 0;
+                        double ref_regret = 0.0;
+                        for (int token = 0; token < tokens; ++token) {
+                            const CacheChoice &action = options[size_t(token)]
+                                [size_t(trial[size_t(token)])];
+                            ref_regret += action.regret;
+                            ref_substitutions += action.substitutions;
+                            for (int expert : action.experts)
+                                if (!seen[size_t(expert)]) {
+                                    seen[size_t(expert)] = 1;
+                                    ++ref_union;
+                                    require(union_disk[size_t(expert)] >= 0,
+                                            "joint shadow union contains an unranked expert");
+                                    ref_disk += union_disk[size_t(expert)];
+                                    ref_h2d += union_h2d[size_t(expert)];
+                                }
+                        }
+                        require(ref_disk == disk && ref_h2d == h2d &&
+                                    ref_union == union_count && ref_regret == regret &&
+                                    ref_substitutions == substitutions,
+                                "POPCNT cache objective disagrees with byte shadow");
+                    }
+                } else {
+                    std::array<uint8_t, 288> seen{};
+                    for (int token = 0; token < tokens; ++token) {
+                        const CacheChoice &action =
+                            options[size_t(token)][size_t(trial[size_t(token)])];
+                        regret += action.regret;
+                        substitutions += action.substitutions;
+                        for (int expert : action.experts)
+                            if (!seen[size_t(expert)]) {
+                                seen[size_t(expert)] = 1;
+                                ++union_count;
+                                require(union_disk[size_t(expert)] >= 0,
+                                        "joint cache union contains an unranked expert");
+                                disk += union_disk[size_t(expert)];
+                                h2d += union_h2d[size_t(expert)];
+                            }
                         }
                 }
                 const bool better = disk < best_disk ||
@@ -6486,6 +6668,10 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
             df_cache_route_disk_saved_ += baseline_action->disk - action.disk;
             df_cache_route_h2d_saved_ += baseline_action->h2d - action.h2d;
         }
+        df_cache_selector_seconds_ += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - selector_started).count();
+        ++df_cache_selector_calls_;
+        df_cache_selector_mask_calls_ += mask_search;
     }
     if (trace_falsifier && falsifier_feature_only_)
         report_falsifier_features(layer, selection, exec_count, candidate_experts,
@@ -7981,6 +8167,7 @@ std::vector<std::pair<int, float>> Runner::step(
                     (long long)df_cache_joint_disk_saved_,
                     (long long)df_cache_joint_h2d_saved_,
                     (unsigned long long)df_cache_joint_groups_);
+    report_cache_selector();
     if (df_calibration_guard_rounds_)
         std::printf("  DFlash calibration guard exactified %llu/%llu rounds "
                     "(JS mean %.6f max %.6f)\n",
@@ -8445,6 +8632,7 @@ int main(int argc, char **argv) {
                             committed_total / std::max(1, rounds),
                             accepted_draft_total / std::max(1.0e-9, decode_seconds),
                             committed_total / std::max(1.0e-9, decode_seconds));
+                runner.report_cache_selector();
                 if (v2_scalar_rounds)
                     std::printf("  adaptive controller bypassed speculation for %d k=1 rounds\n",
                                 v2_scalar_rounds);

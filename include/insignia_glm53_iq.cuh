@@ -9,6 +9,7 @@ namespace insignia::glm53 {
 constexpr int kIQBlockWeights = 256;
 constexpr int kIQ3XXSBlockBytes = 98;
 constexpr int kIQ4XSBlockBytes = 136;
+constexpr int kQ6KBlockBytes = 210;
 constexpr int kIQActivationGroup = 32;
 constexpr int kIQMaxRows = 8;
 
@@ -113,8 +114,34 @@ cudaError_t iq4_xs_gemv_acc_rows(
     int cols,
     cudaStream_t stream = nullptr);
 
+// Q6_K exception path used by the routed down projections in blocks 11, 12,
+// and 44.  It reconstructs the split low-4/high-2 bitplanes directly into
+// signed DP4A operands and applies the two per-16 scales inside each Q8-per-32
+// activation group.
+cudaError_t q6_k_gemv_rows(
+    const uint8_t *weights,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
+cudaError_t q6_k_gemv_acc_rows(
+    const uint8_t *weights,
+    const void *workspace,
+    int count,
+    float *y,
+    const int *y_ids,
+    const float *combine,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 // Independent scalar decoders used by the GGUF fixture and repacker gates.
 void iq3_xxs_dequantize_row_cpu(const uint8_t *weights, float *output, int cols);
 void iq4_xs_dequantize_row_cpu(const uint8_t *weights, float *output, int cols);
+void q6_k_dequantize_row_cpu(const uint8_t *weights, float *output, int cols);
 
 }  // namespace insignia::glm53

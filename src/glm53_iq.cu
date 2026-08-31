@@ -17,6 +17,7 @@ using insignia::glm53::kIQ4XSBlockBytes;
 using insignia::glm53::kIQActivationGroup;
 using insignia::glm53::kIQBlockWeights;
 using insignia::glm53::kIQMaxRows;
+using insignia::glm53::kQ6KBlockBytes;
 
 struct alignas(2) IQ3XXSBlock {
     __half d;
@@ -31,6 +32,14 @@ struct alignas(2) IQ4XSBlock {
     uint8_t qs[128];
 };
 static_assert(sizeof(IQ4XSBlock) == kIQ4XSBlockBytes);
+
+struct alignas(2) Q6KBlock {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    __half d;
+};
+static_assert(sizeof(Q6KBlock) == kQ6KBlockBytes);
 
 struct IQRowIds {
     int ids[kIQMaxRows]{};
@@ -359,6 +368,79 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     }
 }
 
+template <int R, int BLOCKS, bool ACCUMULATE>
+__global__ __launch_bounds__(256, 2) void q6_k_rows_kernel(
+    const Q6KBlock *__restrict__ weights,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    int words_per_row,
+    float *__restrict__ y,
+    IQRowOut out) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int cohort = lane >> 3;
+    const int subgroup = lane & 7;
+    const int row = blockIdx.x * 8 + warp;
+    const Q6KBlock *row_weights = weights + static_cast<size_t>(row) * BLOCKS;
+    float sums[R] = {};
+#pragma unroll
+    for (int wave = 0; wave < BLOCKS / 4; ++wave) {
+        const int block_id = 4 * wave + cohort;
+        const Q6KBlock &block = row_weights[block_id];
+        const int half = subgroup >> 2;
+        const int quadrant = subgroup & 3;
+        const uint8_t *ql = block.ql + 64 * half + 32 * (quadrant & 1);
+        const uint8_t *qh = block.qh + 32 * half;
+        uint32_t decoded[8];
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+            const uint32_t low =
+                (load_u32_any(ql + 4 * word) >> (4 * (quadrant >> 1))) &
+                0x0f0f0f0fu;
+            const uint32_t high =
+                (load_u32_any(qh + 4 * word) >> (2 * quadrant)) &
+                0x03030303u;
+            decoded[word] = __vsub4(low | (high << 4), 0x20202020u);
+        }
+        const int scale_index = 8 * half + 2 * quadrant;
+        const float d = __half2float(block.d);
+        const float weight_scale0 = d * float(block.scales[scale_index + 0]);
+        const float weight_scale1 = d * float(block.scales[scale_index + 1]);
+        const int activation_group = block_id * 8 + subgroup;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint32_t *activation =
+                xq + static_cast<size_t>(r) * words_per_row +
+                activation_group * 8;
+            int dot0 = 0, dot1 = 0;
+#pragma unroll
+            for (int word = 0; word < 4; ++word)
+                dot0 = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot0);
+#pragma unroll
+            for (int word = 4; word < 8; ++word)
+                dot1 = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot1);
+            const float scale = xscale[static_cast<size_t>(r) * BLOCKS * 8 +
+                                       activation_group];
+            sums[r] = fmaf(float(dot0), weight_scale0 * scale, sums[r]);
+            sums[r] = fmaf(float(dot1), weight_scale1 * scale, sums[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            sums[r] += __shfl_down_sync(0xffffffffu, sums[r], offset);
+        if (!lane) {
+            float *destination =
+                y + static_cast<size_t>(out.ids[r]) * gridDim.x * 8 + row;
+            if constexpr (ACCUMULATE)
+                *destination = fmaf(sums[r], out.weights[r], *destination);
+            else
+                *destination = sums[r];
+        }
+    }
+}
+
 // Prefill is a different machine from decode.  Each CTA owns sixteen output
 // rows and thirty-two routed tokens.  It expands one 16x16 weight tile to FP16
 // once, then two warps reuse it through HMMA.  The expert payload is therefore
@@ -531,6 +613,16 @@ cudaError_t launch_iq4(const uint8_t *weights, const uint32_t *xq,
     return cudaPeekAtLastError();
 }
 
+template <int R, int BLOCKS, bool ACCUMULATE>
+cudaError_t launch_q6(const uint8_t *weights, const uint32_t *xq,
+                      const float *xscale, int words_per_row, float *y,
+                      IQRowOut out, int rows, cudaStream_t stream) {
+    q6_k_rows_kernel<R, BLOCKS, ACCUMULATE><<<rows / 8, 256, 0, stream>>>(
+        reinterpret_cast<const Q6KBlock *>(weights), xq, xscale,
+        words_per_row, y, out);
+    return cudaPeekAtLastError();
+}
+
 bool valid_geometry(int rows, int cols, int count) {
     return rows > 0 && (rows & 7) == 0 && (cols == 2048 || cols == 4096) &&
            count > 0 && count <= kIQMaxRows;
@@ -600,6 +692,37 @@ cudaError_t dispatch_iq4(const uint8_t *weights, const void *workspace,
         default: return cudaErrorInvalidValue;
     }
 #undef INSIGNIA_IQ4_CASE
+}
+
+template <bool ACCUMULATE>
+cudaError_t dispatch_q6(const uint8_t *weights, const void *workspace,
+                        int count, float *y, const int *y_ids,
+                        const float *combine, int rows, int cols,
+                        cudaStream_t stream) {
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) + count * aligned);
+    IQRowOut out{};
+    for (int r = 0; r < count; ++r) {
+        out.ids[r] = y_ids[r];
+        if constexpr (ACCUMULATE) out.weights[r] = combine[r];
+    }
+#define INSIGNIA_Q6_CASE(R)                                                        \
+    case R:                                                                        \
+        return cols == 4096                                                        \
+            ? launch_q6<R, 16, ACCUMULATE>(weights, xq, xscale,                   \
+                                            int(aligned / 4), y, out, rows, stream)\
+            : launch_q6<R, 8, ACCUMULATE>(weights, xq, xscale,                    \
+                                           int(aligned / 4), y, out, rows, stream)
+    switch (count) {
+        INSIGNIA_Q6_CASE(1); INSIGNIA_Q6_CASE(2);
+        INSIGNIA_Q6_CASE(3); INSIGNIA_Q6_CASE(4);
+        INSIGNIA_Q6_CASE(5); INSIGNIA_Q6_CASE(6);
+        INSIGNIA_Q6_CASE(7); INSIGNIA_Q6_CASE(8);
+        default: return cudaErrorInvalidValue;
+    }
+#undef INSIGNIA_Q6_CASE
 }
 
 }  // namespace
@@ -754,6 +877,27 @@ cudaError_t iq4_xs_gemv_acc_rows(
                               rows, cols, stream);
 }
 
+cudaError_t q6_k_gemv_rows(
+    const uint8_t *weights, const void *workspace, int count, float *y,
+    const int *y_ids, int rows, int cols, cudaStream_t stream) {
+    if (!weights || !workspace || !y || !y_ids ||
+        !valid_geometry(rows, cols, count))
+        return cudaErrorInvalidValue;
+    return dispatch_q6<false>(weights, workspace, count, y, y_ids, nullptr,
+                               rows, cols, stream);
+}
+
+cudaError_t q6_k_gemv_acc_rows(
+    const uint8_t *weights, const void *workspace, int count, float *y,
+    const int *y_ids, const float *combine, int rows, int cols,
+    cudaStream_t stream) {
+    if (!weights || !workspace || !y || !y_ids || !combine ||
+        !valid_geometry(rows, cols, count))
+        return cudaErrorInvalidValue;
+    return dispatch_q6<true>(weights, workspace, count, y, y_ids, combine,
+                              rows, cols, stream);
+}
+
 void iq3_xxs_dequantize_row_cpu(const uint8_t *weights, float *output, int cols) {
     const int blocks = cols / kIQBlockWeights;
     const auto *row = reinterpret_cast<const IQ3XXSBlock *>(weights);
@@ -801,6 +945,34 @@ void iq4_xs_dequantize_row_cpu(const uint8_t *weights, float *output, int cols) 
                     scale * table[packed[element] & 15];
                 output[block_id * 256 + subgroup * 32 + element + 16] =
                     scale * table[packed[element] >> 4];
+            }
+        }
+    }
+}
+
+void q6_k_dequantize_row_cpu(const uint8_t *weights, float *output, int cols) {
+    const int blocks = cols / kIQBlockWeights;
+    const auto *row = reinterpret_cast<const Q6KBlock *>(weights);
+    for (int block_id = 0; block_id < blocks; ++block_id) {
+        const Q6KBlock &block = row[block_id];
+        const float d = __half2float(block.d);
+        for (int half = 0; half < 2; ++half) {
+            for (int l = 0; l < 32; ++l) {
+                const uint8_t ql0 = block.ql[64 * half + l];
+                const uint8_t ql1 = block.ql[64 * half + 32 + l];
+                const uint8_t qh = block.qh[32 * half + l];
+                const int values[4] = {
+                    int((ql0 & 15) | (((qh >> 0) & 3) << 4)) - 32,
+                    int((ql1 & 15) | (((qh >> 2) & 3) << 4)) - 32,
+                    int((ql0 >> 4) | (((qh >> 4) & 3) << 4)) - 32,
+                    int((ql1 >> 4) | (((qh >> 6) & 3) << 4)) - 32,
+                };
+                for (int quadrant = 0; quadrant < 4; ++quadrant) {
+                    const int subgroup = 4 * half + quadrant;
+                    const int scale_index = 8 * half + 2 * quadrant + l / 16;
+                    output[block_id * 256 + subgroup * 32 + l] =
+                        d * float(block.scales[scale_index]) * float(values[quadrant]);
+                }
             }
         }
     }

@@ -129,9 +129,11 @@ under WSL2 for the GLM path:
 Ada has no native block-scaled FP4 MMA (that is Blackwell-only). Insignia stores
 NVFP4/MXFP4 weights but executes them through an Ada-supported decode path;
 direct FP32 accumulation from packed nibbles currently beats the Q8/DP4A
-experiment by a wide margin on decode GEMV. FP8 (E4M3 group-64, tensor-core
-GEMV) is the accepted compute format for dense matrices; E2M1-Q4 was measured
-slower than FP8-TC and rejected.
+experiment by a wide margin on decode GEMV. Direct XPR1-v2 packed experts use
+an exact table-free E2M1 arithmetic decoder by default on glm-box; the shared
+LUT rollback is `INSIGNIA_GLM53_NVFP4_TABLEFREE=0`. FP8 (E4M3 group-64,
+tensor-core GEMV) is the accepted compute format for dense matrices; the old
+standalone E2M1-Q4 dense experiment was slower than FP8-TC and rejected.
 
 ## GLM-5.3-Flash model contract (from config.json)
 
@@ -165,6 +167,10 @@ slower than FP8-TC and rejected.
 - Dense FP8 cache (`glm53-fp8-g64`, 8.13 GiB, 699 matrices, cos 0.9994) is the
   default dense path; produced by the PyTorch-free native E4M3 encoder
   (`tools/quantize_glm53_q8.py`, tested by `tools/test_e4m3fn.py`).
+- Direct XPR1-v2 packed expert execution is the default expert path. Its exact
+  table-free E2M1 decoder raises matched glm-box decode throughput by 1.18%
+  (five-run medians) and is byte-identical to the shared-LUT rollback; see
+  `audits/s12-ti-tablefree-e2m1.md`.
 - Hierarchy in working form: O_DIRECT reader pool → pinned host-RAM expert LRU
   (default 32 GiB with safe halve-and-retry; ~80% hit rate at 2425 slots on
   glm-box) → 576 MiB VRAM expert cache covering all 42 sparse layers → GPU.
@@ -234,7 +240,7 @@ checks. Wait for coherent token parity before claiming the engine is correct.
   `DFLASH2_FP8`, `DF_VERIFY_K`, `DF_SEQ_VERIFY`/`DF_BATCH_VERIFY`), MLA modes
   (`KV_FP8`, `MLA_LEGACY` exact oracle, `SCALAR_MLA_PREFILL`,
   `MLA_BF16_ABSORB`), striping (`STRIPE_INDEX` + `ALT_SHARD_DIR`), prefetch (`CCT`,
-  `PREFETCH`), and the trace/dump hooks (`ROUTE_TRACE`, `LAYER_DUMP`,
+  `PREFETCH`), packed expert decode (`NVFP4_TABLEFREE`), and the trace/dump hooks (`ROUTE_TRACE`, `LAYER_DUMP`,
   `MLA_DUMP`, `DF_DUMP`, `LOGITS_DUMP`).
 - `INSIGNIA_GLM53_DFLASH2_FP8` must point at
   `/var/lib/insignia/glm53-dflash2-fp8-fixed` — the default

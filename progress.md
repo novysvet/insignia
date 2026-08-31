@@ -20,10 +20,25 @@ an external contender.  A first expert microbenchmark measured table-free
 NVFP4 at 7.551 us / 624.9 GB/s and fused pair execution at 14.819 us /
 636.8 GB/s, but no dispatch policy is promoted from a single campaign run.
 
-The public `UD-Q3_K_XL` four-shard GGUF download is persistent under a Windows
-Scheduled Task and writes only to `/var/lib/insignia/glm53-q3-k-xl`.  The exact
-HF include is `UD-Q3_K_XL/*` (about 147.2 GB total).  At the latest checkpoint
-31 GiB had landed and the WSL volume still had 404 GiB free.
+The follow-up serialized 4070 Ti SUPER campaign promotes table-free E2M1
+arithmetic for direct XPR1-v2 packed experts.  Every store/pair/accumulate gate
+in both expert geometries, multiplicities 1--8, and CTA4/CTA8 is byte-exact.
+The 30-token whole-model full-vocabulary dumps are byte-identical (SHA256
+`d0d1f16eef14f925efde75e4c28935e527355b16a792981fd8fd106a530d1a6a`).
+Five clean-start runs per arm at a fixed 1,212-slot host / 158-slot VRAM ledger
+give median decode 13.539 -> 13.381 s per 30 tokens, or 2.216 -> 2.242 tok/s
+(+1.18%).  The isolated fixture GEMV is 12.802 -> 7.506 us.  Gate/up pair
+dispatch now uses four CTA warps only at multiplicities 5 and 8.  Table-free is
+the packed default; `INSIGNIA_GLM53_NVFP4_TABLEFREE=0` is the exact rollback.
+See `audits/s12-ti-tablefree-e2m1.md`.  No local-box timing contributed to this
+decision.
+
+The public `UD-Q3_K_XL` four-shard GGUF download writes only to
+`/var/lib/insignia/glm53-q3-k-xl`.  The Windows Scheduled Task stopped with
+result code 7 after caching 93 GiB, so it was replaced by the persistent WSL
+unit `insignia-q3-k-xl-download.service` at one worker.  The exact HF include is
+`UD-Q3_K_XL/*` (about 147.2 GB total); 342 GiB remained free when the resumable
+unit started.  Treat the box's SSD as contended while this unit is active.
 
 The incoming Ada dispatch, DFlash capture, KDA shadowing, anytime WSL A/B,
 teacher-forcing/free-run, causal residual, joint adaptive compute, and anytime

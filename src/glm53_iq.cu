@@ -1406,7 +1406,7 @@ __global__ __launch_bounds__(128, 4) void iq3_xxs_wmma32_pair_kernel(
         accumulator, rows, wmma::mem_col_major);
 }
 
-template <int BLOCKS, int DECODE_PAIRS>
+template <int BLOCKS>
 __global__ __launch_bounds__(256, 2) void iq3_xxs_imma32_pair_kernel(
     const uint8_t *__restrict__ gate_weights,
     const uint8_t *__restrict__ up_weights,
@@ -1448,14 +1448,11 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_imma32_pair_kernel(
                       words_per_row +
                   group * 8 + activation_word);
 
-        constexpr int kThreadsPerMatrix = 64 / DECODE_PAIRS;
-        constexpr int kDecodeThreads = 2 * kThreadsPerMatrix;
-        if (thread < kDecodeThreads) {
-            const int decode_matrix = thread / kThreadsPerMatrix;
-            const int decode_item = thread - decode_matrix * kThreadsPerMatrix;
-            const int local_row = decode_item / (4 / DECODE_PAIRS);
-            const int first_pair =
-                (decode_item - local_row * (4 / DECODE_PAIRS)) * DECODE_PAIRS;
+        if (thread < 128) {
+            const int decode_matrix = thread >> 6;
+            const int decode_item = thread & 63;
+            const int local_row = decode_item >> 2;
+            const int pair = decode_item & 3;
             const uint8_t *matrix_weights =
                 decode_matrix ? up_weights : gate_weights;
             const auto *blocks = reinterpret_cast<const IQ3XXSBlock *>(
@@ -1469,16 +1466,12 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_imma32_pair_kernel(
                 load_u32_any(block.qs + 8 * subgroup + 4);
             const uint32_t auxiliary =
                 load_u32_any(block.qs + 64 + 4 * subgroup);
-#pragma unroll
-            for (int offset = 0; offset < DECODE_PAIRS; ++offset) {
-                const int pair = first_pair + offset;
-                uint32_t decoded0, decoded1;
-                decode_iq3_pair(pair < 2 ? indices0 : indices1,
-                                auxiliary, pair, decoded0, decoded1);
-                shared_b[decode_matrix][local_row][2 * pair + 0] = decoded0;
-                shared_b[decode_matrix][local_row][2 * pair + 1] = decoded1;
-            }
-            if (!first_pair)
+            uint32_t decoded0, decoded1;
+            decode_iq3_pair(pair < 2 ? indices0 : indices1,
+                            auxiliary, pair, decoded0, decoded1);
+            shared_b[decode_matrix][local_row][2 * pair + 0] = decoded0;
+            shared_b[decode_matrix][local_row][2 * pair + 1] = decoded1;
+            if (!pair)
                 shared_weight_scale[decode_matrix][local_row] =
                     __half2float(block.d) *
                     (0.25f + 0.5f * float(auxiliary >> 28));
@@ -1993,36 +1986,26 @@ cudaError_t iq3_xxs_gemm2_prefill32(
 cudaError_t iq3_xxs_gemm2_prefill32_imma(
     const uint8_t *gate_weights, const uint8_t *up_weights,
     const void *workspace, int tokens, float *gate_y, float *up_y,
-    int rows, int cols, int decode_pairs_per_thread, cudaStream_t stream) {
+    int rows, int cols, cudaStream_t stream) {
     if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
         rows <= 0 || (rows & 15) || tokens <= 0 || (tokens & 31) ||
-        (cols != 2048 && cols != 4096) ||
-        (decode_pairs_per_thread != 1 && decode_pairs_per_thread != 2 &&
-         decode_pairs_per_thread != 4))
+        (cols != 2048 && cols != 4096))
         return cudaErrorInvalidValue;
     const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
     const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
     const auto *xscale = reinterpret_cast<const float *>(
         reinterpret_cast<const uint8_t *>(workspace) +
         static_cast<size_t>(tokens) * aligned);
-#define INSIGNIA_IQ3_IMMA_LAUNCH(PAIRS)                                           \
-    if (cols == 4096)                                                              \
-        iq3_xxs_imma32_pair_kernel<16, PAIRS>                                     \
-            <<<dim3(rows / 16, tokens / 32), 256, 0, stream>>>(                   \
-                gate_weights, up_weights, xq, xscale, gate_y, up_y, rows,          \
-                int(aligned / 4));                                                 \
-    else                                                                           \
-        iq3_xxs_imma32_pair_kernel<8, PAIRS>                                      \
-            <<<dim3(rows / 16, tokens / 32), 256, 0, stream>>>(                   \
-                gate_weights, up_weights, xq, xscale, gate_y, up_y, rows,          \
-                int(aligned / 4))
-    switch (decode_pairs_per_thread) {
-        case 1: INSIGNIA_IQ3_IMMA_LAUNCH(1); break;
-        case 2: INSIGNIA_IQ3_IMMA_LAUNCH(2); break;
-        case 4: INSIGNIA_IQ3_IMMA_LAUNCH(4); break;
-        default: return cudaErrorInvalidValue;
-    }
-#undef INSIGNIA_IQ3_IMMA_LAUNCH
+    if (cols == 4096)
+        iq3_xxs_imma32_pair_kernel<16>
+            <<<dim3(rows / 16, tokens / 32), 256, 0, stream>>>(
+                gate_weights, up_weights, xq, xscale, gate_y, up_y, rows,
+                int(aligned / 4));
+    else
+        iq3_xxs_imma32_pair_kernel<8>
+            <<<dim3(rows / 16, tokens / 32), 256, 0, stream>>>(
+                gate_weights, up_weights, xq, xscale, gate_y, up_y, rows,
+                int(aligned / 4));
     return cudaPeekAtLastError();
 }
 

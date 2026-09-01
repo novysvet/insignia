@@ -629,6 +629,68 @@ void iq3_xxs_wim32_fused_quant_pair_x1_kernel(
     }
 }
 
+__global__ __launch_bounds__(128, 4) void iq3_xxs_wim32_topk_pair_x1_kernel(
+    uint8_t *const *__restrict__ gate_weights,
+    uint8_t *const *__restrict__ up_weights,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ gate_y,
+    float *__restrict__ up_y,
+    int rows) {
+    constexpr int kBlocks = 16;
+    constexpr int kWarpsPerMatrix = 2;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int matrix = warp / kWarpsPerMatrix;
+    const int matrix_warp = warp - matrix * kWarpsPerMatrix;
+    const int cohort = lane >> 3;
+    const int expert = blockIdx.y;
+    const int row = blockIdx.x * kWarpsPerMatrix + matrix_warp;
+    constexpr int row_bytes = kBlocks * kIQ3XXSBlockBytes;
+    const uint8_t *matrix_weights = matrix ? up_weights[expert]
+                                            : gate_weights[expert];
+    const uint8_t *row_weights =
+        matrix_weights + static_cast<size_t>(row) * row_bytes;
+    const auto *scales = reinterpret_cast<const __half *>(row_weights);
+    float sum = 0.0f;
+#pragma unroll
+    for (int wave = 0; wave < kBlocks / 4; ++wave) {
+        const int block_id = 4 * wave + cohort;
+        const uint8_t *wave_words =
+            row_weights + 2 * kBlocks + 384 * wave + 4 * lane;
+        const uint32_t indices0 =
+            __ldcs(reinterpret_cast<const uint32_t *>(wave_words));
+        const uint32_t indices1 =
+            __ldcs(reinterpret_cast<const uint32_t *>(wave_words + 128));
+        const uint32_t aux =
+            __ldcs(reinterpret_cast<const uint32_t *>(wave_words + 256));
+        uint32_t decoded[8];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+            decode_iq3_pair(pair_indices, aux, pair,
+                            decoded[2 * pair + 0], decoded[2 * pair + 1]);
+        }
+        const int activation_group = 32 * wave + lane;
+        const uint32_t *activation = xq + activation_group * 8;
+        int dot = 0;
+#pragma unroll
+        for (int word = 0; word < 8; ++word)
+            dot = __dp4a(int(decoded[word]),
+                         int(__ldg(activation + word)), dot);
+        const float weight_scale = __half2float(scales[block_id]) *
+                                   (0.25f + 0.5f * float(aux >> 28));
+        sum = fmaf(float(dot), weight_scale * xscale[activation_group], sum);
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (!lane) {
+        float *output = matrix ? up_y : gate_y;
+        output[static_cast<size_t>(expert) * rows + row] = sum;
+    }
+}
+
 template <int R, int BLOCKS, bool ACCUMULATE>
 __global__ __launch_bounds__(256, 2) void iq4_xs_rows_kernel(
     const IQ4XSBlock *__restrict__ weights,
@@ -784,6 +846,124 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_x1_kernel(
                 *destination = fmaf(sum, combine, *destination);
             else
                 *destination = sum;
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_topk_x1_kernel(
+    uint8_t *const *__restrict__ weight_pointers,
+    const float *__restrict__ gate,
+    const float *__restrict__ up,
+    const float *__restrict__ combine,
+    int expert_count,
+    float *__restrict__ y,
+    int rows) {
+    constexpr int kBlocks = 8;
+    constexpr int kPasses = 4;
+    __shared__ __align__(128) uint32_t shared_xq[64 * 8];
+    __shared__ __align__(128) float shared_xscale[64];
+    const int thread = threadIdx.x;
+    const int lane = thread & 31;
+    const int warp = thread >> 5;
+    const int cohort = lane >> 3;
+    const int subgroup = lane & 7;
+    float totals[kPasses] = {};
+    if (!lane) {
+#pragma unroll
+        for (int pass = 0; pass < kPasses; ++pass) {
+            const int row = blockIdx.x * 32 + pass * 8 + warp;
+            totals[pass] = y[row];
+        }
+    }
+
+    for (int expert = 0; expert < expert_count; ++expert) {
+        if (thread < 64) {
+            const size_t base = static_cast<size_t>(expert) * 2048 + thread * 32;
+            const float4 *gate4 = reinterpret_cast<const float4 *>(gate + base);
+            const float4 *up4 = reinterpret_cast<const float4 *>(up + base);
+            float values[32];
+            float maximum = 0.0f;
+#pragma unroll
+            for (int word = 0; word < 8; ++word) {
+                const float4 g = __ldg(gate4 + word);
+                const float4 u = __ldg(up4 + word);
+                const float gv[4] = {g.x, g.y, g.z, g.w};
+                const float uv[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    const float gc = fminf(gv[item], 10.0f);
+                    const float uc = fminf(fmaxf(uv[item], -10.0f), 10.0f);
+                    const float value = (gc / (1.0f + __expf(-gc))) * uc;
+                    values[4 * word + item] = value;
+                    maximum = fmaxf(maximum, fabsf(value));
+                }
+            }
+            const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+            shared_xscale[thread] = maximum * (1.0f / 127.0f);
+#pragma unroll
+            for (int word = 0; word < 8; ++word) {
+                uint32_t packed = 0;
+#pragma unroll
+                for (int byte = 0; byte < 4; ++byte)
+                    packed |= uint32_t(uint8_t(__float2int_rn(
+                                  values[4 * word + byte] * inverse))) <<
+                              (8 * byte);
+                shared_xq[thread * 8 + word] = packed;
+            }
+        }
+        __syncthreads();
+
+        const auto *weights = reinterpret_cast<const IQ4XSBlock *>(
+            weight_pointers[expert]);
+#pragma unroll
+        for (int pass = 0; pass < kPasses; ++pass) {
+            const int row = blockIdx.x * 32 + pass * 8 + warp;
+            const IQ4XSBlock *row_weights =
+                weights + static_cast<size_t>(row) * kBlocks;
+            float sum = 0.0f;
+#pragma unroll
+            for (int wave = 0; wave < kBlocks / 4; ++wave) {
+                const int block_id = 4 * wave + cohort;
+                const IQ4XSBlock &block = row_weights[block_id];
+                const uint32_t *packed = reinterpret_cast<const uint32_t *>(
+                    block.qs + 16 * subgroup);
+                int decoded[8];
+#pragma unroll
+                for (int word = 0; word < 4; ++word) {
+                    const int2 values = iq4_lookup8(__ldcs(packed + word));
+                    decoded[word] = values.x;
+                    decoded[word + 4] = values.y;
+                }
+                const int low =
+                    (block.scales_l[subgroup >> 1] >>
+                     (4 * (subgroup & 1))) & 15;
+                const int high = (block.scales_h >> (2 * subgroup)) & 3;
+                const float weight_scale = __half2float(block.d) *
+                    float((low | (high << 4)) - 32);
+                const int activation_group = block_id * 8 + subgroup;
+                const uint32_t *activation =
+                    shared_xq + activation_group * 8;
+                int dot = 0;
+#pragma unroll
+                for (int word = 0; word < 8; ++word)
+                    dot = __dp4a(decoded[word], int(activation[word]), dot);
+                sum = fmaf(float(dot),
+                           weight_scale * shared_xscale[activation_group], sum);
+            }
+#pragma unroll
+            for (int offset = 16; offset; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            if (!lane)
+                totals[pass] = fmaf(sum, __ldg(combine + expert), totals[pass]);
+        }
+        __syncthreads();
+    }
+
+    if (!lane) {
+#pragma unroll
+        for (int pass = 0; pass < kPasses; ++pass) {
+            const int row = blockIdx.x * 32 + pass * 8 + warp;
+            y[row] = totals[pass];
         }
     }
 }
@@ -1715,6 +1895,23 @@ cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
     return cudaPeekAtLastError();
 }
 
+cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
+    uint8_t *const *gate_weights, uint8_t *const *up_weights,
+    const void *workspace, int expert_count, float *gate_y, float *up_y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
+        expert_count <= 0 || expert_count > 8 || rows <= 0 || (rows & 1) ||
+        cols != 4096)
+        return cudaErrorInvalidValue;
+    const auto *base = static_cast<const uint8_t *>(workspace);
+    const auto *xq = reinterpret_cast<const uint32_t *>(base);
+    const auto *xscale = reinterpret_cast<const float *>(base + cols);
+    iq3_xxs_wim32_topk_pair_x1_kernel
+        <<<dim3(rows / 2, expert_count), 128, 0, stream>>>(
+            gate_weights, up_weights, xq, xscale, gate_y, up_y, rows);
+    return cudaPeekAtLastError();
+}
+
 cudaError_t iq4_xs_gemv_rows(
     const uint8_t *weights, const void *workspace, int count, float *y,
     const int *y_ids, int rows, int cols, cudaStream_t stream) {
@@ -1778,6 +1975,18 @@ cudaError_t iq4_xs_swiglu_gemv_acc_fused_x1(
         <<<rows / 32, 256, 0, stream>>>(
             reinterpret_cast<const IQ4XSBlock *>(weights), gate, up, input_id,
             y, output_id, combine, rows);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t iq4_xs_swiglu_gemv_acc_topk_x1(
+    uint8_t *const *weights, const float *gate, const float *up,
+    const float *combine, int expert_count, float *y, int rows, int cols,
+    cudaStream_t stream) {
+    if (!weights || !gate || !up || !combine || !y || expert_count <= 0 ||
+        expert_count > 8 || rows <= 0 || (rows & 31) || cols != 2048)
+        return cudaErrorInvalidValue;
+    iq4_xs_swiglu_topk_x1_kernel<<<rows / 32, 256, 0, stream>>>(
+        weights, gate, up, combine, expert_count, y, rows);
     return cudaPeekAtLastError();
 }
 

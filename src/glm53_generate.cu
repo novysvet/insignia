@@ -756,21 +756,40 @@ public:
             (reinterpret_cast<uintptr_t>(host_raw_) + kAlignment - 1) & ~(uintptr_t(kAlignment) - 1));
         if (q3_compact_host_) {
             size_t cursor = 0;
-            bool full = false;
-            while (!full)
-                for (int layer = 3; layer <= 44; ++layer) {
-                    const uint8_t size_class = q3_window_class(layer);
-                    const size_t capacity = q3_window_capacity(size_class);
-                    if (cursor + capacity > host_arena_bytes_) {
-                        full = true;
-                        break;
+            const auto append_window = [&](uint8_t size_class) {
+                const size_t capacity = q3_window_capacity(size_class);
+                if (cursor + capacity > host_arena_bytes_) return false;
+                window_offsets_.push_back(cursor);
+                window_capacities_.push_back(capacity);
+                window_classes_.push_back(size_class);
+                ++window_class_counts_[size_t(size_class)];
+                cursor += capacity;
+                return true;
+            };
+            // Full-prompt layer-major execution can revisit every expert in
+            // one layer.  Reserve a complete 288-record working set for each
+            // exception geometry before filling the common class; otherwise
+            // the compact cache rereads layer 11/12/44 within the same layer.
+            const size_t exception_bytes = size_t(model_.experts()) *
+                (kQ3MediumWindowBytes + kQ3LargeWindowBytes);
+            if (host_arena_bytes_ >= exception_bytes + 64 * kQ3SmallWindowBytes) {
+                for (uint32_t expert = 0; expert < model_.experts(); ++expert)
+                    require(append_window(2), "Q3 large-window reserve overflow");
+                for (uint32_t expert = 0; expert < model_.experts(); ++expert)
+                    require(append_window(1), "Q3 medium-window reserve overflow");
+                while (append_window(0)) {}
+            } else {
+                // Small hosts cannot afford two complete exception sets.
+                // Preserve at least proportional per-layer capacity there.
+                bool full = false;
+                while (!full)
+                    for (int layer = 3; layer <= 44; ++layer) {
+                        if (!append_window(q3_window_class(layer))) {
+                            full = true;
+                            break;
+                        }
                     }
-                    window_offsets_.push_back(cursor);
-                    window_capacities_.push_back(capacity);
-                    window_classes_.push_back(size_class);
-                    ++window_class_counts_[size_t(size_class)];
-                    cursor += capacity;
-                }
+            }
             window_count_ = int(window_offsets_.size());
             require(window_count_ >= 64,
                     "compact Q3 host arena produced too few windows");
@@ -1319,6 +1338,7 @@ public:
     }
     bool q3_experts() const { return q3_experts_; }
     size_t window_bytes() const { return window_bytes_; }
+    size_t host_arena_bytes() const { return host_arena_bytes_; }
     size_t record_capacity() const { return record_capacity_; }
     TensorType projection_type(int projection) const {
         require(q3_experts_ && projection >= 0 && projection < 3,
@@ -3753,8 +3773,7 @@ public:
             std::printf("expert cache: %d pinned host-RAM %s records (%.1f MiB)\n",
                         expert_stager_->cache_slots(),
                         q3_experts_ ? "Q3" : "NVFP4",
-                        expert_stager_->cache_slots() * expert_stager_->window_bytes() /
-                            double(1 << 20));
+                        expert_stager_->host_arena_bytes() / double(1 << 20));
         else if (expert_stager_)
             std::printf("expert cache: disabled (no pinned host records)\n");
         load_cct();

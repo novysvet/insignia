@@ -216,8 +216,8 @@ cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
 // [expert][row] outputs; IQ4 down consumes those rows and accumulates experts
 // in canonical order inside one kernel launch.
 cudaError_t iq3_xxs_gemv2_topk_x1(
-    uint8_t *const *gate_weights,
-    uint8_t *const *up_weights,
+    const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights,
     const void *workspace,
     int expert_count,
     float *gate_y,
@@ -227,8 +227,8 @@ cudaError_t iq3_xxs_gemv2_topk_x1(
     cudaStream_t stream = nullptr);
 
 cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
-    uint8_t *const *gate_weights,
-    uint8_t *const *up_weights,
+    const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights,
     const void *workspace,
     int expert_count,
     float *gate_y,
@@ -238,7 +238,7 @@ cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
     cudaStream_t stream = nullptr);
 
 cudaError_t iq4_xs_swiglu_gemv_acc_topk_x1(
-    uint8_t *const *weights,
+    const uint8_t *const *weights,
     const float *gate,
     const float *up,
     const float *combine,

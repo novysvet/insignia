@@ -729,14 +729,19 @@ public:
         // layer-id mapping carved 46 segments and stranded four complete
         // slices.  Keep the corrected dense mapping A/B-gated until the
         // real-prompt campaign confirms the trace-replay gain.
-        compact_device_segments_ =
-            std::getenv("INSIGNIA_GLM53_VRAM_COMPACT_SEGMENTS") != nullptr;
+        if (const char *compact =
+                std::getenv("INSIGNIA_GLM53_VRAM_COMPACT_SEGMENTS"))
+            compact_device_segments_ = std::atoi(compact) != 0;
+        else
+            compact_device_segments_ = q3_experts_;
         // A front-of-batch miss must not blindly evict an expert required a
         // few canonical slots later.  Spend a handful of integer compares
         // to retain whole 12.8 MiB records: prefer an entry absent from the
         // rest of this batch, otherwise evict its farthest-future member.
-        batch_aware_device_victim_ =
-            std::getenv("INSIGNIA_GLM53_VRAM_BATCH_VICTIM") != nullptr;
+        if (const char *batch = std::getenv("INSIGNIA_GLM53_VRAM_BATCH_VICTIM"))
+            batch_aware_device_victim_ = std::atoi(batch) != 0;
+        else
+            batch_aware_device_victim_ = q3_experts_;
         // F3 residency ordering: consult the VRAM expert tier before starting
         // an NVMe read. The legacy order only noticed device residency at
         // upload time, after the bytes had already been re-read from disk.
@@ -1310,6 +1315,26 @@ public:
     uint64_t f3_rescued() const { return f3_rescued_; }
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
+    bool device_topk_capable() const {
+        const int segments = compact_device_segments_ ? 42 : 46;
+        return device_arena_ && device_slot_count_ / segments >= 8;
+    }
+    int active_device_slot() const { return active_device_slot_; }
+    void fence_device_slots(const int *slots, int count) {
+        require(device_arena_ && slots && count >= 1 && count <= 8,
+                "invalid expert device batch fence");
+        for (int index = 0; index < count; ++index) {
+            require(slots[index] >= 0 && slots[index] < device_slot_count_,
+                    "expert device batch lost a slot");
+            for (int earlier = 0; earlier < index; ++earlier)
+                require(slots[index] != slots[earlier],
+                        "expert device batch recycled a live slot");
+            check(cudaEventRecord(device_slot_reads_[size_t(slots[index])], nullptr),
+                  "fence batched expert slots");
+        }
+        active_device_slot_ = -1;
+        active_device_ = nullptr;
+    }
     // Whole-layer prompt staging owns large transient sidecars.  Freeze the
     // permanent expert tier first so those temporaries cannot silently reduce
     // the decode-time slot count chosen from free VRAM.
@@ -4766,7 +4791,94 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
         // GEMVs hide under the routed records' disk reads. Routed downs land
         // in a scratch buffer so `output` keeps the shared result.
         compute_mlp(stem + "shared_experts.", input, output, shared_intermediate_);
-        for (int slot = 0; slot < moe_topk_; ++slot) {
+        static const bool q3_topk = [] {
+            const char *value = std::getenv("INSIGNIA_GLM53_Q3_TOPK");
+            return !value || std::atoi(value) != 0;
+        }();
+        if (q3_experts_ && q3_topk) expert_stager_->prime_device_arena();
+        if (q3_experts_ && q3_topk && expert_stager_->device_topk_capable()) {
+            std::array<const uint8_t *, 8> gate_weights{}, up_weights{}, down_weights{};
+            std::array<float, 8> combine{};
+            std::array<int, 8> device_slots{};
+            TensorType gate_type = TensorType::iq3_xxs;
+            TensorType down_type = TensorType::iq4_xs;
+            for (int slot = 0; slot < moe_topk_; ++slot) {
+                const int expert = selected[size_t(slot)];
+                expert_stager_->upload(slot);
+                gate_weights[size_t(slot)] = expert_stager_->gate_weight();
+                up_weights[size_t(slot)] = expert_stager_->up_weight();
+                down_weights[size_t(slot)] = expert_stager_->down_weight();
+                combine[size_t(slot)] = 2.5f * scores[size_t(expert)] / denominator;
+                device_slots[size_t(slot)] = expert_stager_->active_device_slot();
+                require(device_slots[size_t(slot)] >= 0,
+                        "Q3 top-k execution requires a persistent device slot");
+                for (int earlier = 0; earlier < slot; ++earlier)
+                    require(device_slots[size_t(slot)] != device_slots[size_t(earlier)],
+                            "Q3 top-k collection recycled a live device slot");
+                const TensorType this_gate = expert_stager_->projection_type(1);
+                require(this_gate == expert_stager_->projection_type(2),
+                        "Q3 expert gate/up formats must match");
+                const TensorType this_down = expert_stager_->projection_type(0);
+                if (slot == 0) {
+                    gate_type = this_gate;
+                    down_type = this_down;
+                } else {
+                    require(gate_type == this_gate && down_type == this_down,
+                            "Q3 expert formats must be uniform within a layer");
+                }
+            }
+            if (gate_type == TensorType::iq3_xxs && down_type == TensorType::iq4_xs) {
+                check(insignia::glm53::iq3_xxs_gemv2_topk_x1(
+                          gate_weights.data(), up_weights.data(), iq_workspace_4096_.get(),
+                          moe_topk_, c_gateu_.get(), c_up_.get(),
+                          moe_intermediate_, hidden_),
+                      "Q3 raw top-k IQ3 gate/up");
+                check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
+                          down_weights.data(), c_gateu_.get(), c_up_.get(), combine.data(),
+                          moe_topk_, routed_.get(), hidden_, moe_intermediate_),
+                      "Q3 raw top-k IQ4 down");
+            } else {
+                // Three model layers carry higher-precision exception tensors.
+                // Keep their canonical expert order while still amortizing all
+                // eight uploads ahead of the compute launches.
+                for (int slot = 0; slot < moe_topk_; ++slot) {
+                    if (gate_type == TensorType::iq3_xxs) {
+                        check(insignia::glm53::iq3_xxs_gemv2_rows(
+                                  gate_weights[size_t(slot)], up_weights[size_t(slot)],
+                                  iq_workspace_4096_.get(), 1, gate_.get(), up_.get(),
+                                  &direct_id, moe_intermediate_, hidden_),
+                              "Q3 exception IQ3 gate/up");
+                    } else if (gate_type == TensorType::iq4_xs) {
+                        check(insignia::glm53::iq4_xs_gemv_rows(
+                                  gate_weights[size_t(slot)], iq_workspace_4096_.get(), 1,
+                                  gate_.get(), &direct_id, moe_intermediate_, hidden_),
+                              "Q3 exception IQ4 gate");
+                        check(insignia::glm53::iq4_xs_gemv_rows(
+                                  up_weights[size_t(slot)], iq_workspace_4096_.get(), 1,
+                                  up_.get(), &direct_id, moe_intermediate_, hidden_),
+                              "Q3 exception IQ4 up");
+                    } else {
+                        require(false, "unsupported Q3 gate/up format");
+                    }
+                    if (down_type == TensorType::iq4_xs) {
+                        check(insignia::glm53::iq4_xs_swiglu_gemv_acc_fused_x1(
+                                  down_weights[size_t(slot)], gate_.get(), up_.get(), 0,
+                                  routed_.get(), 0, combine[size_t(slot)], hidden_,
+                                  moe_intermediate_),
+                              "Q3 exception IQ4 fused routed down");
+                    } else if (down_type == TensorType::q6_k) {
+                        check(insignia::glm53::q6_k_swiglu_gemv_acc_fused_x1(
+                                  down_weights[size_t(slot)], gate_.get(), up_.get(), 0,
+                                  routed_.get(), 0, combine[size_t(slot)], hidden_,
+                                  moe_intermediate_),
+                              "Q3 exception Q6 fused routed down");
+                    } else {
+                        require(false, "unsupported Q3 down format");
+                    }
+                }
+            }
+            expert_stager_->fence_device_slots(device_slots.data(), moe_topk_);
+        } else for (int slot = 0; slot < moe_topk_; ++slot) {
             const int expert = selected[slot];
             expert_stager_->upload(slot);
             if (q3_experts_) {

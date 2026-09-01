@@ -2486,7 +2486,7 @@ cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
 }
 
 cudaError_t iq3_xxs_gemv2_topk_x1(
-    uint8_t *const *gate_weights, uint8_t *const *up_weights,
+    const uint8_t *const *gate_weights, const uint8_t *const *up_weights,
     const void *workspace, int expert_count, float *gate_y, float *up_y,
     int rows, int cols, cudaStream_t stream) {
     if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
@@ -2511,7 +2511,7 @@ cudaError_t iq3_xxs_gemv2_topk_x1(
 }
 
 cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
-    uint8_t *const *gate_weights, uint8_t *const *up_weights,
+    const uint8_t *const *gate_weights, const uint8_t *const *up_weights,
     const void *workspace, int expert_count, float *gate_y, float *up_y,
     int rows, int cols, cudaStream_t stream) {
     if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
@@ -2602,7 +2602,7 @@ cudaError_t iq4_xs_swiglu_gemv_acc_fused_x1(
 }
 
 cudaError_t iq4_xs_swiglu_gemv_acc_topk_x1(
-    uint8_t *const *weights, const float *gate, const float *up,
+    const uint8_t *const *weights, const float *gate, const float *up,
     const float *combine, int expert_count, float *y, int rows, int cols,
     cudaStream_t stream) {
     if (!weights || !gate || !up || !combine || !y || expert_count <= 0 ||

@@ -27,6 +27,11 @@ The strongest exact decode changes are:
   gate/up CTA and SwiGLU Q8 is recomputed inside each down CTA: the complete
   single-expert median reached 17.759 us. Its paired speedup median is 1.644x
   over the old path and 1.487x over the prior optimized path.
+- exact pointer-table batching collapses the ordinary top-8 path from sixteen
+  expert launches to one gate/up launch plus one ordered down launch. The
+  first isolated seven-run median improved 229.069 -> 129.467 us (1.769x by
+  median times, 1.773x paired-ratio median). A follow-up complete k sweep
+  measured 235.509 -> 129.370 us at k=8 (1.820x by median times).
 
 All fused-path comparisons are bit-exact against their unfused GPU controls:
 MSE 0, relative L2 0, cosine 1.0000000000, and max absolute error 0.
@@ -63,11 +68,37 @@ and measured as one serialized routed group. The exact crossover is:
 | 4 | 101.588 | 97.615 | 1.045x, noisy |
 | 8 | 181.071 | 195.607 | 0.924x |
 
-Production rule: use double fusion only when the active expert count is at
-most two. Keep one shared hidden-Q8 conversion for exact top-8. k=4 remains an
-experimental arm because three of seven paired trials lost despite the median
-gain. This makes the fused path useful to adaptive-k/mass-pruned execution
-without regressing exact routing.
+That compute-only experiment did not include the real weighted ordered down
+accumulation. The subsequent exact end-to-end expert-group sweep supersedes
+its dispatch conclusion:
+
+| Executed experts | Serial shared-Q8 (us) | Batched ordered (us) | Double fused (us) | Winner |
+|---:|---:|---:|---:|---|
+| 1 | 41.198 | 41.036 | 30.986 | double fused |
+| 2 | 66.562 | 42.335 | 58.787 | batched |
+| 4 | 123.249 | 71.043 | 116.160 | batched |
+| 8 | 235.509 | 129.370 | 229.629 | batched |
+
+Production rule: use double fusion only for k=1. For k>=2, quantize the hidden
+row once and use the pointer-table batched path. All gate, up, and canonical
+ordered down controls are bit-exact: MSE 0, relative L2 0, cosine 1.0, max
+absolute error 0.
+
+## Exact ordered top-k batching
+
+The decode router already names at most eight experts. Their resident device
+pointers are copied into persistent pointer tables. The IQ3 launch uses
+`grid.y=expert` and writes compact `[expert][2048]` gate/up rows. The IQ4 down
+launch keeps one 4096-row output CTA resident while it walks experts in router
+order, regenerates the exact 2048-wide SwiGLU Q8 row in shared memory, and
+performs the same sequence of FP32 `fmaf` operations as the serialized
+reference. This removes fourteen launches without reassociating the MoE sum.
+
+On sm_89, batched gate/up uses 91 registers and no spills. Batched down uses
+113 registers, one barrier, 2,304 bytes of shared memory, and no spills. The
+batched k=8 timing range was only 129.05--129.85 us in the first campaign and
+128.50--130.14 us in the crossover campaign, while the serialized path varied
+by tens of microseconds as CPU submission gaps repeatedly drained the GPU.
 
 ## Prefill and exception formats
 
@@ -123,4 +154,3 @@ typed GGUF expert index/stager with separate IQ3/IQ4/Q6 record geometry, WIM32
 sidecars for the winning dispatch, and an active-expert-count dispatch between
 shared-Q8 and double fusion. Dense/shared Q8_0 handling must follow before a
 full MathArena/GSM teacher-forced PPL, cosine, KL/JS, and throughput campaign.
-

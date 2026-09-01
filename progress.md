@@ -1,5 +1,23 @@
 # progress
 
+### 2026-09-01 - Exact Q3 top-k launch collapse
+
+The resident IQ3/IQ4 decode group now has an exact two-launch top-k path.
+Pointer-table IQ3 gate/up batches experts in `grid.y`; the IQ4 down CTA then
+walks experts in canonical router order and retains the original FP32 `fmaf`
+chain. Gate, up, and accumulated down match the serialized GPU control with
+MSE 0, relative L2 0, cosine 1.0, and max error 0. The new kernels compile for
+sm_89 with no spills (91 registers for gate/up; 113 registers and 2.25 KiB
+shared memory for down).
+
+The first seven-run top-8 campaign improved 229.069->129.467 us (1.769x by
+median times; 1.773x paired-ratio median). A full exact crossover measured
+serial/batched/double-fused medians of 41.198/41.036/30.986 us at k=1,
+66.562/42.335/58.787 us at k=2, 123.249/71.043/116.160 us at k=4, and
+235.509/129.370/229.629 us at k=8. This corrects the earlier compute-only
+rule: recompute hidden Q8 only for k=1; use exact ordered batching for k>=2.
+Evidence is in `audits/s14-q3-compute-bandwidth-wave.md`.
+
 ### 2026-09-01 - Q3 compute-for-bandwidth fusion and exact crossover
 
 The native Q3 path now spends redundant Ada compute to avoid global-memory

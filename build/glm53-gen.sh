@@ -9,6 +9,7 @@ exec /opt/cuda/bin/nvcc -ccbin /usr/bin/g++-15 -arch=sm_89 -O3 --use_fast_math -
     -std=c++20 -DINSIGNIA_GLM53_NO_MAIN -I"$repo/include" \
     "$repo/src/bf16.cu" "$repo/src/glm53_expert_bench.cu" "$repo/src/glm53_ops.cu" \
     "$repo/src/glm53_q8.cu" "$repo/src/glm53_fp8.cu" "$repo/src/glm53_dflash2.cu" \
+    "$repo/src/glm53_iq.cu" \
     "$repo/src/glm53_logit_metrics.cu" "$repo/src/glm53_generate.cu" \
     "$repo/src/glm53_index.cpp" "$repo/src/glm53_q8_index.cpp" \
     -o "$out/glm53-generate"

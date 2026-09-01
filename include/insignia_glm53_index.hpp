@@ -17,6 +17,15 @@ enum class TensorType : uint8_t {
     u32 = 5,
     i8 = 6,
     f8_e4m3 = 7,
+    // Geometry-only tensor whose payload lives exclusively in the generated
+    // group-64 FP8 cache. A missing cache entry is a hard error; there is no
+    // fabricated BF16 fallback.
+    external_fp8 = 8,
+    // Native GGUF routed-expert payloads. These are aggregate
+    // [expert,output,input] tensors; ExpertStager slices one expert in place.
+    iq3_xxs = 9,
+    iq4_xs = 10,
+    q6_k = 11,
 };
 
 struct TensorLocation {

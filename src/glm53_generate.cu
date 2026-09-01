@@ -3,6 +3,7 @@
 #include "insignia_glm53_dflash2.cuh"
 #include "insignia_glm53_fp8.cuh"
 #include "insignia_glm53_index.hpp"
+#include "insignia_glm53_iq.cuh"
 #include "insignia_glm53_logit_metrics.cuh"
 #include "insignia_glm53_q8.cuh"
 #include "insignia_glm53_q8_index.hpp"
@@ -552,6 +553,17 @@ ExpertLocations locate_expert(ShardedIndex &model, int layer, int expert) {
              &model.tensor(stem + "up_proj.weight_scale_2")}};
 }
 
+struct Q3ExpertLocations {
+    std::array<const TensorLocation *, 3> body;
+};
+
+Q3ExpertLocations locate_q3_expert(ShardedIndex &model, int layer) {
+    const std::string stem = layer_stem(layer) + "mlp.q3_experts.";
+    return {{&model.tensor(stem + "down_proj.weight"),
+             &model.tensor(stem + "gate_proj.weight"),
+             &model.tensor(stem + "up_proj.weight")}};
+}
+
 struct PackedExpertFileHeader {
     char magic[8];
     uint32_t version, layers, experts, records;
@@ -650,14 +662,22 @@ public:
                       ~(kAlignment - 1));
     static constexpr size_t kWindowBytes =
         (kPayloadCapacity + 2 * kAlignment - 2) & ~(kAlignment - 1);
+    // Block 11 is the largest live Q3 record: IQ4 gate + IQ4 up + Q6 down =
+    // 15.0625 MiB. Each component is read through its own page-aligned
+    // O_DIRECT window, so reserve one exact 16 MiB size class for now.
+    static constexpr size_t kQ3PayloadCapacity = 16ull << 20;
+    static constexpr size_t kQ3WindowBytes =
+        (kQ3PayloadCapacity + 2 * kAlignment - 2) & ~(kAlignment - 1);
     static constexpr uint32_t kNoKey = 0xffffffffu;
 
     explicit ExpertStager(ShardedIndex &model, ShardedIndex *stripe_model,
-                          uint64_t host_cache_bytes)
-        : model_(model), stripe_model_(stripe_model) {
+                          uint64_t host_cache_bytes, bool q3_experts = false)
+        : model_(model), stripe_model_(stripe_model), q3_experts_(q3_experts) {
+        window_bytes_ = q3_experts_ ? kQ3WindowBytes : kWindowBytes;
+        record_capacity_ = q3_experts_ ? kQ3PayloadCapacity : kPayloadCapacity;
         // A full decode token needs 336 records; default the tier just above
         // that and let the environment shrink it on smaller hosts.
-        window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / kWindowBytes, 64, 4096));
+        window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / window_bytes_, 64, 4096));
         // Write-combined host arena (ioaudit #5): windows are pread-written
         // and H2D-read, never CPU-read except the tiny v2 prefix tripwire, so
         // WC pages are safe and may reclaim 5-15% H2D efficiency. A/B only.
@@ -667,7 +687,7 @@ public:
         size_t attempt = size_t(window_count_);
         while (attempt >= 64) {
             void *block = nullptr;
-            const cudaError_t status = cudaHostAlloc(&block, attempt * kWindowBytes + kAlignment - 1,
+            const cudaError_t status = cudaHostAlloc(&block, attempt * window_bytes_ + kAlignment - 1,
                                                      arena_flags);
             if (status == cudaSuccess) {
                 host_raw_ = static_cast<uint8_t *>(block);
@@ -1200,6 +1220,14 @@ public:
     bool active_slot_is_packed() const {
         return device_packed_scales_ && active_device_slot_ >= 0;
     }
+    bool q3_experts() const { return q3_experts_; }
+    size_t window_bytes() const { return window_bytes_; }
+    size_t record_capacity() const { return record_capacity_; }
+    TensorType projection_type(int projection) const {
+        require(q3_experts_ && projection >= 0 && projection < 3,
+                "Q3 projection type requested outside native Q3 execution");
+        return active_.types[size_t(projection)];
+    }
     bool packed_direct_active() const {
         return packed_direct_ && active_slot_is_packed();
     }
@@ -1317,6 +1345,7 @@ private:
     struct Layout {
         std::array<size_t, 3> body{};
         std::array<size_t, 3> scales{};
+        std::array<TensorType, 3> types{};
         std::array<size_t, 3> packed_body{}, packed_blob{}, packed_device{};
         std::array<size_t, 3> packed_escapes{}, packed_codebook{}, packed_prefix{};
         std::array<size_t, 3> packed_blob_bytes{};
@@ -1438,6 +1467,19 @@ private:
         return packed_entries_[index];
     }
     uint64_t source_bytes(int layer, int expert) const {
+        if (q3_experts_) {
+            (void)expert;
+            const Q3ExpertLocations tensors = locate_q3_expert(model_, layer);
+            uint64_t bytes = 0;
+            for (const TensorLocation *tensor : tensors.body) {
+                require(tensor->shape.size() == 3 &&
+                            tensor->shape[0] == model_.experts() &&
+                            tensor->bytes % model_.experts() == 0,
+                        "malformed aggregate Q3 expert tensor");
+                bytes += tensor->bytes / model_.experts();
+            }
+            return bytes;
+        }
         return packed_fd_ >= 0 ? packed_entry(layer, expert).padded_bytes
                                : kBodyBytes + kScaleBytes + 3 * sizeof(float);
     }
@@ -1893,7 +1935,7 @@ private:
     }
     void ensure_device_scratch() {
         if (!device_)
-            check(cudaMalloc(&device_, kPayloadCapacity), "cudaMalloc expert record");
+            check(cudaMalloc(&device_, record_capacity_), "cudaMalloc expert record");
     }
 
     // Sizes and allocates the VRAM tier at first expert use, when every
@@ -1915,7 +1957,7 @@ private:
             budget = free_bytes > (768ull << 20) ? free_bytes - (768ull << 20) : 0;
         }
         const size_t expanded_stride =
-            (kPayloadCapacity + kAlignment - 1) & ~(kAlignment - 1);
+            (record_capacity_ + kAlignment - 1) & ~(kAlignment - 1);
         const size_t stride = device_packed_scales_ ? packed_device_stride_ : expanded_stride;
         require(stride && (!device_packed_scales_ || stride < expanded_stride),
                 "packed device-slot stride is unavailable or not smaller");
@@ -2260,6 +2302,7 @@ private:
     // physical drive). Cached per (layer,expert); the lookup walks 9 index
     // entries once per distinct key.
     int drive_of(uint32_t key, int layer, int expert) {
+        if (q3_experts_) return 0;
         if (packed_fd_ >= 0) return 0;
         if (stripe_failed_.load(std::memory_order_relaxed)) return 0;
         std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -2349,19 +2392,60 @@ private:
         // record in a drive's queue waits forever.
         pool_cv_.notify_all();
     }
+    void stage_q3(Layout &layout, std::array<float, 3> &globals,
+                  uint8_t *&payload, uint8_t *window, int layer, int expert) {
+        require(q3_experts_ && expert >= 0 && expert < int(model_.experts()),
+                "invalid native Q3 expert request");
+        const Q3ExpertLocations tensors = locate_q3_expert(model_, layer);
+        layout = {};
+        globals = {};
+        size_t cursor = 0;
+        for (int projection = 0; projection < 3; ++projection) {
+            const TensorLocation &tensor = *tensors.body[size_t(projection)];
+            require(tensor.shape.size() == 3 && tensor.shape[0] == model_.experts() &&
+                        tensor.bytes % model_.experts() == 0 &&
+                        (tensor.type == TensorType::iq3_xxs ||
+                         tensor.type == TensorType::iq4_xs ||
+                         tensor.type == TensorType::q6_k),
+                    "malformed native Q3 expert component");
+            const uint64_t bytes = tensor.bytes / model_.experts();
+            const uint64_t offset = tensor.offset + uint64_t(expert) * bytes;
+            const uint64_t aligned_offset = offset & ~(uint64_t(kAlignment) - 1);
+            const size_t delta = size_t(offset - aligned_offset);
+            const size_t request =
+                (delta + size_t(bytes) + kAlignment - 1) & ~(kAlignment - 1);
+            require(cursor + request <= record_capacity_,
+                    "native Q3 expert exceeds staging size class");
+            const uint64_t actual_delta = model_.read_span_direct_window(
+                tensor.shard, offset, bytes, window + cursor, request);
+            require(actual_delta == delta, "native Q3 direct-read delta changed");
+            layout.body[size_t(projection)] = cursor + delta;
+            layout.types[size_t(projection)] = tensor.type;
+            cursor += request;
+        }
+        layout.bytes = cursor;
+        payload = window;
+    }
     void read_window(int window, void *packed_scratch) {
         WindowState &state = windows_[size_t(window)];
         try {
-            if (packed_fd_ >= 0) {
+            if (q3_experts_) {
+                stage_q3(state.layout, state.globals, state.payload,
+                         host_ + size_t(window) * window_bytes_,
+                         state.layer, state.expert);
+                ++drive_records_[0];
+                drive_bytes_[0].fetch_add(state.source_bytes,
+                                          std::memory_order_relaxed);
+            } else if (packed_fd_ >= 0) {
                 stage_packed(state.layout, state.globals, state.payload,
-                             host_ + size_t(window) * kWindowBytes,
+                             host_ + size_t(window) * window_bytes_,
                              state.layer, state.expert, packed_scratch);
             } else {
                 auto stage_from = [&](ShardedIndex &source) {
                     const ExpertLocations tensors =
                         locate_expert(source, state.layer, state.expert);
                     stage(source, state.layout, state.globals, state.payload, tensors,
-                          host_ + size_t(window) * kWindowBytes, state);
+                          host_ + size_t(window) * window_bytes_, state);
                 };
                 if (state.drive == 1 && stripe_model_ &&
                     stripe_failed_.load(std::memory_order_relaxed)) {
@@ -2462,6 +2546,9 @@ private:
 
     ShardedIndex &model_;
     ShardedIndex *stripe_model_ = nullptr;
+    bool q3_experts_ = false;
+    size_t window_bytes_ = kWindowBytes;
+    size_t record_capacity_ = kPayloadCapacity;
     int packed_fd_ = -1, packed_direct_fd_ = -1;
     int packed_version_ = 0;
     std::vector<PackedExpertIndexEntry> packed_entries_;
@@ -3232,7 +3319,10 @@ public:
             const std::string stem = layer_stem(int(first_sparse)) + "mlp.";
             shared_intermediate_ = int(model_.tensor(stem + "shared_experts.gate_proj.weight").shape[0]);
             nvfp4_experts_ = model_.has(stem + "experts.0.down_proj.weight_scale");
-            if (nvfp4_experts_) {
+            q3_experts_ = model_.has(stem + "q3_experts.down_proj.weight");
+            require(!(nvfp4_experts_ && q3_experts_),
+                    "checkpoint exposes both NVFP4 and native Q3 expert schemas");
+            if (nvfp4_experts_ || q3_experts_) {
                 // Host-RAM LRU over whole expert records: one decode token
                 // touches 42 x 8 = 336 records, so the tier must exceed that
                 // to hit at all. Default 5 GiB pinned (~370 records) inside
@@ -3241,7 +3331,8 @@ public:
                 if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_CACHE_MB"))
                     host_cache = uint64_t(std::max(0, std::atoi(budget))) << 20;
                 expert_stager_ =
-                    std::make_unique<ExpertStager>(model_, stripe_model_.get(), host_cache);
+                    std::make_unique<ExpertStager>(model_, stripe_model_.get(), host_cache,
+                                                   q3_experts_);
             }
         }
         if (!moe_metrics_path_.empty() ||
@@ -3435,6 +3526,12 @@ public:
             nv_workspace_2048_.reset(
                 insignia::glm53::nvfp4_workspace_rows_bytes(moe_intermediate_, kMaxVerify));
         }
+        if (q3_experts_) {
+            iq_workspace_4096_.reset(
+                insignia::glm53::iq_workspace_rows_bytes(hidden_, kMaxVerify));
+            iq_workspace_2048_.reset(
+                insignia::glm53::iq_workspace_rows_bytes(moe_intermediate_, kMaxVerify));
+        }
         if (q8_index_)
             q8_workspace_.reset(q8_index_->format() == Cache8Format::fp8_e4m3 ?
                 insignia::glm53::fp8_batch_workspace_bytes(16384, kMaxChunk()) :
@@ -3501,11 +3598,14 @@ public:
                     "KDA %dx%d, MLA %dx%d%s\n",
                     hidden_, layer_count, kda_layers_, mla_layers_, moe_experts_, moe_topk_,
                     moe_intermediate_, kda_heads_, kda_head_dim_, mla_heads_, mla_head_dim_,
-                    nvfp4_experts_ ? ", NVFP4 experts" : ", BF16 experts");
+                    q3_experts_ ? ", native Q3 experts" :
+                    (nvfp4_experts_ ? ", NVFP4 experts" : ", BF16 experts"));
         if (expert_stager_ && expert_stager_->cache_slots())
-            std::printf("expert cache: %d pinned host-RAM NVFP4 records (%.1f MiB)\n",
+            std::printf("expert cache: %d pinned host-RAM %s records (%.1f MiB)\n",
                         expert_stager_->cache_slots(),
-                        expert_stager_->cache_slots() * ExpertStager::kWindowBytes / double(1 << 20));
+                        q3_experts_ ? "Q3" : "NVFP4",
+                        expert_stager_->cache_slots() * expert_stager_->window_bytes() /
+                            double(1 << 20));
         else if (expert_stager_)
             std::printf("expert cache: disabled (no pinned host records)\n");
         load_cct();
@@ -3840,7 +3940,7 @@ private:
     int mla_heads_ = 0, mla_head_dim_ = 0, mla_layers_ = 0, kda_layers_ = 0;
     int moe_experts_ = 0, moe_topk_ = 0, moe_intermediate_ = 0;
     int dense_intermediate_ = 0, shared_intermediate_ = 0;
-    bool nvfp4_experts_ = false;
+    bool nvfp4_experts_ = false, q3_experts_ = false;
     bool df_logit_guard_on() const {
         return df_logit_guard_margin_ > 0.0f || df_calibration_guard_js_ > 0.0f ||
             df_uncertainty_top1_p_ > 0.0f || df_uncertainty_top1_drop_ > 0.0f ||
@@ -3889,6 +3989,7 @@ private:
     DeviceBuffer<float> c_kv_, c_mlaq_, c_mlao_, c_gateu_, c_up_, c_act_, c_router_;
     DeviceBuffer<float> c_post_, c_comb_, c_beta_;
     DeviceBuffer<uint8_t> nv_workspace_4096_, nv_workspace_2048_, q8_workspace_;
+    DeviceBuffer<uint8_t> iq_workspace_4096_, iq_workspace_2048_;
     // MTP speculative decoding state (INSIGNIA_GLM53_MTP=K, 0 disables).
     int mtp_draft_total_ = 0;
     int mtp_variant_ = 0;  // 0: hnorm(mean-of-streams) 1: hnorm(final-normed) 2: swapped eh concat
@@ -3939,9 +4040,9 @@ const float *Runner::device_f32(std::string_view name) {
 
 void Runner::linear(std::string_view name, const float *input, float *output, int rows, int cols) {
     const TensorLocation &weight = model_.tensor(name);
-    require(weight.type == TensorType::bf16 && weight.shape.size() == 2 &&
-            weight.shape[0] == uint32_t(rows) && weight.shape[1] == uint32_t(cols),
-            "wrong BF16 linear geometry for " + std::string(name));
+    require(weight.shape.size() == 2 && weight.shape[0] == uint32_t(rows) &&
+                weight.shape[1] == uint32_t(cols),
+            "wrong linear geometry for " + std::string(name));
     if (q8_index_) {
         // The 8-bit cache holds fabricated layer-45 entries (it lists
         // shared-expert tensors that do not exist in the MTP layer), so its
@@ -3969,6 +4070,10 @@ void Runner::linear(std::string_view name, const float *input, float *output, in
             return;
         }
     }
+    require(weight.type != TensorType::external_fp8,
+            "external FP8 tensor is missing from cache: " + std::string(name));
+    require(weight.type == TensorType::bf16,
+            "wrong BF16 fallback type for " + std::string(name));
     const uint32_t *device = reinterpret_cast<const uint32_t *>(stager_.load(weight));
     insignia::bf16_gemv_v2(device, input, output, rows, cols);
 }
@@ -4012,9 +4117,9 @@ void Runner::linear_multi(std::string_view name, const float *inputs, float *out
                           int tokens, int rows, int cols) {
     require(tokens >= 1 && tokens <= kMaxChunk(), "prefill chunk out of range");
     const TensorLocation &weight = model_.tensor(name);
-    require(weight.type == TensorType::bf16 && weight.shape.size() == 2 &&
-            weight.shape[0] == uint32_t(rows) && weight.shape[1] == uint32_t(cols),
-            "wrong multi-token BF16 linear geometry for " + std::string(name));
+    require(weight.shape.size() == 2 && weight.shape[0] == uint32_t(rows) &&
+                weight.shape[1] == uint32_t(cols),
+            "wrong multi-token linear geometry for " + std::string(name));
     const auto run_chunk = [&](int row, int chunk_rows) {
         for (int token = 0; token < tokens; ++token)
             insignia::bf16_gemv_v2(chunk_bf16_weights_, inputs + size_t(token) * cols,
@@ -4051,6 +4156,10 @@ void Runner::linear_multi(std::string_view name, const float *inputs, float *out
             return;
         }
     }
+    require(weight.type != TensorType::external_fp8,
+            "external FP8 tensor is missing from multi-token cache: " + std::string(name));
+    require(weight.type == TensorType::bf16,
+            "wrong multi-token BF16 fallback type for " + std::string(name));
     const uint64_t row_bytes = uint64_t(cols) * 2;
     const uint64_t capacity = TensorStager::kCapacity / row_bytes;
     if (stager_.is_resident(weight)) {
@@ -4068,9 +4177,9 @@ void Runner::linear_multi(std::string_view name, const float *inputs, float *out
 
 void Runner::linear_rows(std::string_view name, const TensorLocation &weight, uint64_t row, int rows,
                          const float *input, float *output, int cols) {
-    require(weight.type == TensorType::bf16 && weight.shape.size() == 2 &&
-            weight.shape[1] == uint32_t(cols) && row + rows <= weight.shape[0],
-            "wrong chunked BF16 linear geometry");
+    require(weight.shape.size() == 2 && weight.shape[1] == uint32_t(cols) &&
+                row + rows <= weight.shape[0],
+            "wrong chunked linear geometry");
     if (q8_index_) {
         if (const Q8TensorLocation *q8 = q8_index_->find(name)) {
             require(q8->rows == weight.shape[0] && q8->cols == uint32_t(cols),
@@ -4086,6 +4195,9 @@ void Runner::linear_rows(std::string_view name, const TensorLocation &weight, ui
             return;
         }
     }
+    require(weight.type != TensorType::external_fp8,
+            "external FP8 tensor is missing from chunked cache: " + std::string(name));
+    require(weight.type == TensorType::bf16, "wrong chunked BF16 fallback type");
     const uint64_t row_bytes = uint64_t(cols) * 2;
     const uint32_t *device = reinterpret_cast<const uint32_t *>(
         stager_.load(weight, row * row_bytes, uint64_t(rows) * row_bytes));
@@ -4195,8 +4307,6 @@ void Runner::extract_mla_absorb() {
         const std::string name =
             layer_stem(mla_slot_[size_t(slot)]) + "self_attn.kv_b_proj.weight";
         const TensorLocation &location = model_.tensor(name);
-        require(location.bytes == size_t(kv_b_rows_) * latent * sizeof(uint16_t),
-                "unexpected kv_b_proj tensor size");
         if (use_fp8) {
             const Q8TensorLocation *quantized = q8_index_->find(name);
             require(quantized && quantized->rows == uint32_t(kv_b_rows_) &&
@@ -4225,6 +4335,9 @@ void Runner::extract_mla_absorb() {
                                 host_uv.data() + (h * head_dim + j) * latent);
                 }
         } else {
+            require(location.type == TensorType::bf16 &&
+                        location.bytes == size_t(kv_b_rows_) * latent * sizeof(uint16_t),
+                    "unexpected BF16 kv_b_proj tensor size");
             std::vector<uint16_t> source(size_t(kv_b_rows_) * latent);
             model_.read(location, source.data());
             for (size_t h = 0; h < heads; ++h)
@@ -4615,7 +4728,7 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
     route_trace(layer, selected, scores);
 
     check(cudaMemset(routed_, 0, hidden_ * sizeof(float)), "clear routed output");
-    if (!nvfp4_experts_) {
+    if (!nvfp4_experts_ && !q3_experts_) {
         // BF16 checkpoints (the tiny oracle among them) take the plain linear
         // path; there are no block scales to stage.
         for (int slot = 0; slot < moe_topk_; ++slot) {
@@ -4640,8 +4753,15 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
         // so speculative reads can never delay the current GEMVs.
         if (prefetch_on_ && !cct_.empty())
             cct_prefetch(layer);
-        check(insignia::glm53::nvfp4_quantize_activation(input, hidden_, nv_workspace_4096_),
-              "quantize expert input");
+        constexpr int direct_id = 0;
+        if (q3_experts_)
+            check(insignia::glm53::iq_quantize_activation_rows(
+                      input, hidden_, &direct_id, 1, iq_workspace_4096_.get()),
+                  "quantize Q3 expert input");
+        else
+            check(insignia::glm53::nvfp4_quantize_activation(
+                      input, hidden_, nv_workspace_4096_),
+                  "quantize expert input");
         // The shared expert is dense-resident FP8; running it first lets its
         // GEMVs hide under the routed records' disk reads. Routed downs land
         // in a scratch buffer so `output` keeps the shared result.
@@ -4649,8 +4769,49 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
         for (int slot = 0; slot < moe_topk_; ++slot) {
             const int expert = selected[slot];
             expert_stager_->upload(slot);
-            constexpr int direct_id = 0;
-            check(expert_stager_->packed_direct_active()
+            if (q3_experts_) {
+                const TensorType gate_type = expert_stager_->projection_type(1);
+                const TensorType up_type = expert_stager_->projection_type(2);
+                require(gate_type == up_type,
+                        "Q3 expert gate/up formats must match");
+                if (gate_type == TensorType::iq3_xxs) {
+                    check(insignia::glm53::iq3_xxs_gemv2_rows(
+                              expert_stager_->gate_weight(),
+                              expert_stager_->up_weight(), iq_workspace_4096_.get(),
+                              1, gate_.get(), up_.get(), &direct_id,
+                              moe_intermediate_, hidden_),
+                          "Q3 IQ3 gate/up");
+                } else if (gate_type == TensorType::iq4_xs) {
+                    check(insignia::glm53::iq4_xs_gemv_rows(
+                              expert_stager_->gate_weight(), iq_workspace_4096_.get(),
+                              1, gate_.get(), &direct_id,
+                              moe_intermediate_, hidden_),
+                          "Q3 IQ4 gate");
+                    check(insignia::glm53::iq4_xs_gemv_rows(
+                              expert_stager_->up_weight(), iq_workspace_4096_.get(),
+                              1, up_.get(), &direct_id,
+                              moe_intermediate_, hidden_),
+                          "Q3 IQ4 up");
+                } else {
+                    require(false, "unsupported Q3 gate/up format");
+                }
+                const float weight = 2.5f * scores[expert] / denominator;
+                const TensorType down_type = expert_stager_->projection_type(0);
+                if (down_type == TensorType::iq4_xs) {
+                    check(insignia::glm53::iq4_xs_swiglu_gemv_acc_fused_x1(
+                              expert_stager_->down_weight(), gate_.get(), up_.get(),
+                              0, routed_.get(), 0, weight, hidden_, moe_intermediate_),
+                          "Q3 IQ4 fused routed down");
+                } else if (down_type == TensorType::q6_k) {
+                    check(insignia::glm53::q6_k_swiglu_gemv_acc_fused_x1(
+                              expert_stager_->down_weight(), gate_.get(), up_.get(),
+                              0, routed_.get(), 0, weight, hidden_, moe_intermediate_),
+                          "Q3 Q6 fused routed down");
+                } else {
+                    require(false, "unsupported Q3 down format");
+                }
+            } else {
+                check(expert_stager_->packed_direct_active()
                       ? insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_packed(
                             expert_stager_->gate_weight(),
                             expert_stager_->gate_packed_scale(),
@@ -4666,7 +4827,7 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
                             expert_stager_->gate_global(slot), expert_stager_->up_weight(),
                             expert_stager_->up_scale(), expert_stager_->up_global(slot),
                             nv_workspace_4096_, gate_, up_, moe_intermediate_, hidden_),
-                  "routed expert gate/up");
+                      "routed expert gate/up");
                 check(insignia::glm53::quantize_swiglu_activation(gate_, up_, moe_intermediate_, nv_workspace_2048_),
                       "quantize routed SwiGLU");
                 const float weight = 2.5f * scores[expert] / denominator;
@@ -4684,9 +4845,10 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
                                 routed_, weight, hidden_, moe_intermediate_),
                       "routed expert down");
             }
+            }
         add_kernel<<<16, 256>>>(output, routed_, hidden_);
     }
-    if (!nvfp4_experts_) {
+    if (!nvfp4_experts_ && !q3_experts_) {
         compute_mlp(stem + "shared_experts.", input, output, shared_intermediate_);
         add_kernel<<<16, 256>>>(output, routed_, hidden_);
     } else {
@@ -6775,7 +6937,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         return;
     }
     check(cudaMemset(c_routed_, 0, size_t(tokens) * hidden_ * sizeof(float)), "clear routed (prefill)");
-    if (nvfp4_experts_ && expert_stager_) {
+    if ((nvfp4_experts_ || q3_experts_) && expert_stager_) {
         // Routing bookkeeping + speculative next-layer reads, mirroring the
         // decode path. Demand staging for the whole deduplicated union comes
         // first so all four readers stream the layer while its first GEMV
@@ -6805,7 +6967,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);
     }
 
-    if (!nvfp4_experts_) {
+    if (!nvfp4_experts_ && !q3_experts_) {
         for (int expert : distinct) {
             std::vector<int> users;
             for (int token = 0; token < tokens; ++token)
@@ -6938,13 +7100,89 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                             out_ids[size_t(total)] = token * topk + pick_slot;
                             combine[size_t(total)] = selection[size_t(token)][size_t(pick_slot)].second;
                             ++total;
-                        }
+                }
                 for (int base = 0; base < total; base += kMaxVerify) {
                     const int count = std::min(kMaxVerify, total - base);
-                    check(insignia::glm53::nvfp4_quantize_activation_rows(
-                              input, hidden_, &users[size_t(base)], count, nv_workspace_4096_),
-                          "quantize expert input (batched prefill)");
-                    check(expert_stager_->packed_direct_active()
+                    if (q3_experts_) {
+                        check(insignia::glm53::iq_quantize_activation_rows(
+                                  input, hidden_, &users[size_t(base)], count,
+                                  iq_workspace_4096_.get()),
+                              "quantize Q3 expert input (batched prefill)");
+                        const TensorType gate_type = expert_stager_->projection_type(1);
+                        const TensorType up_type = expert_stager_->projection_type(2);
+                        require(gate_type == up_type,
+                                "Q3 expert gate/up formats must match");
+                        if (gate_type == TensorType::iq3_xxs) {
+                            check(insignia::glm53::iq3_xxs_gemv2_rows(
+                                      expert_stager_->gate_weight(),
+                                      expert_stager_->up_weight(),
+                                      iq_workspace_4096_.get(), count,
+                                      c_gateu_.get(), c_up_.get(),
+                                      &users[size_t(base)], moe_intermediate_, hidden_),
+                                  "Q3 IQ3 gate/up (batched prefill)");
+                        } else if (gate_type == TensorType::iq4_xs) {
+                            check(insignia::glm53::iq4_xs_gemv_rows(
+                                      expert_stager_->gate_weight(),
+                                      iq_workspace_4096_.get(), count,
+                                      c_gateu_.get(), &users[size_t(base)],
+                                      moe_intermediate_, hidden_),
+                                  "Q3 IQ4 gate (batched prefill)");
+                            check(insignia::glm53::iq4_xs_gemv_rows(
+                                      expert_stager_->up_weight(),
+                                      iq_workspace_4096_.get(), count,
+                                      c_up_.get(), &users[size_t(base)],
+                                      moe_intermediate_, hidden_),
+                                  "Q3 IQ4 up (batched prefill)");
+                        } else {
+                            require(false, "unsupported Q3 gate/up format");
+                        }
+                        check(insignia::glm53::iq_quantize_swiglu_rows(
+                                  c_gateu_.get(), c_up_.get(), moe_intermediate_,
+                                  &users[size_t(base)], count,
+                                  iq_workspace_2048_.get()),
+                              "quantize Q3 routed SwiGLU (batched prefill)");
+                        const TensorType down_type = expert_stager_->projection_type(0);
+                        if (retain_down_results) {
+                            if (down_type == TensorType::iq4_xs)
+                                check(insignia::glm53::iq4_xs_gemv_rows(
+                                          expert_stager_->down_weight(),
+                                          iq_workspace_2048_.get(), count,
+                                          c_expert_out_.get(), &out_ids[size_t(base)],
+                                          hidden_, moe_intermediate_),
+                                      "Q3 IQ4 down (ordered batched)");
+                            else if (down_type == TensorType::q6_k)
+                                check(insignia::glm53::q6_k_gemv_rows(
+                                          expert_stager_->down_weight(),
+                                          iq_workspace_2048_.get(), count,
+                                          c_expert_out_.get(), &out_ids[size_t(base)],
+                                          hidden_, moe_intermediate_),
+                                      "Q3 Q6 down (ordered batched)");
+                            else
+                                require(false, "unsupported Q3 down format");
+                        } else {
+                            if (down_type == TensorType::iq4_xs)
+                                check(insignia::glm53::iq4_xs_gemv_acc_rows(
+                                          expert_stager_->down_weight(),
+                                          iq_workspace_2048_.get(), count,
+                                          c_routed_.get(), &users[size_t(base)],
+                                          &combine[size_t(base)], hidden_, moe_intermediate_),
+                                      "Q3 IQ4 down (batched prefill)");
+                            else if (down_type == TensorType::q6_k)
+                                check(insignia::glm53::q6_k_gemv_acc_rows(
+                                          expert_stager_->down_weight(),
+                                          iq_workspace_2048_.get(), count,
+                                          c_routed_.get(), &users[size_t(base)],
+                                          &combine[size_t(base)], hidden_, moe_intermediate_),
+                                      "Q3 Q6 down (batched prefill)");
+                            else
+                                require(false, "unsupported Q3 down format");
+                        }
+                    } else {
+                        check(insignia::glm53::nvfp4_quantize_activation_rows(
+                                  input, hidden_, &users[size_t(base)], count,
+                                  nv_workspace_4096_),
+                              "quantize expert input (batched prefill)");
+                        check(expert_stager_->packed_direct_active()
                               ? insignia::glm53::nvfp4_gemv2_dp4a_quantized_rows_packed(
                                     expert_stager_->gate_weight(),
                                     expert_stager_->gate_packed_scale(),
@@ -6963,12 +7201,13 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                     expert_stager_->up_global(int(slot)),
                                     nv_workspace_4096_, count, c_gateu_.get(), c_up_.get(),
                                     &users[size_t(base)], moe_intermediate_, hidden_),
-                          "routed expert gate/up (batched prefill)");
-                    check(insignia::glm53::quantize_swiglu_activation_rows(
-                              c_gateu_.get(), c_up_.get(), moe_intermediate_, &users[size_t(base)],
-                              count, nv_workspace_2048_), "quantize routed SwiGLU (batched prefill)");
-                    if (retain_down_results) {
-                        check(expert_stager_->packed_direct_active()
+                              "routed expert gate/up (batched prefill)");
+                        check(insignia::glm53::quantize_swiglu_activation_rows(
+                                  c_gateu_.get(), c_up_.get(), moe_intermediate_,
+                                  &users[size_t(base)], count, nv_workspace_2048_),
+                              "quantize routed SwiGLU (batched prefill)");
+                        if (retain_down_results) {
+                            check(expert_stager_->packed_direct_active()
                                   ? insignia::glm53::nvfp4_gemv_dp4a_quantized_rows_packed(
                                         expert_stager_->down_weight(),
                                         expert_stager_->down_packed_scale(),
@@ -6991,9 +7230,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         expert_stager_->down_global(int(slot)),
                                         nv_workspace_2048_, count, c_expert_out_.get(),
                                         &out_ids[size_t(base)], hidden_, moe_intermediate_),
-                              "routed expert down (ordered batched)");
-                    } else {
-                        check(expert_stager_->packed_direct_active()
+                                  "routed expert down (ordered batched)");
+                        } else {
+                            check(expert_stager_->packed_direct_active()
                                   ? insignia::glm53::nvfp4_gemv_dp4a_acc_quantized_rows_packed(
                                         expert_stager_->down_weight(),
                                         expert_stager_->down_packed_scale(),
@@ -7007,7 +7246,8 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                         expert_stager_->down_global(int(slot)), nv_workspace_2048_,
                                         count, c_routed_.get(), &users[size_t(base)],
                                         &combine[size_t(base)], hidden_, moe_intermediate_),
-                              "routed expert down (batched prefill)");
+                                  "routed expert down (batched prefill)");
+                        }
                     }
                 }
             }
@@ -7049,7 +7289,7 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
                                candidate_choice, router_summary, candidate_residency,
                                input, tokens);
     }
-    if (!nvfp4_experts_)
+    if (!nvfp4_experts_ && !q3_experts_)
         mlp_multi(stem + "shared_experts.", input, output, tokens, shared_intermediate_);
     for (int token = 0; token < tokens; ++token)
         add_kernel<<<16, 256>>>(output + size_t(token) * hidden_,

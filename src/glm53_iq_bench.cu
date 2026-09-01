@@ -274,6 +274,11 @@ int main(int argc, char **argv) {
                      insignia::glm53::iq_prefill_workspace_bytes(
                          gate.cols, kPrefillTokens)),
           "cudaMalloc IQ prefill workspace");
+    void *iq_down_prefill_workspace = nullptr;
+    check(cudaMalloc(&iq_down_prefill_workspace,
+                     insignia::glm53::iq_prefill_workspace_bytes(
+                         down.cols, kPrefillTokens)),
+          "cudaMalloc IQ down prefill workspace");
     auto *down_prefill_output_device =
         device_alloc<float>(size_t(kPrefillTokens) * down.rows);
     const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
@@ -474,6 +479,27 @@ int main(int argc, char **argv) {
               imma_gate_metrics.cosine < 0.99980 ||
               imma_up_metrics.relative > 2.0e-2 ||
               imma_up_metrics.cosine < 0.99980;
+
+    check(insignia::glm53::iq_quantize_activation_prefill(
+              down_prefill_device, down.cols, kPrefillTokens,
+              iq_down_prefill_workspace),
+          "quantize IQ4 IMMA prefill");
+    check(insignia::glm53::iq4_xs_gemm_prefill32_imma(
+              down.weights_device, iq_down_prefill_workspace,
+              kPrefillTokens, down_prefill_output_device,
+              down.rows, down.cols),
+          "IQ4 IMMA32 correctness");
+    check(cudaDeviceSynchronize(), "IQ4 IMMA32 synchronize");
+    std::vector<float> imma_down_prefill(size_t(kPrefillTokens) * down.rows);
+    check(cudaMemcpy(imma_down_prefill.data(), down_prefill_output_device,
+                     imma_down_prefill.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy IQ4 IMMA32 prefill");
+    const Metrics imma_down_metrics =
+        compare(imma_down_prefill, down_prefill_reference);
+    print_metrics("IQ4 IMMA prefill", imma_down_metrics);
+    failed |= imma_down_metrics.relative > 2.0e-2 ||
+              imma_down_metrics.cosine < 0.99980;
 
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
@@ -1358,6 +1384,23 @@ int main(int argc, char **argv) {
             launch_iq3_prefill_quantize();
             launch_gate_up_imma32_compute();
         };
+        const auto launch_iq4_prefill_quantize = [&] {
+            check(insignia::glm53::iq_quantize_activation_prefill(
+                      down_prefill_device, down.cols, kPrefillTokens,
+                      iq_down_prefill_workspace),
+                  "timed IQ4 IMMA prefill quantize");
+        };
+        const auto launch_down_imma32_compute = [&] {
+            check(insignia::glm53::iq4_xs_gemm_prefill32_imma(
+                      down.weights_device, iq_down_prefill_workspace,
+                      kPrefillTokens, down_prefill_output_device,
+                      down.rows, down.cols),
+                  "timed IQ4 IMMA32 compute");
+        };
+        const auto launch_down_imma32_pipeline = [&] {
+            launch_iq4_prefill_quantize();
+            launch_down_imma32_compute();
+        };
         const float gate_q8_compute32_us = benchmark_us(launch_gate_q8_compute32);
         const float gate_q8_pipeline32_us = benchmark_us(launch_gate_q8_pipeline32);
         const float gate_wmma32_us = benchmark_us(launch_gate_wmma32);
@@ -1374,6 +1417,12 @@ int main(int argc, char **argv) {
             benchmark_us(launch_gate_up_imma32_compute);
         const float gate_up_imma32_pipeline_us =
             benchmark_us(launch_gate_up_imma32_pipeline);
+        const float iq4_prefill_quantize_us =
+            benchmark_us(launch_iq4_prefill_quantize);
+        const float down_imma32_compute_us =
+            benchmark_us(launch_down_imma32_compute);
+        const float down_imma32_pipeline_us =
+            benchmark_us(launch_down_imma32_pipeline);
         std::printf("IQ3 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
                     "%.3fx pipe speedup\n",
                     gate_q8_compute32_us, gate_q8_pipeline32_us, gate_wmma32_us,
@@ -1391,6 +1440,11 @@ int main(int argc, char **argv) {
                     gate_up_wmma32_pair_us, iq3_prefill_quantize_us,
                     gate_up_imma32_compute_us, gate_up_imma32_pipeline_us,
                     gate_up_wmma32_pair_us / gate_up_imma32_pipeline_us);
+        std::printf("IQ4 prefill32 FP16/Q8/IMMA/pipe "
+                    "%8.3f/%8.3f/%8.3f/%8.3f us %.3fx pipe\n",
+                    down_wmma32_us, iq4_prefill_quantize_us,
+                    down_imma32_compute_us, down_imma32_pipeline_us,
+                    down_wmma32_us / down_imma32_pipeline_us);
         for (int batch = 0; batch < 4; ++batch) {
             cudaFree(gate_prefill_workspace[batch]);
             cudaFree(down_prefill_workspace[batch]);
@@ -1420,6 +1474,7 @@ int main(int argc, char **argv) {
     cudaFree(gate_prefill_device); cudaFree(down_prefill_device);
     cudaFree(gate_prefill_output_device); cudaFree(up_prefill_output_device);
     cudaFree(iq_prefill_workspace);
+    cudaFree(iq_down_prefill_workspace);
     cudaFree(down_prefill_output_device);
     return failed ? 3 : 0;
 }

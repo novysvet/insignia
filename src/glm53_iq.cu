@@ -1606,6 +1606,114 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
 }
 
 template <int BLOCKS>
+__global__ __launch_bounds__(128, 4) void iq4_xs_imma32_kernel(
+    const IQ4XSBlock *__restrict__ weights,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ y,
+    int rows,
+    int words_per_row) {
+    __shared__ __align__(128) uint32_t shared_a[2][16][8];
+    __shared__ __align__(128) uint32_t shared_b[16][8];
+    __shared__ __align__(128) float shared_weight_scale[16];
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5;
+    const int lane = thread & 31;
+    const int row_tile = warp >> 1;
+    const int token_half = warp & 1;
+    const int row_start = blockIdx.x * 16;
+    const int token_start = blockIdx.y * 32;
+    const int token_low = lane >> 2;
+    const int token_high = token_low + 8;
+    const int out_even = (lane & 3) * 2;
+    const int out_odd = out_even + 1;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+    float result2 = 0.0f;
+    float result3 = 0.0f;
+
+    for (int group = 0; group < BLOCKS * 8; ++group) {
+#pragma unroll
+        for (int activation_item = thread; activation_item < 32 * 8;
+             activation_item += 128) {
+            const int activation_token = activation_item >> 3;
+            const int activation_word = activation_item & 7;
+            shared_a[activation_token >> 4][activation_token & 15]
+                    [activation_word] =
+                __ldg(xq +
+                      static_cast<size_t>(token_start + activation_token) *
+                          words_per_row +
+                      group * 8 + activation_word);
+        }
+        if (thread < 64) {
+            const int local_row = thread >> 2;
+            const int local_word = thread & 3;
+            const IQ4XSBlock &block =
+                weights[static_cast<size_t>(row_start + local_row) * BLOCKS +
+                        (group >> 3)];
+            const int subgroup = group & 7;
+            const int low =
+                (block.scales_l[subgroup >> 1] >>
+                 (4 * (subgroup & 1))) & 15;
+            const int high = (block.scales_h >> (2 * subgroup)) & 3;
+            const int2 decoded = iq4_lookup8(__ldcs(
+                reinterpret_cast<const uint32_t *>(
+                    block.qs + 16 * subgroup) +
+                local_word));
+            shared_b[local_row][local_word] = uint32_t(decoded.x);
+            shared_b[local_row][4 + local_word] = uint32_t(decoded.y);
+            if (!local_word)
+                shared_weight_scale[local_row] =
+                    __half2float(block.d) *
+                    float((low | (high << 4)) - 32);
+        }
+        __syncthreads();
+
+        IQI8A a{};
+        const uint32_t *a_address =
+            &shared_a[token_half][lane & 15][(lane >> 4) * 4];
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(a.x[0]), "=r"(a.x[1]), "=r"(a.x[2]), "=r"(a.x[3])
+            : "l"(a_address));
+        const int b_row = row_tile * 8 + (lane >> 2);
+        const int b_quarter = lane & 3;
+        const IQI8B b{{shared_b[b_row][b_quarter],
+                       shared_b[b_row][4 + b_quarter]}};
+        const IQI32C dots = iq_imma_m16n8k32(a, b);
+        const float weight_even =
+            shared_weight_scale[row_tile * 8 + out_even];
+        const float weight_odd =
+            shared_weight_scale[row_tile * 8 + out_odd];
+        const float activation_low = __ldg(
+            xscale +
+            static_cast<size_t>(token_start + token_half * 16 + token_low) *
+                (BLOCKS * 8) +
+            group);
+        const float activation_high = __ldg(
+            xscale +
+            static_cast<size_t>(token_start + token_half * 16 + token_high) *
+                (BLOCKS * 8) +
+            group);
+        result0 = fmaf(float(dots.x[0]), weight_even * activation_low, result0);
+        result1 = fmaf(float(dots.x[1]), weight_odd * activation_low, result1);
+        result2 = fmaf(float(dots.x[2]), weight_even * activation_high, result2);
+        result3 = fmaf(float(dots.x[3]), weight_odd * activation_high, result3);
+        __syncthreads();
+    }
+
+    const int output_base = row_start + row_tile * 8;
+    y[static_cast<size_t>(token_start + token_half * 16 + token_low) * rows +
+      output_base + out_even] = result0;
+    y[static_cast<size_t>(token_start + token_half * 16 + token_low) * rows +
+      output_base + out_odd] = result1;
+    y[static_cast<size_t>(token_start + token_half * 16 + token_high) * rows +
+      output_base + out_even] = result2;
+    y[static_cast<size_t>(token_start + token_half * 16 + token_high) * rows +
+      output_base + out_odd] = result3;
+}
+
+template <int BLOCKS>
 __global__ __launch_bounds__(128, 4) void q6_k_wmma32_kernel(
     const Q6KBlock *__restrict__ weights,
     const float *__restrict__ x,
@@ -2021,6 +2129,30 @@ cudaError_t iq4_xs_gemm_prefill32(
     else
         iq4_xs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
             reinterpret_cast<const IQ4XSBlock *>(weights), x, y, rows, cols);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t iq4_xs_gemm_prefill32_imma(
+    const uint8_t *weights, const void *workspace, int tokens, float *y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!weights || !workspace || !y || rows <= 0 || (rows & 15) ||
+        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
+        return cudaErrorInvalidValue;
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) +
+        static_cast<size_t>(tokens) * aligned);
+    if (cols == 4096)
+        iq4_xs_imma32_kernel<16>
+            <<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
+                reinterpret_cast<const IQ4XSBlock *>(weights), xq, xscale,
+                y, rows, int(aligned / 4));
+    else
+        iq4_xs_imma32_kernel<8>
+            <<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
+                reinterpret_cast<const IQ4XSBlock *>(weights), xq, xscale,
+                y, rows, int(aligned / 4));
     return cudaPeekAtLastError();
 }
 

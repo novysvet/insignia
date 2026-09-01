@@ -1488,8 +1488,8 @@ __global__ __launch_bounds__(256, 2) void iq3_xxs_imma32_pair_kernel(
         const int b_row = row_tile * 8 + (lane >> 2);
         const int b_quarter = lane & 3;
         const IQI8B b{{
-            shared_b[matrix][b_row][2 * b_quarter + 0],
-            shared_b[matrix][b_row][2 * b_quarter + 1],
+            shared_b[matrix][b_row][b_quarter],
+            shared_b[matrix][b_row][4 + b_quarter],
         }};
         const IQI32C dots = iq_imma_m16n8k32(a, b);
         const float weight_even =

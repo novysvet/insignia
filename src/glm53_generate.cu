@@ -3484,7 +3484,7 @@ public:
         }
         if (const char *whole =
                 std::getenv("INSIGNIA_GLM53_PREFILL_WHOLE_LAYER_MOE"))
-            prefill_whole_layer_moe_ = std::atoi(whole) != 0;
+            prefill_whole_layer_moe_ = std::atoi(whole) != 0 ? 1 : 0;
         if (const char *fixed = std::getenv("INSIGNIA_GLM53_NVFP4_FIXED_ROWS"))
             nvfp4_fixed_rows_ = std::atoi(fixed) != 0;
         if (const char *margin = std::getenv("INSIGNIA_GLM53_DF_LOGIT_GUARD_MARGIN")) {
@@ -4194,7 +4194,9 @@ private:
     bool prefetch_on_ = true, deep_checks_ = false, trace_layers_ = false;
     bool full_layer_major_active_ = false;
     bool prefill_approx_moe_ = false;
-    bool prefill_whole_layer_moe_ = false;
+    // -1 selects the measured Q3 length crossover automatically; 0/1 are
+    // explicit environment overrides.
+    int prefill_whole_layer_moe_ = -1;
     bool nvfp4_fixed_rows_ = true;
     int prefill_approx_first_layer_ = 0;
     bool early_route_on_ = false, early_route_prefetch_ = false;
@@ -7879,7 +7881,11 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
     const size_t capture_floats = size_t(5) * df_tokens * hidden_;
 
     constexpr int kWholeMoeMaxPrompt = 8192;
-    bool whole_moe = prefill_whole_layer_moe_;
+    constexpr int kQ3WholeMoeAutoTokens = 320;
+    const bool whole_requested = prefill_whole_layer_moe_ >= 0
+        ? prefill_whole_layer_moe_ != 0
+        : q3_experts_ && prompt_tokens >= kQ3WholeMoeAutoTokens;
+    bool whole_moe = whole_requested;
     const char *whole_fallback = nullptr;
     if (whole_moe && prompt_tokens > kWholeMoeMaxPrompt)
         whole_fallback = "prompt exceeds the 8192-row sidecar cap";
@@ -7938,7 +7944,7 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
             }
         }
     }
-    if (prefill_whole_layer_moe_ && !whole_moe)
+    if (whole_requested && !whole_moe)
         std::printf("whole-layer MoE fallback: %s\n",
                     whole_fallback ? whole_fallback : "unsupported mode");
 

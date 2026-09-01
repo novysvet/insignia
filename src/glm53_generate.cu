@@ -724,10 +724,13 @@ public:
         : model_(model), stripe_model_(stripe_model), q3_experts_(q3_experts) {
         window_bytes_ = q3_experts_ ? kQ3WindowBytes : kWindowBytes;
         record_capacity_ = q3_experts_ ? kQ3PayloadCapacity : kPayloadCapacity;
-        if (q3_experts_)
+        if (q3_experts_) {
             if (const char *compact =
                     std::getenv("INSIGNIA_GLM53_Q3_COMPACT_HOST"))
                 q3_compact_host_ = std::atoi(compact) != 0;
+            else
+                q3_compact_host_ = true;
+        }
         // A full decode token needs 336 records; default the tier just above
         // that and let the environment shrink it on smaller hosts.
         window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / window_bytes_, 64, 4096));
@@ -754,6 +757,14 @@ public:
         require(host_raw_, "cudaHostAlloc expert host cache");
         host_ = reinterpret_cast<uint8_t *>(
             (reinterpret_cast<uintptr_t>(host_raw_) + kAlignment - 1) & ~(uintptr_t(kAlignment) - 1));
+        const size_t q3_compact_min_bytes = size_t(model_.experts()) *
+            (kQ3MediumWindowBytes + kQ3LargeWindowBytes) + 64 * kQ3SmallWindowBytes;
+        if (q3_compact_host_ && host_arena_bytes_ < q3_compact_min_bytes) {
+            std::printf("Q3 compact host tier needs %.1f MiB; using fixed windows at %.1f MiB\n",
+                        q3_compact_min_bytes / double(1ull << 20),
+                        host_arena_bytes_ / double(1ull << 20));
+            q3_compact_host_ = false;
+        }
         if (q3_compact_host_) {
             size_t cursor = 0;
             const auto append_window = [&](uint8_t size_class) {
@@ -770,26 +781,11 @@ public:
             // one layer.  Reserve a complete 288-record working set for each
             // exception geometry before filling the common class; otherwise
             // the compact cache rereads layer 11/12/44 within the same layer.
-            const size_t exception_bytes = size_t(model_.experts()) *
-                (kQ3MediumWindowBytes + kQ3LargeWindowBytes);
-            if (host_arena_bytes_ >= exception_bytes + 64 * kQ3SmallWindowBytes) {
-                for (uint32_t expert = 0; expert < model_.experts(); ++expert)
-                    require(append_window(2), "Q3 large-window reserve overflow");
-                for (uint32_t expert = 0; expert < model_.experts(); ++expert)
-                    require(append_window(1), "Q3 medium-window reserve overflow");
-                while (append_window(0)) {}
-            } else {
-                // Small hosts cannot afford two complete exception sets.
-                // Preserve at least proportional per-layer capacity there.
-                bool full = false;
-                while (!full)
-                    for (int layer = 3; layer <= 44; ++layer) {
-                        if (!append_window(q3_window_class(layer))) {
-                            full = true;
-                            break;
-                        }
-                    }
-            }
+            for (uint32_t expert = 0; expert < model_.experts(); ++expert)
+                require(append_window(2), "Q3 large-window reserve overflow");
+            for (uint32_t expert = 0; expert < model_.experts(); ++expert)
+                require(append_window(1), "Q3 medium-window reserve overflow");
+            while (append_window(0)) {}
             window_count_ = int(window_offsets_.size());
             require(window_count_ >= 64,
                     "compact Q3 host arena produced too few windows");
@@ -1058,7 +1054,7 @@ public:
             const auto found = flight_index_.find(route_key(layer, experts[slot]));
             if (found != flight_index_.end()) windows_[size_t(found->second)].claimed = true;
         }
-        int hits = 0, adopted = 0, f3_rescued = 0;
+        int hits = 0, adopted = 0;
         uint64_t started_bytes = 0;
         for (int slot = 0; slot < count; ++slot) {
             const int expert = experts[slot];
@@ -1086,6 +1082,7 @@ public:
                     batch_cached_[slot] = true;
                     ++state.hits;
                     ++hits;
+                    cache_hit_bytes_ += state.source_bytes;
                     if (!state.demand) ++prefetch_useful_;
                     if (tier_slru_) slru_hit(resident->second);
                 } else {
@@ -1112,7 +1109,6 @@ public:
                 if (device_resident != device_index_.end()) {
                     batch_device_[size_t(slot)] = true;
                     batch_cached_[size_t(slot)] = true;
-                    ++f3_rescued;
                     continue;
                 }
             }
@@ -1142,7 +1138,6 @@ public:
         }
         cache_hits_ += hits;
         cache_lookups_ += count;
-        f3_rescued_ += uint64_t(f3_rescued);
         // Include F3 candidates in the expected completion count. upload()
         // contributes a zero-I/O marker for a surviving device hit or the
         // actual read end if an earlier slot recycles it before use.
@@ -1162,9 +1157,9 @@ public:
     void stage_layer(int layer, const int *experts, int count) {
         if (!overlap_reads_) return;
         // Whole-layer read-ahead claims the complete union at once.  The
-        // compact arena deliberately gives rare large-record layers only
-        // their proportional share; leave those layers on ordinary 8-wide
-        // demand staging when their union cannot fit in the matching class.
+        // compact arena keeps a geometry-specific working set; leave a layer
+        // on ordinary 8-wide demand staging if a nonstandard model exposes a
+        // union larger than its proven class capacity.
         if (q3_compact_host_ && window_class_counts_[size_t(q3_window_class(layer))] < count)
             return;
         for (int index = 0; index < count; ++index) {
@@ -1202,6 +1197,11 @@ public:
                 ++device_lookups_;
                 ++device_hits_;
                 const int device_slot = found->second;
+                const uint64_t source_bytes =
+                    device_slot_source_bytes_[size_t(device_slot)];
+                device_hit_bytes_ += source_bytes;
+                ++f3_rescued_;
+                f3_rescued_bytes_ += source_bytes;
                 device_slot_stamps_[size_t(device_slot)] = ++device_stamp_;
                 active_device_ = device_arena_ + size_t(device_slot) * device_stride_;
                 active_device_slot_ = device_slot;
@@ -1258,6 +1258,7 @@ public:
             if (found != device_index_.end()) {
                 device_slot = found->second;
                 ++device_hits_;
+                device_hit_bytes_ += state.source_bytes;
             } else {
                 device_slot = take_device_slot(state.layer, slot);
                 // The recycle waits on the victim's read fence: the copy
@@ -1273,6 +1274,7 @@ public:
                 state.copy_issued = true;
                 device_index_.emplace(key, device_slot);
                 device_slot_keys_[size_t(device_slot)] = key;
+                device_slot_source_bytes_[size_t(device_slot)] = state.source_bytes;
                 device_slot_pinned_[size_t(device_slot)] =
                     pinned_device_keys_.count(key) ? 1 : 0;
                 // F3: remember how this slot's image is laid out (and its
@@ -1407,6 +1409,7 @@ public:
     uint64_t io_bytes() const { return io_bytes_; }
     uint64_t prefetch_bytes() const { return prefetch_bytes_; }
     uint64_t cache_hits() const { return cache_hits_; }
+    uint64_t cache_hit_bytes() const { return cache_hit_bytes_; }
     // Demand NVMe record reads started (load_batch misses, F3 fallbacks,
     // stage_layer unions) - the U3 adaptive-k cost estimator's denominator.
     uint64_t records_read() const { return records_read_; }
@@ -1424,7 +1427,9 @@ public:
     int cache_slots() const { return window_count_; }
     double read_wait_seconds() const { return read_wait_seconds_; }
     uint64_t device_hits() const { return device_hits_; }
+    uint64_t device_hit_bytes() const { return device_hit_bytes_; }
     uint64_t f3_rescued() const { return f3_rescued_; }
+    uint64_t f3_rescued_bytes() const { return f3_rescued_bytes_; }
     uint64_t device_lookups() const { return device_lookups_; }
     int device_slots() const { return device_slot_count_; }
     bool device_topk_capable() const {
@@ -2122,6 +2127,7 @@ private:
             std::printf("expert VRAM packed slots: stride=%zu, slots=%d, scratch=%zu bytes\n",
                         device_stride_, device_slot_count_, kScaleBytes);
         device_slot_keys_.assign(attempt, kNoKey);
+        device_slot_source_bytes_.assign(attempt, 0);
         device_slot_stamps_.assign(attempt, 0);
         device_slot_pinned_.assign(attempt, 0);
         device_slot_layouts_.assign(attempt, Layout{});
@@ -2755,7 +2761,7 @@ private:
     int batch_layer_ = -1, batch_count_ = 0, batch_demand_count_ = 0;
     uint64_t stamp_ = 0;
     bool overlap_reads_ = true, batch_io_recorded_ = true;
-    uint64_t cache_hits_ = 0, cache_lookups_ = 0;
+    uint64_t cache_hits_ = 0, cache_lookups_ = 0, cache_hit_bytes_ = 0;
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
@@ -2775,6 +2781,7 @@ private:
     int vram_budget_mb_ = -1;  // -1 = size from free VRAM at first use
     uint64_t device_stamp_ = 0;
     std::vector<uint32_t> device_slot_keys_;
+    std::vector<uint64_t> device_slot_source_bytes_;
     std::vector<uint64_t> device_slot_stamps_;
     std::vector<uint8_t> device_slot_pinned_;
     std::vector<Layout> device_slot_layouts_;
@@ -2782,11 +2789,11 @@ private:
     std::unordered_set<uint32_t> pinned_device_keys_;
     std::vector<cudaEvent_t> device_slot_reads_;
     std::unordered_map<uint32_t, int> device_index_;
-    uint64_t device_hits_ = 0, device_lookups_ = 0;
+    uint64_t device_hits_ = 0, device_lookups_ = 0, device_hit_bytes_ = 0;
     // F3 device-consult state (INSIGNIA_GLM53_F3).
     bool f3_device_consult_ = false;
     std::array<bool, 8> batch_device_{};
-    uint64_t f3_rescued_ = 0;
+    uint64_t f3_rescued_ = 0, f3_rescued_bytes_ = 0;
     // O(1) intrusive LRU state (INSIGNIA_GLM53_TIER_O1) plus the segmented
     // variant (INSIGNIA_GLM53_TIER_SLRU): probationary + protected lists,
     // hit-promotion, soft 50% protected cap, verify-rejection demotions.
@@ -8664,8 +8671,10 @@ std::vector<std::pair<int, float>> Runner::step(
     std::printf("  source BF16 %.3f GiB / %.3f s (%.2f GB/s)\n",
                 stager_.io_bytes() / double(1ull << 30), stager_.io_seconds(),
                 stager_.io_bytes() / stager_.io_seconds() / 1.0e9);
+    const char *expert_format = q3_experts_ ? "Q3" : "NVFP4";
     if (expert_stager_)
-        std::printf("  QD8 expert O_DIRECT %.3f GiB / %.3f s (%.2f GB/s)\n",
+        std::printf("  %s expert O_DIRECT %.3f GiB / %.3f s (%.2f GB/s)\n",
+                    expert_format,
                     expert_io_bytes() / double(1ull << 30), expert_io_seconds(),
                     expert_io_bytes() / expert_io_seconds() / 1.0e9);
     if (expert_stager_ &&
@@ -8678,27 +8687,24 @@ std::vector<std::pair<int, float>> Runner::step(
                     expert_stager_->drive_bytes(1) / double(1ull << 30),
                     (unsigned long long)expert_stager_->stripe_fallbacks());
     if (expert_stager_ && expert_stager_->cache_lookups())
-        std::printf("  NVFP4 cache %llu/%llu hits (%.1f%%, %.3f GiB NVMe+H2D avoided; %d slots)\n",
+        std::printf("  %s cache %llu/%llu hits (%.1f%%, %.3f GiB NVMe avoided; %d slots)\n",
+                    expert_format,
                     (unsigned long long)expert_stager_->cache_hits(),
                     (unsigned long long)expert_stager_->cache_lookups(),
                     100.0 * expert_stager_->cache_hits() / expert_stager_->cache_lookups(),
-                    expert_stager_->cache_hits() *
-                        (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes + 3 * sizeof(float)) /
-                        double(1ull << 30),
+                    expert_stager_->cache_hit_bytes() / double(1ull << 30),
                     expert_stager_->cache_slots());
     if (expert_stager_ && expert_stager_->device_lookups())
         std::printf("  VRAM expert tier %llu/%llu hits (%.1f%%, %.3f GiB PCIe avoided; %d slots)\n",
                     (unsigned long long)expert_stager_->device_hits(),
                     (unsigned long long)expert_stager_->device_lookups(),
                     100.0 * expert_stager_->device_hits() / expert_stager_->device_lookups(),
-                    expert_stager_->device_hits() * ExpertStager::kPayloadCapacity / double(1ull << 30),
+                    expert_stager_->device_hit_bytes() / double(1ull << 30),
                     expert_stager_->device_slots());
     if (expert_stager_ && expert_stager_->f3_rescued())
         std::printf("  F3 device-consult rescued %llu reads (%.3f GiB NVMe avoided)\n",
                     (unsigned long long)expert_stager_->f3_rescued(),
-                    expert_stager_->f3_rescued() *
-                        (ExpertStager::kBodyBytes + ExpertStager::kScaleBytes) /
-                        double(1ull << 30));
+                    expert_stager_->f3_rescued_bytes() / double(1ull << 30));
     if (expert_stager_ && expert_stager_->demoted_cold())
         std::printf("  SLRU demoted %llu rejected-row records to the probationary tail\n",
                     (unsigned long long)expert_stager_->demoted_cold());

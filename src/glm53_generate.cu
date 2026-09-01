@@ -809,6 +809,9 @@ public:
             if (const char *budget =
                     std::getenv("INSIGNIA_GLM53_Q3_PAGEABLE_CACHE_MB"))
                 pageable_mb = std::max(0, std::atoi(budget));
+            if (const char *hits =
+                    std::getenv("INSIGNIA_GLM53_Q3_PAGEABLE_MIN_HITS"))
+                q3_pageable_min_hits_ = std::max(0, std::atoi(hits));
             if (pageable_mb) init_q3_pageable_cache(size_t(pageable_mb) << 20);
         }
         windows_.resize(size_t(window_count_));
@@ -1431,6 +1434,7 @@ public:
     uint64_t q3_pageable_lookups() const { return q3_pageable_lookups_; }
     uint64_t q3_pageable_hit_bytes() const { return q3_pageable_hit_bytes_; }
     uint64_t q3_pageable_copy_bytes() const { return q3_pageable_copy_bytes_; }
+    uint64_t q3_pageable_stores() const { return q3_pageable_stores_; }
     int q3_pageable_slots() const { return q3_pageable_slots_; }
     // Demand NVMe record reads started (load_batch misses, F3 fallbacks,
     // stage_layer unions) - the U3 adaptive-k cost estimator's denominator.
@@ -1572,8 +1576,10 @@ private:
 #ifdef MADV_HUGEPAGE
         (void)::madvise(mapping, bytes, MADV_HUGEPAGE);
 #endif
-        std::printf("Q3 pageable victim: %d common-record slots (%.1f MiB, DRAM-copy L2)\n",
-                    q3_pageable_slots_, bytes / double(1ull << 20));
+        std::printf("Q3 pageable victim: %d common-record slots (%.1f MiB, DRAM-copy L2, "
+                    "min %d L1 hits)\n",
+                    q3_pageable_slots_, bytes / double(1ull << 20),
+                    q3_pageable_min_hits_);
     }
 
     void q3_pageable_unlink(int slot) {
@@ -1609,6 +1615,7 @@ private:
         if (window_classes_[size_t(window)] != 0 || source.key == kNoKey ||
             source.error || !source.done || source.layout.bytes > kQ3SmallWindowBytes)
             return;
+        if (source.hits < unsigned(q3_pageable_min_hits_)) return;
         int slot = -1;
         if (!q3_pageable_free_.empty()) {
             slot = q3_pageable_free_.back();
@@ -1651,43 +1658,6 @@ private:
         target.payload = host_ + window_offsets_[size_t(window)];
         target.source_bytes = source.source_bytes;
         target.error = nullptr;
-        if (const char *verify = std::getenv("INSIGNIA_GLM53_Q3_PAGEABLE_VERIFY")) {
-            const int limit = std::max(1, std::atoi(verify));
-            if (q3_pageable_verify_count_ < uint64_t(limit)) {
-                void *raw = nullptr;
-                require(::posix_memalign(&raw, kAlignment, kQ3SmallWindowBytes) == 0,
-                        "[DEBUG-q3-pageable] reference allocation failed");
-                Layout reference_layout{};
-                std::array<float, 3> reference_globals{};
-                uint8_t *reference_payload = nullptr;
-                const int layer = int(key / 4096u), expert = int(key % 4096u);
-                stage_q3(reference_layout, reference_globals, reference_payload,
-                         static_cast<uint8_t *>(raw), kQ3SmallWindowBytes,
-                         layer, expert);
-                const bool layout_equal = target.layout.body == reference_layout.body &&
-                    target.layout.types == reference_layout.types &&
-                    target.layout.bytes == reference_layout.bytes;
-                size_t mismatch = target.layout.bytes;
-                if (layout_equal) {
-                    const uint8_t *actual = host_ + window_offsets_[size_t(window)];
-                    const uint8_t *expected = static_cast<const uint8_t *>(raw);
-                    for (size_t byte = 0; byte < target.layout.bytes; ++byte)
-                        if (actual[byte] != expected[byte]) {
-                            mismatch = byte;
-                            break;
-                        }
-                }
-                std::printf("[DEBUG-q3-pageable] restore %llu key=%u layer=%d expert=%d "
-                            "bytes=%zu reference=%zu layout=%d mismatch=%zu\n",
-                            (unsigned long long)q3_pageable_verify_count_, key, layer, expert,
-                            target.layout.bytes, reference_layout.bytes,
-                            layout_equal ? 1 : 0, mismatch);
-                std::free(raw);
-                ++q3_pageable_verify_count_;
-                require(layout_equal && mismatch == target.layout.bytes,
-                        "[DEBUG-q3-pageable] restored record differs from direct source");
-            }
-        }
         target.end = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -2962,7 +2932,7 @@ private:
     uint64_t q3_pageable_hits_ = 0, q3_pageable_lookups_ = 0;
     uint64_t q3_pageable_stores_ = 0, q3_pageable_hit_bytes_ = 0;
     uint64_t q3_pageable_copy_bytes_ = 0;
-    uint64_t q3_pageable_verify_count_ = 0;
+    int q3_pageable_min_hits_ = 0;
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
@@ -8897,13 +8867,14 @@ std::vector<std::pair<int, float>> Runner::step(
                     expert_stager_->cache_slots());
     if (expert_stager_ && expert_stager_->q3_pageable_lookups())
         std::printf("  Q3 pageable victim %llu/%llu L1-miss hits (%.1f%%, %.3f GiB "
-                    "NVMe avoided; %d slots, %.3f GiB DRAM copied)\n",
+                    "NVMe avoided; %d slots, %llu stores / %.3f GiB DRAM copied)\n",
                     (unsigned long long)expert_stager_->q3_pageable_hits(),
                     (unsigned long long)expert_stager_->q3_pageable_lookups(),
                     100.0 * expert_stager_->q3_pageable_hits() /
                         expert_stager_->q3_pageable_lookups(),
                     expert_stager_->q3_pageable_hit_bytes() / double(1ull << 30),
                     expert_stager_->q3_pageable_slots(),
+                    (unsigned long long)expert_stager_->q3_pageable_stores(),
                     expert_stager_->q3_pageable_copy_bytes() / double(1ull << 30));
     if (expert_stager_ && expert_stager_->device_lookups())
         std::printf("  VRAM expert tier %llu/%llu hits (%.1f%%, %.3f GiB PCIe avoided; %d slots)\n",

@@ -14,6 +14,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("shards", nargs="+", type=Path)
     parser.add_argument("--contains")
+    parser.add_argument("--tsv", action="store_true")
     args = parser.parse_args()
 
     for shard_id, path in enumerate(args.shards):
@@ -21,7 +22,7 @@ def main() -> None:
         for tensor in reader.tensors:
             if args.contains and args.contains not in tensor.name:
                 continue
-            print(json.dumps({
+            record = {
                 "shard": shard_id,
                 "file": path.name,
                 "name": tensor.name,
@@ -31,7 +32,15 @@ def main() -> None:
                 "elements": int(tensor.n_elements),
                 "bytes": int(tensor.n_bytes),
                 "offset": int(tensor.data_offset),
-            }, separators=(",", ":")))
+            }
+            if args.tsv:
+                print("\t".join((
+                    record["name"], record["type"],
+                    "x".join(map(str, record["shape"])),
+                    str(record["bytes"]), str(record["offset"]), record["file"],
+                )))
+            else:
+                print(json.dumps(record, separators=(",", ":")))
 
 
 if __name__ == "__main__":

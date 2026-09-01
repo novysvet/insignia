@@ -966,6 +966,9 @@ public:
         return moved;
     }
     uint64_t demoted_cold() const { return demoted_cold_; }
+    void set_q3_pageable_admission(bool enabled) {
+        q3_pageable_admission_ = enabled;
+    }
     // Speculative read-ahead keyed on the previous token's routing. Cheap to
     // call: resident or in-flight experts are skipped, and 8 windows stay
     // unreserved so a demand batch always finds free slots immediately.
@@ -1610,7 +1613,7 @@ private:
     // miss currently being promoted: never recycle its L2 slot while making
     // room for the L1 victim that promotion itself displaced.
     void store_q3_pageable(int window, uint32_t protected_key) {
-        if (!q3_pageable_) return;
+        if (!q3_pageable_ || !q3_pageable_admission_) return;
         const WindowState &source = windows_[size_t(window)];
         if (window_classes_[size_t(window)] != 0 || source.key == kNoKey ||
             source.error || !source.done || source.layout.bytes > kQ3SmallWindowBytes)
@@ -1644,7 +1647,9 @@ private:
     }
 
     bool restore_q3_pageable(int window, uint32_t key) {
-        if (!q3_pageable_ || window_classes_[size_t(window)] != 0) return false;
+        if (!q3_pageable_ || !q3_pageable_admission_ ||
+            window_classes_[size_t(window)] != 0)
+            return false;
         ++q3_pageable_lookups_;
         const auto found = q3_pageable_index_.find(key);
         if (found == q3_pageable_index_.end()) return false;
@@ -2933,6 +2938,7 @@ private:
     uint64_t q3_pageable_stores_ = 0, q3_pageable_hit_bytes_ = 0;
     uint64_t q3_pageable_copy_bytes_ = 0;
     int q3_pageable_min_hits_ = 0;
+    bool q3_pageable_admission_ = true;
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
@@ -7922,9 +7928,17 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
 
     struct ActiveScope {
         bool &active;
-        explicit ActiveScope(bool &flag) : active(flag) { active = true; }
-        ~ActiveScope() { active = false; }
-    } active_scope(full_layer_major_active_);
+        ExpertStager *stager;
+        ActiveScope(bool &flag, ExpertStager *expert_stager)
+            : active(flag), stager(expert_stager) {
+            active = true;
+            if (stager) stager->set_q3_pageable_admission(false);
+        }
+        ~ActiveScope() {
+            if (stager) stager->set_q3_pageable_admission(true);
+            active = false;
+        }
+    } active_scope(full_layer_major_active_, expert_stager_.get());
 
     const uint64_t records_before = expert_stager_ ? expert_stager_->records_read() : 0;
     const uint64_t io_before = expert_stager_ ? expert_stager_->io_bytes() : 0;

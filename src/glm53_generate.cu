@@ -5124,6 +5124,11 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
             const char *value = std::getenv("INSIGNIA_GLM53_Q3_TOPK");
             return value && std::atoi(value) != 0;
         }();
+        static const int q3_topk_group = [] {
+            const char *value = std::getenv("INSIGNIA_GLM53_Q3_TOPK_GROUP");
+            const int requested = value ? std::atoi(value) : 8;
+            return requested <= 1 ? 1 : requested <= 2 ? 2 : requested <= 4 ? 4 : 8;
+        }();
         if (q3_experts_ && q3_topk) expert_stager_->prime_device_arena();
         if (q3_experts_ && q3_topk && expert_stager_->device_topk_capable()) {
             std::array<const uint8_t *, 8> gate_weights{}, up_weights{}, down_weights{};
@@ -5168,14 +5173,39 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
                               iq_workspace_4096_.get(), 1, c_gateu_.get(), c_up_.get(),
                               &output_id, moe_intermediate_, hidden_),
                           "Q3 pipelined IQ3 gate/up");
+                    const int group_end = slot + 1;
+                    if (group_end == moe_topk_ || group_end % q3_topk_group == 0) {
+                        const int group_begin =
+                            group_end - std::min(q3_topk_group, group_end);
+                        const int group_count = group_end - group_begin;
+                        std::array<const uint8_t *, 8> group_weights{};
+                        std::array<float, 8> group_combine{};
+                        for (int member = 0; member < group_count; ++member) {
+                            group_weights[size_t(member)] =
+                                down_weights[size_t(group_begin + member)];
+                            group_combine[size_t(member)] =
+                                combine[size_t(group_begin + member)];
+                        }
+                        // The wrapper passes eight pointers by value, although
+                        // the kernel only selects the first group_count. Keep
+                        // every argument valid so sanitizer/debug builds never
+                        // manufacture an indeterminate pointer value.
+                        for (int member = group_count; member < 8; ++member) {
+                            group_weights[size_t(member)] = group_weights[0];
+                            group_combine[size_t(member)] = 0.0f;
+                        }
+                        check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
+                                  group_weights.data(),
+                                  c_gateu_.get() + size_t(group_begin) * moe_intermediate_,
+                                  c_up_.get() + size_t(group_begin) * moe_intermediate_,
+                                  group_combine.data(), group_count, routed_.get(),
+                                  hidden_, moe_intermediate_),
+                              "Q3 grouped raw IQ4 down");
+                    }
                 }
             }
-            if (gate_type == TensorType::iq3_xxs && down_type == TensorType::iq4_xs) {
-                check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
-                          down_weights.data(), c_gateu_.get(), c_up_.get(), combine.data(),
-                          moe_topk_, routed_.get(), hidden_, moe_intermediate_),
-                      "Q3 raw top-k IQ4 down");
-            } else {
+            if (!(gate_type == TensorType::iq3_xxs &&
+                  down_type == TensorType::iq4_xs)) {
                 // Three model layers carry higher-precision exception tensors.
                 // Keep their canonical expert order while still amortizing all
                 // eight uploads ahead of the compute launches.

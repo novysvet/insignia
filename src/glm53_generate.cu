@@ -3670,11 +3670,13 @@ public:
             require(!(nvfp4_experts_ && q3_experts_),
                     "checkpoint exposes both NVFP4 and native Q3 expert schemas");
             if (nvfp4_experts_ || q3_experts_) {
-                // Host-RAM LRU over whole expert records: one decode token
-                // touches 42 x 8 = 336 records, so the tier must exceed that
-                // to hit at all. Default 5 GiB pinned (~370 records) inside
-                // the 14 GiB WSL VM; VRAM keeps only the 13.5 MiB H2D target.
-                uint64_t host_cache = 32768ull << 20;
+                // Host-RAM LRU over whole expert records.  The glm-box DXG
+                // probe page-locked 34,816 MiB but wedged at the next range;
+                // 33.5 GiB leaves 768 MiB below that cliff.  Its compact Q3
+                // tier removes another ~2.3 GiB/read over 40 hard tokens and
+                // won both paired decode runs.  Small WSL guests retain the
+                // allocator's halve-and-retry fallback or may override this.
+                uint64_t host_cache = 34304ull << 20;
                 if (const char *budget = std::getenv("INSIGNIA_GLM53_EXPERT_CACHE_MB"))
                     host_cache = uint64_t(std::max(0, std::atoi(budget))) << 20;
                 expert_stager_ =

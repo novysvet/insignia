@@ -36,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -803,6 +804,13 @@ public:
             for (int window = 0; window < window_count_; ++window)
                 window_offsets_[size_t(window)] = size_t(window) * window_bytes_;
         }
+        if (q3_experts_) {
+            int pageable_mb = 0;
+            if (const char *budget =
+                    std::getenv("INSIGNIA_GLM53_Q3_PAGEABLE_CACHE_MB"))
+                pageable_mb = std::max(0, std::atoi(budget));
+            if (pageable_mb) init_q3_pageable_cache(size_t(pageable_mb) << 20);
+        }
         windows_.resize(size_t(window_count_));
         for (WindowState &state : windows_)
             check(cudaEventCreateWithFlags(&state.copy_done, cudaEventDisableTiming),
@@ -919,6 +927,8 @@ public:
         for (WindowState &state : windows_)
             if (state.copy_done) cudaEventDestroy(state.copy_done);
         if (host_raw_) cudaFreeHost(host_raw_);
+        if (q3_pageable_)
+            ::munmap(q3_pageable_, size_t(q3_pageable_slots_) * kQ3SmallWindowBytes);
         if (device_arena_) cudaFree(device_arena_);
         for (cudaEvent_t &event : device_slot_reads_)
             if (event) cudaEventDestroy(event);
@@ -969,8 +979,8 @@ public:
             if (flight_index_.count(key)) continue;
             const int window = pop_free_window(required_window_class(layer), 8);
             if (window < 0) break;
-            start_read(window, key, layer, experts[index], false);
-            ++prefetch_started_;
+            if (start_read(window, key, layer, experts[index], false))
+                ++prefetch_started_;
             ++started;
         }
         return started;
@@ -1112,10 +1122,10 @@ public:
                     continue;
                 }
             }
-            const int window = take_window(layer);
-            start_read(window, key, layer, expert, true);
+            const int window = take_window(layer, key);
+            const bool disk_read = start_read(window, key, layer, expert, true);
             batch_window_[slot] = window;
-            started_bytes += windows_[size_t(window)].source_bytes;
+            if (disk_read) started_bytes += windows_[size_t(window)].source_bytes;
             // TinyLFU-style door: a record may enter the tier only once its
             // lifetime demand count beats the hit count of the coldest
             // resident (threshold 1 disables the door entirely).
@@ -1176,10 +1186,10 @@ public:
             // batch consult adopts the VRAM slot directly at upload time.
             if (f3_device_consult_ && device_arena_ && device_index_.count(key))
                 continue;
-            const int window = take_window(layer);
-            start_read(window, key, layer, experts[index], true);
+            const int window = take_window(layer, key);
+            const bool disk_read = start_read(window, key, layer, experts[index], true);
             windows_[size_t(window)].claimed = true;
-            io_bytes_ += windows_[size_t(window)].source_bytes;
+            if (disk_read) io_bytes_ += windows_[size_t(window)].source_bytes;
         }
     }
     void upload(int slot) {
@@ -1220,9 +1230,10 @@ public:
             // The slot was recycled between the batch consult and this
             // upload (only this batch's own miss uploads can evict). Stage
             // the demand read now and fall through to the regular path.
-            const int window = take_window(batch_layer_);
-            start_read(window, key, batch_layer_, batch_experts_[size_t(slot)], true);
-            io_bytes_ += windows_[size_t(window)].source_bytes;
+            const int window = take_window(batch_layer_, key);
+            const bool disk_read =
+                start_read(window, key, batch_layer_, batch_experts_[size_t(slot)], true);
+            if (disk_read) io_bytes_ += windows_[size_t(window)].source_bytes;
             batch_window_[size_t(slot)] = window;
             batch_device_[size_t(slot)] = false;
             batch_cached_[size_t(slot)] = false;
@@ -1410,6 +1421,11 @@ public:
     uint64_t prefetch_bytes() const { return prefetch_bytes_; }
     uint64_t cache_hits() const { return cache_hits_; }
     uint64_t cache_hit_bytes() const { return cache_hit_bytes_; }
+    uint64_t q3_pageable_hits() const { return q3_pageable_hits_; }
+    uint64_t q3_pageable_lookups() const { return q3_pageable_lookups_; }
+    uint64_t q3_pageable_hit_bytes() const { return q3_pageable_hit_bytes_; }
+    uint64_t q3_pageable_copy_bytes() const { return q3_pageable_copy_bytes_; }
+    int q3_pageable_slots() const { return q3_pageable_slots_; }
     // Demand NVMe record reads started (load_batch misses, F3 fallbacks,
     // stage_layer unions) - the U3 adaptive-k cost estimator's denominator.
     uint64_t records_read() const { return records_read_; }
@@ -1516,6 +1532,133 @@ private:
         int l2_shard = -1;
         uint64_t l2_offset = 0, l2_bytes = 0;
     };
+
+    // Pageable victim tier behind the CUDA-pinned L1. WDDM will not let this
+    // box pin all 60 GiB of guest RAM, but ordinary anonymous memory can hold
+    // evicted Q3 records. Only the common 10.39 MiB geometry participates:
+    // compact L1 already reserves all 288 medium and all 288 large records.
+    struct Q3PageableState {
+        uint32_t key = kNoKey;
+        int previous = -1, next = -1;
+        size_t bytes = 0;
+        uint64_t source_bytes = 0;
+        Layout layout{};
+        std::array<float, 3> globals{};
+    };
+
+    void init_q3_pageable_cache(size_t requested_bytes) {
+        const size_t slots = requested_bytes / kQ3SmallWindowBytes;
+        if (!slots) return;
+        const size_t bytes = slots * kQ3SmallWindowBytes;
+        void *mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) {
+            std::printf("Q3 pageable victim: mmap %.1f MiB failed (%s); disabled\n",
+                        bytes / double(1ull << 20), std::strerror(errno));
+            return;
+        }
+        q3_pageable_ = static_cast<uint8_t *>(mapping);
+        q3_pageable_slots_ = int(slots);
+        q3_pageable_states_.resize(slots);
+        q3_pageable_free_.reserve(slots);
+        for (size_t slot = slots; slot-- > 0;)
+            q3_pageable_free_.push_back(int(slot));
+#ifdef MADV_HUGEPAGE
+        (void)::madvise(mapping, bytes, MADV_HUGEPAGE);
+#endif
+        std::printf("Q3 pageable victim: %d common-record slots (%.1f MiB, DRAM-copy L2)\n",
+                    q3_pageable_slots_, bytes / double(1ull << 20));
+    }
+
+    void q3_pageable_unlink(int slot) {
+        Q3PageableState &state = q3_pageable_states_[size_t(slot)];
+        if (state.previous >= 0)
+            q3_pageable_states_[size_t(state.previous)].next = state.next;
+        else if (q3_pageable_head_ == slot)
+            q3_pageable_head_ = state.next;
+        if (state.next >= 0)
+            q3_pageable_states_[size_t(state.next)].previous = state.previous;
+        else if (q3_pageable_tail_ == slot)
+            q3_pageable_tail_ = state.previous;
+        state.previous = state.next = -1;
+    }
+
+    void q3_pageable_push_front(int slot) {
+        Q3PageableState &state = q3_pageable_states_[size_t(slot)];
+        state.previous = -1;
+        state.next = q3_pageable_head_;
+        if (q3_pageable_head_ >= 0)
+            q3_pageable_states_[size_t(q3_pageable_head_)].previous = slot;
+        else
+            q3_pageable_tail_ = slot;
+        q3_pageable_head_ = slot;
+    }
+
+    // Copy an evicted pinned record into pageable RAM. `protected_key` is the
+    // miss currently being promoted: never recycle its L2 slot while making
+    // room for the L1 victim that promotion itself displaced.
+    void store_q3_pageable(int window, uint32_t protected_key) {
+        if (!q3_pageable_) return;
+        const WindowState &source = windows_[size_t(window)];
+        if (window_classes_[size_t(window)] != 0 || source.key == kNoKey ||
+            source.error || !source.done || source.layout.bytes > kQ3SmallWindowBytes)
+            return;
+        int slot = -1;
+        if (!q3_pageable_free_.empty()) {
+            slot = q3_pageable_free_.back();
+            q3_pageable_free_.pop_back();
+        } else {
+            slot = q3_pageable_tail_;
+            if (slot >= 0 && q3_pageable_states_[size_t(slot)].key == protected_key)
+                slot = q3_pageable_states_[size_t(slot)].previous;
+            if (slot < 0) return;
+            Q3PageableState &victim = q3_pageable_states_[size_t(slot)];
+            q3_pageable_index_.erase(victim.key);
+            q3_pageable_unlink(slot);
+        }
+        Q3PageableState &target = q3_pageable_states_[size_t(slot)];
+        std::memcpy(q3_pageable_ + size_t(slot) * kQ3SmallWindowBytes,
+                    host_ + window_offsets_[size_t(window)], source.layout.bytes);
+        target.key = source.key;
+        target.bytes = source.layout.bytes;
+        target.source_bytes = source.source_bytes;
+        target.layout = source.layout;
+        target.globals = source.globals;
+        q3_pageable_index_[target.key] = slot;
+        q3_pageable_push_front(slot);
+        ++q3_pageable_stores_;
+        q3_pageable_copy_bytes_ += source.layout.bytes;
+    }
+
+    bool restore_q3_pageable(int window, uint32_t key) {
+        if (!q3_pageable_ || window_classes_[size_t(window)] != 0) return false;
+        ++q3_pageable_lookups_;
+        const auto found = q3_pageable_index_.find(key);
+        if (found == q3_pageable_index_.end()) return false;
+        const int slot = found->second;
+        Q3PageableState &source = q3_pageable_states_[size_t(slot)];
+        WindowState &target = windows_[size_t(window)];
+        std::memcpy(host_ + window_offsets_[size_t(window)],
+                    q3_pageable_ + size_t(slot) * kQ3SmallWindowBytes, source.bytes);
+        target.layout = source.layout;
+        target.globals = source.globals;
+        target.payload = host_ + window_offsets_[size_t(window)];
+        target.source_bytes = source.source_bytes;
+        target.error = nullptr;
+        target.end = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            target.done = true;
+        }
+        q3_pageable_index_.erase(found);
+        q3_pageable_unlink(slot);
+        source = Q3PageableState{};
+        q3_pageable_free_.push_back(slot);
+        ++q3_pageable_hits_;
+        q3_pageable_hit_bytes_ += target.source_bytes;
+        q3_pageable_copy_bytes_ += target.layout.bytes;
+        return true;
+    }
 
     static uint32_t route_key(int layer, int expert) {
         return uint32_t(layer) * 4096u + uint32_t(expert);
@@ -2196,7 +2339,8 @@ private:
         device_slot_keys_[size_t(victim)] = kNoKey;
         return victim;
     }
-    void start_read(int window, uint32_t key, int layer, int expert, bool demand) {
+    // Returns true only when an actual backing-store read was submitted.
+    bool start_read(int window, uint32_t key, int layer, int expert, bool demand) {
         WindowState &state = windows_[size_t(window)];
         state.key = key;
         state.layer = layer;
@@ -2217,8 +2361,10 @@ private:
         state.round_epoch = round_epoch_;
         flight_index_.emplace(key, window);
         seg_push_back(window, 1);
+        if (restore_q3_pageable(window, key)) return false;
         if (demand) ++records_read_;
         submit_window(window, demand);
+        return true;
     }
     // Relabeling an adopted prefetch is insufficient: if it has not started,
     // it still sits in the speculative FIFO behind unrelated hints. Move that
@@ -2380,7 +2526,7 @@ private:
         require(false, "expert free-window class count drifted");
         return -1;
     }
-    int take_window(int layer) {
+    int take_window(int layer, uint32_t protected_key = kNoKey) {
         const int size_class = required_window_class(layer);
         reap_released();
         if (const int window = pop_free_window(size_class); window >= 0) return window;
@@ -2396,6 +2542,7 @@ private:
                     state.copy_issued = false;
                 }
                 if (!state.demand) ++prefetch_wasted_;
+                store_q3_pageable(walk, protected_key);
                 release_window(walk);
             };
             for (int walk = pb_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
@@ -2404,7 +2551,7 @@ private:
                     !state.done || state.claimed || state.releasing || state.pinned)
                     continue;
                 evict(walk);
-                return take_window(layer);
+                return take_window(layer, protected_key);
             }
             for (int walk = pt_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
                 const WindowState &state = windows_[size_t(walk)];
@@ -2412,7 +2559,7 @@ private:
                     !state.done || state.claimed || state.releasing || state.pinned)
                     continue;
                 evict(walk);
-                return take_window(layer);
+                return take_window(layer, protected_key);
             }
         }
         // Evict the least-recently-used completed, unclaimed record. A batch
@@ -2448,8 +2595,9 @@ private:
             victim_state.copy_issued = false;
         }
         if (!victim_state.demand) ++prefetch_wasted_;
+        store_q3_pageable(victim, protected_key);
         release_window(victim);
-        return take_window(layer);
+        return take_window(layer, protected_key);
     }
     void release_window(int window) {
         WindowState &state = windows_[size_t(window)];
@@ -2732,6 +2880,12 @@ private:
     std::array<int, 3> free_window_class_counts_{};
     int window_count_ = 0;
     std::unordered_map<uint32_t, int> flight_index_;
+    uint8_t *q3_pageable_ = nullptr;
+    int q3_pageable_slots_ = 0;
+    int q3_pageable_head_ = -1, q3_pageable_tail_ = -1;
+    std::vector<Q3PageableState> q3_pageable_states_;
+    std::vector<int> q3_pageable_free_;
+    std::unordered_map<uint32_t, int> q3_pageable_index_;
     std::vector<int> free_windows_;
     std::vector<std::thread> pool_;
     std::mutex pool_mutex_;
@@ -2762,6 +2916,9 @@ private:
     uint64_t stamp_ = 0;
     bool overlap_reads_ = true, batch_io_recorded_ = true;
     uint64_t cache_hits_ = 0, cache_lookups_ = 0, cache_hit_bytes_ = 0;
+    uint64_t q3_pageable_hits_ = 0, q3_pageable_lookups_ = 0;
+    uint64_t q3_pageable_stores_ = 0, q3_pageable_hit_bytes_ = 0;
+    uint64_t q3_pageable_copy_bytes_ = 0;
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;
@@ -8694,6 +8851,16 @@ std::vector<std::pair<int, float>> Runner::step(
                     100.0 * expert_stager_->cache_hits() / expert_stager_->cache_lookups(),
                     expert_stager_->cache_hit_bytes() / double(1ull << 30),
                     expert_stager_->cache_slots());
+    if (expert_stager_ && expert_stager_->q3_pageable_lookups())
+        std::printf("  Q3 pageable victim %llu/%llu L1-miss hits (%.1f%%, %.3f GiB "
+                    "NVMe avoided; %d slots, %.3f GiB DRAM copied)\n",
+                    (unsigned long long)expert_stager_->q3_pageable_hits(),
+                    (unsigned long long)expert_stager_->q3_pageable_lookups(),
+                    100.0 * expert_stager_->q3_pageable_hits() /
+                        expert_stager_->q3_pageable_lookups(),
+                    expert_stager_->q3_pageable_hit_bytes() / double(1ull << 30),
+                    expert_stager_->q3_pageable_slots(),
+                    expert_stager_->q3_pageable_copy_bytes() / double(1ull << 30));
     if (expert_stager_ && expert_stager_->device_lookups())
         std::printf("  VRAM expert tier %llu/%llu hits (%.1f%%, %.3f GiB PCIe avoided; %d slots)\n",
                     (unsigned long long)expert_stager_->device_hits(),

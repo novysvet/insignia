@@ -454,6 +454,40 @@ __global__ __launch_bounds__(256) void add_kernel(
         destination[index] += source[index];
 }
 
+struct IndexedRows32 {
+    int ids[32];
+};
+
+__global__ __launch_bounds__(256) void gather_indexed_rows_kernel(
+    const float *__restrict__ source,
+    float *__restrict__ destination,
+    IndexedRows32 row_ids,
+    int rows,
+    int width) {
+    const int count = rows * width;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += blockDim.x * gridDim.x) {
+        const int row = index / width;
+        const int column = index - row * width;
+        destination[index] = source[size_t(row_ids.ids[row]) * width + column];
+    }
+}
+
+__global__ __launch_bounds__(256) void scatter_indexed_rows_kernel(
+    const float *__restrict__ source,
+    float *__restrict__ destination,
+    IndexedRows32 row_ids,
+    int rows,
+    int width) {
+    const int count = rows * width;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += blockDim.x * gridDim.x) {
+        const int row = index / width;
+        const int column = index - row * width;
+        destination[size_t(row_ids.ids[row]) * width + column] = source[index];
+    }
+}
+
 __global__ __launch_bounds__(256) void average_streams_kernel(
     const float *__restrict__ streams,
     float *__restrict__ output,
@@ -3556,6 +3590,12 @@ public:
                 insignia::glm53::iq_workspace_rows_bytes(hidden_, kMaxVerify));
             iq_workspace_2048_.reset(
                 insignia::glm53::iq_workspace_rows_bytes(moe_intermediate_, kMaxVerify));
+            iq_prefill_workspace_4096_.reset(
+                insignia::glm53::iq_prefill_workspace_bytes(hidden_, 32));
+            iq_prefill_workspace_2048_.reset(
+                insignia::glm53::iq_prefill_workspace_bytes(moe_intermediate_, 32));
+            iq_prefill_in_.reset(size_t(32) * hidden_);
+            iq_prefill_out_.reset(size_t(32) * hidden_);
         }
         if (q8_index_)
             q8_workspace_.reset(q8_index_->format() == Cache8Format::fp8_e4m3 ?
@@ -4015,6 +4055,8 @@ private:
     DeviceBuffer<float> c_post_, c_comb_, c_beta_;
     DeviceBuffer<uint8_t> nv_workspace_4096_, nv_workspace_2048_, q8_workspace_;
     DeviceBuffer<uint8_t> iq_workspace_4096_, iq_workspace_2048_;
+    DeviceBuffer<uint8_t> iq_prefill_workspace_4096_, iq_prefill_workspace_2048_;
+    DeviceBuffer<float> iq_prefill_in_, iq_prefill_out_;
     // MTP speculative decoding state (INSIGNIA_GLM53_MTP=K, 0 disables).
     int mtp_draft_total_ = 0;
     int mtp_variant_ = 0;  // 0: hnorm(mean-of-streams) 1: hnorm(final-normed) 2: swapped eh concat
@@ -4793,7 +4835,7 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
         compute_mlp(stem + "shared_experts.", input, output, shared_intermediate_);
         static const bool q3_topk = [] {
             const char *value = std::getenv("INSIGNIA_GLM53_Q3_TOPK");
-            return !value || std::atoi(value) != 0;
+            return value && std::atoi(value) != 0;
         }();
         if (q3_experts_ && q3_topk) expert_stager_->prime_device_arena();
         if (q3_experts_ && q3_topk && expert_stager_->device_topk_capable()) {
@@ -7029,9 +7071,9 @@ void Runner::moe_multi(int layer, const float *input, float *output, int tokens)
         }
     }
     if (whole_moe_route_sink_) {
-        require(nvfp4_experts_ && expert_stager_ && topk == 8 && !approximate_moe &&
-                    !kda_archive_,
-                "whole-layer route sink requires exact Top-8 NVFP4 prompt routing");
+        require((nvfp4_experts_ || q3_experts_) && expert_stager_ && topk == 8 &&
+                    !approximate_moe && !kda_archive_,
+                "whole-layer route sink requires exact Top-8 quantized prompt routing");
         for (int token = 0; token < tokens; ++token) {
             require(exec_count[size_t(token)] == topk,
                     "whole-layer route sink cannot retain a pruned row");
@@ -7522,9 +7564,9 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
     const char *whole_fallback = nullptr;
     if (whole_moe && prompt_tokens > kWholeMoeMaxPrompt)
         whole_fallback = "prompt exceeds the 8192-row sidecar cap";
-    else if (whole_moe && (!nvfp4_experts_ || !expert_stager_ ||
+    else if (whole_moe && (!(nvfp4_experts_ || q3_experts_) || !expert_stager_ ||
                            moe_experts_ != 288 || moe_topk_ != 8))
-        whole_fallback = "engine is not exact Top-8 NVFP4";
+        whole_fallback = "engine is not exact Top-8 quantized MoE";
     else if (whole_moe && prefill_approx_moe_)
         whole_fallback = "approximate/cache-aware prompt routing is enabled";
     else if (whole_moe && (kda_archive_ || df_retry_replay_))
@@ -7777,10 +7819,129 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
                                 whole_users[size_t(user_count)] = row;
                                 whole_out_ids[size_t(user_count)] = row * moe_topk_ + pick;
                                 ++user_count;
-                            }
+                    }
                     whole_user_rows += uint64_t(user_count);
-                    for (int base_user = 0; base_user < user_count;
-                         base_user += kMaxVerify) {
+                    if (q3_experts_) {
+                        const TensorType gate_type = expert_stager_->projection_type(1);
+                        const TensorType down_type = expert_stager_->projection_type(0);
+                        require(gate_type == expert_stager_->projection_type(2),
+                                "Q3 whole-layer gate/up formats must match");
+                        static const bool q3_imma = [] {
+                            const char *value =
+                                std::getenv("INSIGNIA_GLM53_Q3_PREFILL_IMMA");
+                            return value && std::atoi(value) != 0;
+                        }();
+                        static const int q3_imma_min = [] {
+                            const char *value =
+                                std::getenv("INSIGNIA_GLM53_Q3_PREFILL_IMMA_MIN");
+                            return std::clamp(value ? std::atoi(value) : 16, 1, 32);
+                        }();
+                        int base_user = 0;
+                        while (base_user < user_count) {
+                            const int remaining = user_count - base_user;
+                            const bool imma = q3_imma && remaining >= q3_imma_min &&
+                                gate_type == TensorType::iq3_xxs &&
+                                down_type == TensorType::iq4_xs;
+                            if (imma) {
+                                const int count = std::min(32, remaining);
+                                IndexedRows32 input_ids{}, output_ids{};
+                                for (int row = 0; row < 32; ++row)
+                                    input_ids.ids[row] = whole_users[size_t(
+                                        base_user + std::min(row, count - 1))];
+                                for (int row = 0; row < count; ++row)
+                                    output_ids.ids[row] =
+                                        whole_out_ids[size_t(base_user + row)];
+                                gather_indexed_rows_kernel<<<512, 256>>>(
+                                    whole_normalized.get(), iq_prefill_in_.get(),
+                                    input_ids, 32, hidden_);
+                                check(insignia::glm53::iq_quantize_activation_prefill(
+                                          iq_prefill_in_.get(), hidden_, 32,
+                                          iq_prefill_workspace_4096_.get()),
+                                      "quantize Q3 whole-layer IMMA input");
+                                check(insignia::glm53::iq3_xxs_gemm2_prefill32_imma(
+                                          expert_stager_->gate_weight(),
+                                          expert_stager_->up_weight(),
+                                          iq_prefill_workspace_4096_.get(), 32,
+                                          c_gateu_.get(), c_up_.get(),
+                                          moe_intermediate_, hidden_),
+                                      "Q3 whole-layer IQ3 IMMA gate/up");
+                                launch_clamped_swiglu(c_gateu_.get(), c_up_.get(),
+                                                      c_act_.get(),
+                                                      32 * moe_intermediate_);
+                                check(insignia::glm53::iq_quantize_activation_prefill(
+                                          c_act_.get(), moe_intermediate_, 32,
+                                          iq_prefill_workspace_2048_.get()),
+                                      "quantize Q3 whole-layer IMMA SwiGLU");
+                                check(insignia::glm53::iq4_xs_gemm_prefill32_imma(
+                                          expert_stager_->down_weight(),
+                                          iq_prefill_workspace_2048_.get(), 32,
+                                          iq_prefill_out_.get(), hidden_,
+                                          moe_intermediate_),
+                                      "Q3 whole-layer IQ4 IMMA down");
+                                scatter_indexed_rows_kernel<<<512, 256>>>(
+                                    iq_prefill_out_.get(), whole_expert_out.get(),
+                                    output_ids, count, hidden_);
+                                check(cudaGetLastError(),
+                                      "Q3 whole-layer IMMA gather/scatter");
+                                base_user += count;
+                                continue;
+                            }
+                            const int count = std::min(kMaxVerify, remaining);
+                            check(insignia::glm53::iq_quantize_activation_rows(
+                                      whole_normalized.get(), hidden_,
+                                      whole_users.data() + base_user, count,
+                                      iq_workspace_4096_.get()),
+                                  "quantize Q3 whole-layer expert input");
+                            if (gate_type == TensorType::iq3_xxs)
+                                check(insignia::glm53::iq3_xxs_gemv2_rows(
+                                          expert_stager_->gate_weight(),
+                                          expert_stager_->up_weight(),
+                                          iq_workspace_4096_.get(), count,
+                                          c_gateu_.get(), c_up_.get(), local_ids.data(),
+                                          moe_intermediate_, hidden_),
+                                      "Q3 whole-layer IQ3 gate/up");
+                            else if (gate_type == TensorType::iq4_xs) {
+                                check(insignia::glm53::iq4_xs_gemv_rows(
+                                          expert_stager_->gate_weight(),
+                                          iq_workspace_4096_.get(), count,
+                                          c_gateu_.get(), local_ids.data(),
+                                          moe_intermediate_, hidden_),
+                                      "Q3 whole-layer IQ4 gate");
+                                check(insignia::glm53::iq4_xs_gemv_rows(
+                                          expert_stager_->up_weight(),
+                                          iq_workspace_4096_.get(), count,
+                                          c_up_.get(), local_ids.data(),
+                                          moe_intermediate_, hidden_),
+                                      "Q3 whole-layer IQ4 up");
+                            } else
+                                require(false, "unsupported Q3 whole-layer gate/up format");
+                            check(insignia::glm53::iq_quantize_swiglu_rows(
+                                      c_gateu_.get(), c_up_.get(), moe_intermediate_,
+                                      local_ids.data(), count,
+                                      iq_workspace_2048_.get()),
+                                  "quantize Q3 whole-layer SwiGLU");
+                            if (down_type == TensorType::iq4_xs)
+                                check(insignia::glm53::iq4_xs_gemv_rows(
+                                          expert_stager_->down_weight(),
+                                          iq_workspace_2048_.get(), count,
+                                          whole_expert_out.get(),
+                                          whole_out_ids.data() + base_user,
+                                          hidden_, moe_intermediate_),
+                                      "Q3 whole-layer IQ4 down");
+                            else if (down_type == TensorType::q6_k)
+                                check(insignia::glm53::q6_k_gemv_rows(
+                                          expert_stager_->down_weight(),
+                                          iq_workspace_2048_.get(), count,
+                                          whole_expert_out.get(),
+                                          whole_out_ids.data() + base_user,
+                                          hidden_, moe_intermediate_),
+                                      "Q3 whole-layer Q6 down");
+                            else
+                                require(false, "unsupported Q3 whole-layer down format");
+                            base_user += count;
+                        }
+                    } else for (int base_user = 0; base_user < user_count;
+                                base_user += kMaxVerify) {
                         const int count = std::min(kMaxVerify, user_count - base_user);
                         check(insignia::glm53::nvfp4_quantize_activation_rows(
                                   whole_normalized.get(), hidden_,

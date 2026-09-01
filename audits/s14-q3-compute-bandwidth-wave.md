@@ -109,6 +109,28 @@ Seven-run medians improve 182.215 -> 101.346 us (1.798x by median times;
 tensor-core launches: MSE 0, relative L2 0, cosine 1.0, max error 0. The pair
 kernel uses 53 registers, one barrier, 4 KiB shared memory, and no spills.
 
+The faster quality-gated arm quantizes each 32-value activation group once and
+feeds the decoded IQ3 bytes directly to Ada's signed
+`mma.sync.aligned.m16n8k32`. Integer dot products stay in registers; the kernel
+then applies the independent row and token scales in FP32. Seven-run medians
+improve the FP16 pair from 101.419 us to 60.012 us including activation
+quantization (1.690x by median times; 1.689x paired-ratio median). IMMA compute
+alone is 57.487 us. The kernel uses 47 registers, one barrier, 2,176 bytes of
+shared memory, and no spills.
+
+Against the independent FP64-accumulating CPU oracle, the IMMA gate result has
+MSE 3.417566e-6, relative L2 0.006917408, cosine 0.9999760766, and max error
+0.01302025. Up has MSE 3.551246e-6, relative L2 0.006927118, cosine
+0.9999760152, and max error 0.009515196. This passes the existing per-matrix
+2%/0.9998 gate, but full-model PPL/KL/JS and hard-prompt checks remain required
+before making it the unconditional production default.
+
+A decoder-granularity sweep made each thread expand one, two, or four IQ3 code
+pairs to reduce redundant metadata reads. All variants were bit-identical, but
+seven-run pipeline medians were 64.189, 65.370, and 66.085 us respectively.
+The generalized p1 code also lost against the original 60.012 us specialization.
+The sweep was removed and the original 128-way decoder restored.
+
 A more aggressive prefill arm regenerated clamped SwiGLU inside every IQ4
 down-row CTA to remove the 256 KiB intermediate. It was also bit-exact, but
 duplicating the sigmoid work across CTAs regressed the seven-run median

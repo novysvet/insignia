@@ -1,5 +1,22 @@
 # progress
 
+### 2026-09-01 - Native signed-IMMA IQ3 prefill
+
+IQ3 gate/up now has a Q8 activation plus native signed-int8 tensor-core path.
+It decodes codebook bytes straight into `m16n8k32.s8` fragments, keeps INT32
+dots in registers, and applies per-row/per-token scales in FP32. Seven-run
+medians improve the paired FP16 path 101.419->60.012 us including activation
+quantization (1.690x by median times; 1.689x paired-ratio median); compute alone
+is 57.487 us. The kernel has 47 registers, 2,176 bytes shared memory, and no
+spills.
+
+Gate/up CPU-oracle metrics are MSE 3.417566e-6/3.551246e-6, relative L2
+0.006917/0.006927, cosine 0.99997608/0.99997602, and max error
+0.01302/0.00952. This passes the matrix gate; full-model PPL/KL/JS remains a
+production gate. A 1/2/4-code-pair thread-granularity sweep was exact but
+slower and was removed. Evidence is in
+`audits/s14-q3-compute-bandwidth-wave.md`.
+
 ### 2026-09-01 - Paired IQ3 tensor-core prefill
 
 The real 32-token IQ3 gate/up path now converts the shared activation tile once

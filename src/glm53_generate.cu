@@ -7881,7 +7881,9 @@ void Runner::prefill_prompt_full_layer_major(const std::vector<int> &tokens) {
     const size_t capture_floats = size_t(5) * df_tokens * hidden_;
 
     constexpr int kWholeMoeMaxPrompt = 8192;
-    constexpr int kQ3WholeMoeAutoTokens = 320;
+    // The CLI's reported prompt length includes the seed token; the measured
+    // 320-token crossover reaches this function as 319 retained rows.
+    constexpr int kQ3WholeMoeAutoTokens = 319;
     const bool whole_requested = prefill_whole_layer_moe_ >= 0
         ? prefill_whole_layer_moe_ != 0
         : q3_experts_ && prompt_tokens >= kQ3WholeMoeAutoTokens;

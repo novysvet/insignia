@@ -1,5 +1,36 @@
 # progress
 
+### 2026-09-01 - Q3 compute-for-bandwidth fusion and exact crossover
+
+The native Q3 path now spends redundant Ada compute to avoid global-memory
+intermediates. Fused IQ3 gate/up improves the dedicated WIM32 x1 median
+14.473->13.493 us. Recomputing SwiGLU Q8 in every IQ4 down CTA improves
+16.033->7.850 us (2.042x); Q6_K exceptions improve 13.098->10.035 us (1.305x).
+All fused outputs are bit-exact against the unfused GPU paths: MSE 0, relative
+L2 0, cosine 1.0, max error 0.
+
+The more aggressive hidden-Q8 fusion redundantly quantizes the same 4096-wide
+row in every gate/up CTA and keeps it in 4.5 KiB shared memory. The r8 tile
+improves separate quant+gate/up 20.555->12.556 us (1.637x). Chained directly
+into fused down, a single resident expert reaches a 17.759 us median with a
+1.644x median paired speedup over the old four-stage path. The kernel uses 60
+registers and has no spills.
+
+That result is not promoted blindly: eight distinct resident expert slices
+show the reuse crossover. Double fusion wins at k=1 (1.405x paired median) and
+k=2 (1.161x), is noisy at k=4 (1.045x), and loses at exact top-8 (0.924x).
+Dispatch double fusion only for active k<=2; top-8 shares one hidden-Q8
+conversion. WIM64, three exact parity/sign circuits, two-warp HMMA, and an
+rANS codec saving only 1.694% were measured and rejected. Q6 tensor-core
+prefill improves 130.337->48.728 us (2.675x), with relative L2 0.0002819 and
+cosine 0.9999999603. Full evidence is in
+`audits/s14-q3-compute-bandwidth-wave.md`.
+
+Production Q3 integration remains blocked on the typed GGUF expert stager and
+Q8_0 dense/shared path; the current generator still consumes the deleted
+NVFP4 compact-store schema. The public Q3 shard download continues in its
+restartable glm-box tmux job.
+
 ### 2026-09-01 - Native IQ3/IQ4 decode and tensor-core prefill
 
 `UD-Q3_K_XL` was byte-inventoried before dispatch work. Despite its name,

@@ -702,13 +702,32 @@ public:
     static constexpr size_t kQ3PayloadCapacity = 16ull << 20;
     static constexpr size_t kQ3WindowBytes =
         (kQ3PayloadCapacity + 2 * kAlignment - 2) & ~(kAlignment - 1);
+    // The live Q3_K_XL routed records have only three geometries.  Their raw
+    // projection spans are page multiples; each of the three O_DIRECT reads
+    // can consume at most one leading-delta page.  One final guard page keeps
+    // the class proof independent of GGUF tensor alignment.
+    static constexpr size_t kQ3SmallWindowBytes = 2660ull * kAlignment;
+    static constexpr size_t kQ3MediumWindowBytes = 3252ull * kAlignment;
+    static constexpr size_t kQ3LargeWindowBytes = 3860ull * kAlignment;
     static constexpr uint32_t kNoKey = 0xffffffffu;
+
+    static constexpr uint8_t q3_window_class(int layer) {
+        return layer == 11 ? 2 : (layer == 12 || layer == 44 ? 1 : 0);
+    }
+    static constexpr size_t q3_window_capacity(uint8_t size_class) {
+        return size_class == 2 ? kQ3LargeWindowBytes :
+               size_class == 1 ? kQ3MediumWindowBytes : kQ3SmallWindowBytes;
+    }
 
     explicit ExpertStager(ShardedIndex &model, ShardedIndex *stripe_model,
                           uint64_t host_cache_bytes, bool q3_experts = false)
         : model_(model), stripe_model_(stripe_model), q3_experts_(q3_experts) {
         window_bytes_ = q3_experts_ ? kQ3WindowBytes : kWindowBytes;
         record_capacity_ = q3_experts_ ? kQ3PayloadCapacity : kPayloadCapacity;
+        if (q3_experts_)
+            if (const char *compact =
+                    std::getenv("INSIGNIA_GLM53_Q3_COMPACT_HOST"))
+                q3_compact_host_ = std::atoi(compact) != 0;
         // A full decode token needs 336 records; default the tier just above
         // that and let the environment shrink it on smaller hosts.
         window_count_ = int(std::clamp<uint64_t>(host_cache_bytes / window_bytes_, 64, 4096));
@@ -726,6 +745,7 @@ public:
             if (status == cudaSuccess) {
                 host_raw_ = static_cast<uint8_t *>(block);
                 window_count_ = int(attempt);
+                host_arena_bytes_ = attempt * window_bytes_;
                 break;
             }
             cudaGetLastError();  // clear the sticky error and retry smaller
@@ -734,6 +754,40 @@ public:
         require(host_raw_, "cudaHostAlloc expert host cache");
         host_ = reinterpret_cast<uint8_t *>(
             (reinterpret_cast<uintptr_t>(host_raw_) + kAlignment - 1) & ~(uintptr_t(kAlignment) - 1));
+        if (q3_compact_host_) {
+            size_t cursor = 0;
+            bool full = false;
+            while (!full)
+                for (int layer = 3; layer <= 44; ++layer) {
+                    const uint8_t size_class = q3_window_class(layer);
+                    const size_t capacity = q3_window_capacity(size_class);
+                    if (cursor + capacity > host_arena_bytes_) {
+                        full = true;
+                        break;
+                    }
+                    window_offsets_.push_back(cursor);
+                    window_capacities_.push_back(capacity);
+                    window_classes_.push_back(size_class);
+                    ++window_class_counts_[size_t(size_class)];
+                    cursor += capacity;
+                }
+            window_count_ = int(window_offsets_.size());
+            require(window_count_ >= 64,
+                    "compact Q3 host arena produced too few windows");
+            std::printf("Q3 compact host tier: %d slots (%d/%d/%d small/medium/large, "
+                        "%.1f MiB padding reclaimed)\n",
+                        window_count_, window_class_counts_[0], window_class_counts_[1],
+                        window_class_counts_[2],
+                        (size_t(window_count_) * kQ3WindowBytes - cursor) /
+                            double(1ull << 20));
+        } else {
+            window_offsets_.resize(size_t(window_count_));
+            window_capacities_.assign(size_t(window_count_), record_capacity_);
+            window_classes_.assign(size_t(window_count_), 0);
+            window_class_counts_[0] = window_count_;
+            for (int window = 0; window < window_count_; ++window)
+                window_offsets_[size_t(window)] = size_t(window) * window_bytes_;
+        }
         windows_.resize(size_t(window_count_));
         for (WindowState &state : windows_)
             check(cudaEventCreateWithFlags(&state.copy_done, cudaEventDisableTiming),
@@ -836,7 +890,7 @@ public:
         if (device_packed_scales_)
             require(packed_fd_ >= 0,
                     "packed device slots require INSIGNIA_GLM53_PACKED_EXPERTS");
-        for (int window = 0; window < window_count_; ++window) free_windows_.push_back(window);
+        for (int window = 0; window < window_count_; ++window) push_free_window(window);
         start_pool();
         load_pin_list();
     }
@@ -895,12 +949,11 @@ public:
         reap_released();
         int started = 0;
         for (int index = 0; index < count; ++index) {
-            if (int(free_windows_.size()) <= 8) break;
             if (experts[index] < 0) continue;  // routing unknown (first token)
             const uint32_t key = route_key(layer, experts[index]);
             if (flight_index_.count(key)) continue;
-            const int window = free_windows_.back();
-            free_windows_.pop_back();
+            const int window = pop_free_window(required_window_class(layer), 8);
+            if (window < 0) break;
             start_read(window, key, layer, experts[index], false);
             ++prefetch_started_;
             ++started;
@@ -936,15 +989,14 @@ public:
                 taken_device = 0;
             }
             if (taken >= per_layer) continue;
-            if (int(free_windows_.size()) <= 16) break;
             const uint32_t key = route_key(layer, parsed_expert);
             if (flight_index_.count(key)) {
                 ++taken;
                 ++taken_device;
                 continue;
             }
-            const int window = free_windows_.back();
-            free_windows_.pop_back();
+            const int window = pop_free_window(required_window_class(layer), 16);
+            if (window < 0) continue;
             start_read(window, key, layer, parsed_expert, false);
             windows_[size_t(window)].pinned = true;
             lru_unlink(window);
@@ -1045,7 +1097,7 @@ public:
                     continue;
                 }
             }
-            const int window = take_window();
+            const int window = take_window(layer);
             start_read(window, key, layer, expert, true);
             batch_window_[slot] = window;
             started_bytes += windows_[size_t(window)].source_bytes;
@@ -1090,6 +1142,12 @@ public:
     // 8-record batches. Records already resident or in flight are skipped.
     void stage_layer(int layer, const int *experts, int count) {
         if (!overlap_reads_) return;
+        // Whole-layer read-ahead claims the complete union at once.  The
+        // compact arena deliberately gives rare large-record layers only
+        // their proportional share; leave those layers on ordinary 8-wide
+        // demand staging when their union cannot fit in the matching class.
+        if (q3_compact_host_ && window_class_counts_[size_t(q3_window_class(layer))] < count)
+            return;
         for (int index = 0; index < count; ++index) {
             if (experts[index] < 0) continue;
             const uint32_t key = route_key(layer, experts[index]);
@@ -1104,7 +1162,7 @@ public:
             // batch consult adopts the VRAM slot directly at upload time.
             if (f3_device_consult_ && device_arena_ && device_index_.count(key))
                 continue;
-            const int window = take_window();
+            const int window = take_window(layer);
             start_read(window, key, layer, experts[index], true);
             windows_[size_t(window)].claimed = true;
             io_bytes_ += windows_[size_t(window)].source_bytes;
@@ -1143,7 +1201,7 @@ public:
             // The slot was recycled between the batch consult and this
             // upload (only this batch's own miss uploads can evict). Stage
             // the demand read now and fall through to the regular path.
-            const int window = take_window();
+            const int window = take_window(batch_layer_);
             start_read(window, key, batch_layer_, batch_experts_[size_t(slot)], true);
             io_bytes_ += windows_[size_t(window)].source_bytes;
             batch_window_[size_t(slot)] = window;
@@ -2269,17 +2327,37 @@ private:
             }
             state.releasing = false;
             state.copy_issued = false;
-            free_windows_.push_back(window);
+            push_free_window(window);
         }
         releasing_.resize(out);
     }
-    int take_window() {
-        reap_released();
-        if (!free_windows_.empty()) {
-            const int window = free_windows_.back();
+    int required_window_class(int layer) const {
+        return q3_compact_host_ ? int(q3_window_class(layer)) : 0;
+    }
+    void push_free_window(int window) {
+        const size_t size_class = window_classes_[size_t(window)];
+        free_windows_.push_back(window);
+        ++free_window_class_counts_[size_class];
+    }
+    int pop_free_window(int size_class, int reserve = 0) {
+        require(size_class >= 0 && size_class < int(free_window_class_counts_.size()),
+                "invalid expert host-window size class");
+        if (free_window_class_counts_[size_t(size_class)] <= reserve) return -1;
+        for (size_t index = free_windows_.size(); index-- > 0;) {
+            const int window = free_windows_[index];
+            if (window_classes_[size_t(window)] != size_class) continue;
+            free_windows_[index] = free_windows_.back();
             free_windows_.pop_back();
+            --free_window_class_counts_[size_t(size_class)];
             return window;
         }
+        require(false, "expert free-window class count drifted");
+        return -1;
+    }
+    int take_window(int layer) {
+        const int size_class = required_window_class(layer);
+        reap_released();
+        if (const int window = pop_free_window(size_class); window >= 0) return window;
         if (tier_o1_ || tier_slru_) {
             // O(1) victim: first eligible window from the probationary tail,
             // then the protected tail (SLRU). The probationary order mirrors
@@ -2296,19 +2374,19 @@ private:
             };
             for (int walk = pb_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
                 const WindowState &state = windows_[size_t(walk)];
-                if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
-                    state.pinned)
+                if (window_classes_[size_t(walk)] != size_class || state.key == kNoKey ||
+                    !state.done || state.claimed || state.releasing || state.pinned)
                     continue;
                 evict(walk);
-                return take_window();
+                return take_window(layer);
             }
             for (int walk = pt_tail_; walk >= 0; walk = lru_prev_[size_t(walk)]) {
                 const WindowState &state = windows_[size_t(walk)];
-                if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
-                    state.pinned)
+                if (window_classes_[size_t(walk)] != size_class || state.key == kNoKey ||
+                    !state.done || state.claimed || state.releasing || state.pinned)
                     continue;
                 evict(walk);
-                return take_window();
+                return take_window(layer);
             }
         }
         // Evict the least-recently-used completed, unclaimed record. A batch
@@ -2319,8 +2397,8 @@ private:
         int victim = -1;
         for (int window = 0; window < window_count_; ++window) {
             const WindowState &state = windows_[size_t(window)];
-            if (state.key == kNoKey || !state.done || state.claimed || state.releasing ||
-                state.pinned)
+            if (window_classes_[size_t(window)] != size_class || state.key == kNoKey ||
+                !state.done || state.claimed || state.releasing || state.pinned)
                 continue;
             if (victim < 0 || state.stamp < windows_[size_t(victim)].stamp) victim = window;
         }
@@ -2328,14 +2406,12 @@ private:
             // Everything is claimed or draining: wait out the oldest copy.
             for (int window = 0; window < window_count_; ++window) {
                 WindowState &state = windows_[size_t(window)];
-                if (!state.releasing) continue;
+                if (window_classes_[size_t(window)] != size_class || !state.releasing) continue;
                 check(cudaEventSynchronize(state.copy_done), "drain released expert copy");
                 state.releasing = false;
                 state.copy_issued = false;
-                free_windows_.push_back(window);
-                const int taken = free_windows_.back();
-                free_windows_.pop_back();
-                return taken;
+                push_free_window(window);
+                return pop_free_window(size_class);
             }
         }
         require(victim >= 0, "no expert window available for a demand read");
@@ -2347,7 +2423,7 @@ private:
         }
         if (!victim_state.demand) ++prefetch_wasted_;
         release_window(victim);
-        return take_window();
+        return take_window(layer);
     }
     void release_window(int window) {
         WindowState &state = windows_[size_t(window)];
@@ -2355,7 +2431,7 @@ private:
         state.key = kNoKey;
         state.demand = false;
         lru_unlink(window);
-        free_windows_.push_back(window);
+        push_free_window(window);
     }
     // Drive of a routing target: 0 = main store, 1 = ALT_SHARD_DIR (second
     // physical drive). Cached per (layer,expert); the lookup walks 9 index
@@ -2452,7 +2528,8 @@ private:
         pool_cv_.notify_all();
     }
     void stage_q3(Layout &layout, std::array<float, 3> &globals,
-                  uint8_t *&payload, uint8_t *window, int layer, int expert) {
+                  uint8_t *&payload, uint8_t *window, size_t window_capacity,
+                  int layer, int expert) {
         require(q3_experts_ && expert >= 0 && expert < int(model_.experts()),
                 "invalid native Q3 expert request");
         const Q3ExpertLocations tensors = locate_q3_expert(model_, layer);
@@ -2473,7 +2550,7 @@ private:
             const size_t delta = size_t(offset - aligned_offset);
             const size_t request =
                 (delta + size_t(bytes) + kAlignment - 1) & ~(kAlignment - 1);
-            require(cursor + request <= record_capacity_,
+            require(cursor + request <= window_capacity,
                     "native Q3 expert exceeds staging size class");
             const uint64_t actual_delta = model_.read_span_direct_window(
                 tensor.shard, offset, bytes, window + cursor, request);
@@ -2487,24 +2564,25 @@ private:
     }
     void read_window(int window, void *packed_scratch) {
         WindowState &state = windows_[size_t(window)];
+        uint8_t *const host_window = host_ + window_offsets_[size_t(window)];
         try {
             if (q3_experts_) {
-                stage_q3(state.layout, state.globals, state.payload,
-                         host_ + size_t(window) * window_bytes_,
+                stage_q3(state.layout, state.globals, state.payload, host_window,
+                         window_capacities_[size_t(window)],
                          state.layer, state.expert);
                 ++drive_records_[0];
                 drive_bytes_[0].fetch_add(state.source_bytes,
                                           std::memory_order_relaxed);
             } else if (packed_fd_ >= 0) {
                 stage_packed(state.layout, state.globals, state.payload,
-                             host_ + size_t(window) * window_bytes_,
+                             host_window,
                              state.layer, state.expert, packed_scratch);
             } else {
                 auto stage_from = [&](ShardedIndex &source) {
                     const ExpertLocations tensors =
                         locate_expert(source, state.layer, state.expert);
                     stage(source, state.layout, state.globals, state.payload, tensors,
-                          host_ + size_t(window) * window_bytes_, state);
+                          host_window, state);
                 };
                 if (state.drive == 1 && stripe_model_ &&
                     stripe_failed_.load(std::memory_order_relaxed)) {
@@ -2606,8 +2684,10 @@ private:
     ShardedIndex &model_;
     ShardedIndex *stripe_model_ = nullptr;
     bool q3_experts_ = false;
+    bool q3_compact_host_ = false;
     size_t window_bytes_ = kWindowBytes;
     size_t record_capacity_ = kPayloadCapacity;
+    size_t host_arena_bytes_ = 0;
     int packed_fd_ = -1, packed_direct_fd_ = -1;
     int packed_version_ = 0;
     std::vector<PackedExpertIndexEntry> packed_entries_;
@@ -2620,6 +2700,10 @@ private:
     Layout active_{};
     std::array<float, 3> active_globals_{};
     std::vector<WindowState> windows_;
+    std::vector<size_t> window_offsets_, window_capacities_;
+    std::vector<uint8_t> window_classes_;
+    std::array<int, 3> window_class_counts_{};
+    std::array<int, 3> free_window_class_counts_{};
     int window_count_ = 0;
     std::unordered_map<uint32_t, int> flight_index_;
     std::vector<int> free_windows_;

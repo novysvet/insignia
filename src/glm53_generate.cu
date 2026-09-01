@@ -4826,13 +4826,22 @@ void Runner::sparse_moe(int layer, const float *input, float *output) {
                     require(gate_type == this_gate && down_type == this_down,
                             "Q3 expert formats must be uniform within a layer");
                 }
+                // Keep the original copy/compute pipeline alive: as soon as
+                // one normal IQ3 record reaches VRAM, launch its gate/up pair
+                // while the copy engine fetches the next record.  Waiting for
+                // all eight records before any work made cold and host-tier
+                // hits serialize behind eight H2D copies.
+                if (gate_type == TensorType::iq3_xxs &&
+                    down_type == TensorType::iq4_xs) {
+                    const int output_id = slot;
+                    check(insignia::glm53::iq3_xxs_gemv2_rows(
+                              gate_weights[size_t(slot)], up_weights[size_t(slot)],
+                              iq_workspace_4096_.get(), 1, c_gateu_.get(), c_up_.get(),
+                              &output_id, moe_intermediate_, hidden_),
+                          "Q3 pipelined IQ3 gate/up");
+                }
             }
             if (gate_type == TensorType::iq3_xxs && down_type == TensorType::iq4_xs) {
-                check(insignia::glm53::iq3_xxs_gemv2_topk_x1(
-                          gate_weights.data(), up_weights.data(), iq_workspace_4096_.get(),
-                          moe_topk_, c_gateu_.get(), c_up_.get(),
-                          moe_intermediate_, hidden_),
-                      "Q3 raw top-k IQ3 gate/up");
                 check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
                           down_weights.data(), c_gateu_.get(), c_up_.get(), combine.data(),
                           moe_topk_, routed_.get(), hidden_, moe_intermediate_),

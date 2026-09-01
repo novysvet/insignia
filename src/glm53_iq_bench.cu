@@ -504,9 +504,13 @@ int main(int argc, char **argv) {
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
         constexpr int kBatchExperts = 8;
+        uint8_t *batch_gate_raw[kBatchExperts]{};
+        uint8_t *batch_up_raw[kBatchExperts]{};
         uint8_t *batch_gate[kBatchExperts]{};
         uint8_t *batch_up[kBatchExperts]{};
         uint8_t *batch_down[kBatchExperts]{};
+        batch_gate_raw[0] = gate.weights_device;
+        batch_up_raw[0] = up_device;
         batch_gate[0] = gate_wim32_device;
         batch_up[0] = up_wim32_device;
         batch_down[0] = down.weights_device;
@@ -523,27 +527,19 @@ int main(int argc, char **argv) {
             insignia::glm53::iq3_xxs_repack_wim32_cpu(
                 expert_up.data(), expert_up_wim32.data(),
                 gate_rows, gate_cols);
+            batch_gate_raw[expert] = device_copy(expert_gate);
+            batch_up_raw[expert] = device_copy(expert_up);
             batch_gate[expert] = device_copy(expert_gate_wim32);
             batch_up[expert] = device_copy(expert_up_wim32);
             batch_down[expert] = device_copy(read_slice(
                 path, down_offset + uint64_t(expert) * iq4_bytes, iq4_bytes));
         }
-        const std::vector<uint8_t *> batch_gate_host(
-            batch_gate, batch_gate + kBatchExperts);
-        const std::vector<uint8_t *> batch_up_host(
-            batch_up, batch_up + kBatchExperts);
-        const std::vector<uint8_t *> batch_down_host(
-            batch_down, batch_down + kBatchExperts);
-        auto **batch_gate_table = device_copy(batch_gate_host);
-        auto **batch_up_table = device_copy(batch_up_host);
-        auto **batch_down_table = device_copy(batch_down_host);
         auto *batch_gate_output =
             device_alloc<float>(size_t(kBatchExperts) * gate.rows);
         auto *batch_up_output =
             device_alloc<float>(size_t(kBatchExperts) * gate.rows);
         const std::vector<float> batch_combine_host = {
             0.22f, 0.18f, 0.16f, 0.14f, 0.11f, 0.08f, 0.06f, 0.05f};
-        auto *batch_combine = device_copy(batch_combine_host);
         check(insignia::glm53::iq_quantize_activation_rows(
                   gate.x_device, gate.cols, row_ids, kTokens, gate.workspace),
               "prepare gate benchmark");
@@ -576,8 +572,33 @@ int main(int argc, char **argv) {
                          top8_up_reference.size() * sizeof(float),
                          cudaMemcpyDeviceToHost),
               "copy sequential exact top8 up");
+        check(insignia::glm53::iq3_xxs_gemv2_topk_x1(
+                  batch_gate_raw, batch_up_raw, gate.workspace,
+                  kBatchExperts, batch_gate_output, batch_up_output,
+                  gate.rows, gate.cols),
+              "batched raw exact top8 gate/up");
+        check(cudaDeviceSynchronize(),
+              "batched raw exact top8 gate/up synchronize");
+        std::vector<float> raw_top8_gate_output(size_t(kBatchExperts) * gate.rows);
+        std::vector<float> raw_top8_up_output(size_t(kBatchExperts) * gate.rows);
+        check(cudaMemcpy(raw_top8_gate_output.data(), batch_gate_output,
+                         raw_top8_gate_output.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy batched raw exact top8 gate");
+        check(cudaMemcpy(raw_top8_up_output.data(), batch_up_output,
+                         raw_top8_up_output.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy batched raw exact top8 up");
+        const Metrics raw_top8_gate_metrics =
+            compare(raw_top8_gate_output, top8_gate_reference);
+        const Metrics raw_top8_up_metrics =
+            compare(raw_top8_up_output, top8_up_reference);
+        print_metrics("IQ3 raw exact top8 gate", raw_top8_gate_metrics);
+        print_metrics("IQ3 raw exact top8 up", raw_top8_up_metrics);
+        failed |= raw_top8_gate_metrics.maximum != 0.0 ||
+                  raw_top8_up_metrics.maximum != 0.0;
         check(insignia::glm53::iq3_xxs_gemv2_wim32_topk_x1(
-                  batch_gate_table, batch_up_table, gate.workspace,
+                  batch_gate, batch_up, gate.workspace,
                   kBatchExperts, batch_gate_output, batch_up_output,
                   gate.rows, gate.cols),
               "batched exact top8 gate/up");
@@ -623,8 +644,8 @@ int main(int argc, char **argv) {
                          size_t(down.rows) * sizeof(float)),
               "clear batched exact top8 down");
         check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
-                  batch_down_table, batch_gate_output, batch_up_output,
-                  batch_combine, kBatchExperts, down.output_device,
+                  batch_down, batch_gate_output, batch_up_output,
+                  batch_combine_host.data(), kBatchExperts, down.output_device,
                   down.rows, down.cols),
               "batched exact top8 down");
         check(cudaDeviceSynchronize(),
@@ -1110,15 +1131,33 @@ int main(int argc, char **argv) {
                           gate.x_device, gate.cols, row_ids, 1, gate.workspace),
                       "timed batched top-k hidden quantize");
                 check(insignia::glm53::iq3_xxs_gemv2_wim32_topk_x1(
-                          batch_gate_table, batch_up_table, gate.workspace,
+                          batch_gate, batch_up, gate.workspace,
                           expert_count, batch_gate_output, batch_up_output,
                           gate.rows, gate.cols),
                       "timed batched top-k gate/up");
                 check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
-                          batch_down_table, batch_gate_output, batch_up_output,
-                          batch_combine, expert_count, down.output_device,
+                          batch_down, batch_gate_output, batch_up_output,
+                          batch_combine_host.data(), expert_count, down.output_device,
                           down.rows, down.cols),
                       "timed batched top-k down");
+            };
+            const auto launch_exact_batched_raw = [&] {
+                check(cudaMemsetAsync(down.output_device, 0,
+                                      size_t(down.rows) * sizeof(float)),
+                      "timed clear raw batched top-k");
+                check(insignia::glm53::iq_quantize_activation_rows(
+                          gate.x_device, gate.cols, row_ids, 1, gate.workspace),
+                      "timed raw batched top-k hidden quantize");
+                check(insignia::glm53::iq3_xxs_gemv2_topk_x1(
+                          batch_gate_raw, batch_up_raw, gate.workspace,
+                          expert_count, batch_gate_output, batch_up_output,
+                          gate.rows, gate.cols),
+                      "timed raw batched top-k gate/up");
+                check(insignia::glm53::iq4_xs_swiglu_gemv_acc_topk_x1(
+                          batch_down, batch_gate_output, batch_up_output,
+                          batch_combine_host.data(), expert_count,
+                          down.output_device, down.rows, down.cols),
+                      "timed raw batched top-k down");
             };
             const auto launch_exact_double_fused = [&] {
                 check(cudaMemsetAsync(down.output_device, 0,
@@ -1143,13 +1182,17 @@ int main(int argc, char **argv) {
                 benchmark_us(launch_exact_serial, 40, 400);
             const float exact_batched_us =
                 benchmark_us(launch_exact_batched, 40, 400);
+            const float exact_batched_raw_us =
+                benchmark_us(launch_exact_batched_raw, 40, 400);
             const float exact_double_fused_us =
                 benchmark_us(launch_exact_double_fused, 40, 400);
-            std::printf("IQ3/IQ4 exact top%d serial/batched/double-fused "
-                        "%8.3f/%8.3f/%8.3f us %.3fx/%.3fx\n",
+            std::printf("IQ3/IQ4 exact top%d serial/wim-batched/raw-batched/double-fused "
+                        "%8.3f/%8.3f/%8.3f/%8.3f us %.3fx/%.3fx/%.3fx\n",
                         expert_count, exact_serial_us, exact_batched_us,
+                        exact_batched_raw_us,
                         exact_double_fused_us,
                         exact_serial_us / exact_batched_us,
+                        exact_serial_us / exact_batched_raw_us,
                         exact_serial_us / exact_double_fused_us);
         }
 
@@ -1450,16 +1493,14 @@ int main(int argc, char **argv) {
             cudaFree(down_prefill_workspace[batch]);
         }
         for (int expert = 1; expert < kBatchExperts; ++expert) {
+            cudaFree(batch_gate_raw[expert]);
+            cudaFree(batch_up_raw[expert]);
             cudaFree(batch_gate[expert]);
             cudaFree(batch_up[expert]);
             cudaFree(batch_down[expert]);
         }
-        cudaFree(batch_gate_table);
-        cudaFree(batch_up_table);
-        cudaFree(batch_down_table);
         cudaFree(batch_gate_output);
         cudaFree(batch_up_output);
-        cudaFree(batch_combine);
     } else {
         std::puts("timing skipped; pass --bench only on an uncontended glm-box run");
     }

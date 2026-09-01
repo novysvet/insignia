@@ -210,9 +210,22 @@ cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
     int rows_per_matrix,
     cudaStream_t stream = nullptr);
 
-// Exact top-k decode batching.  The pointer tables live on device. Gate/up
-// writes compact [expert][row] outputs; IQ4 down consumes those rows and
-// accumulates experts in canonical order inside one kernel launch.
+// Exact top-k decode batching. Pointer arrays and combine weights are ordinary
+// host arrays copied into the launch parameter block, so production does not
+// pay three tiny H2D copies per layer. Gate/up writes compact
+// [expert][row] outputs; IQ4 down consumes those rows and accumulates experts
+// in canonical order inside one kernel launch.
+cudaError_t iq3_xxs_gemv2_topk_x1(
+    uint8_t *const *gate_weights,
+    uint8_t *const *up_weights,
+    const void *workspace,
+    int expert_count,
+    float *gate_y,
+    float *up_y,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
 cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
     uint8_t *const *gate_weights,
     uint8_t *const *up_weights,

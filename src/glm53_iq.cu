@@ -50,6 +50,14 @@ struct IQRowOut {
     float weights[kIQMaxRows]{};
 };
 
+struct IQPointerTable {
+    const uint8_t *weights[8]{};
+};
+
+struct IQCombineTable {
+    float weights[8]{};
+};
+
 constexpr uint32_t kIQ3GridHost[256] = {
 #include "insignia_iq3xxs_grid.inc"
 };
@@ -691,9 +699,66 @@ void iq3_xxs_wim32_fused_quant_pair_x1_kernel(
     }
 }
 
+__global__ __launch_bounds__(128, 4) void iq3_xxs_topk_pair_x1_kernel(
+    IQPointerTable gate_weights,
+    IQPointerTable up_weights,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ gate_y,
+    float *__restrict__ up_y,
+    int rows) {
+    constexpr int kBlocks = 16;
+    constexpr int kWarpsPerMatrix = 2;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int matrix = warp / kWarpsPerMatrix;
+    const int matrix_warp = warp - matrix * kWarpsPerMatrix;
+    const int cohort = lane >> 3;
+    const int subgroup = lane & 7;
+    const int expert = blockIdx.y;
+    const int row = blockIdx.x * kWarpsPerMatrix + matrix_warp;
+    const auto *matrix_weights = reinterpret_cast<const IQ3XXSBlock *>(
+        matrix ? up_weights.weights[expert] : gate_weights.weights[expert]);
+    const IQ3XXSBlock *row_weights =
+        matrix_weights + static_cast<size_t>(row) * kBlocks;
+    float sum = 0.0f;
+#pragma unroll
+    for (int wave = 0; wave < kBlocks / 4; ++wave) {
+        const int block_id = 4 * wave + cohort;
+        const IQ3XXSBlock &block = row_weights[block_id];
+        const uint8_t *indices = block.qs + 8 * subgroup;
+        const uint32_t indices0 = load_u32_any(indices);
+        const uint32_t indices1 = load_u32_any(indices + 4);
+        const uint32_t aux = load_u32_any(block.qs + 64 + 4 * subgroup);
+        uint32_t decoded[8];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const uint32_t pair_indices = pair < 2 ? indices0 : indices1;
+            decode_iq3_pair(pair_indices, aux, pair,
+                            decoded[2 * pair + 0], decoded[2 * pair + 1]);
+        }
+        const int activation_group = block_id * 8 + subgroup;
+        const uint32_t *activation = xq + activation_group * 8;
+        int dot = 0;
+#pragma unroll
+        for (int word = 0; word < 8; ++word)
+            dot = __dp4a(int(decoded[word]), int(__ldg(activation + word)), dot);
+        const float weight_scale = __half2float(block.d) *
+                                   (0.25f + 0.5f * float(aux >> 28));
+        sum = fmaf(float(dot), weight_scale * xscale[activation_group], sum);
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (!lane) {
+        float *output = matrix ? up_y : gate_y;
+        output[static_cast<size_t>(expert) * rows + row] = sum;
+    }
+}
+
 __global__ __launch_bounds__(128, 4) void iq3_xxs_wim32_topk_pair_x1_kernel(
-    uint8_t *const *__restrict__ gate_weights,
-    uint8_t *const *__restrict__ up_weights,
+    IQPointerTable gate_weights,
+    IQPointerTable up_weights,
     const uint32_t *__restrict__ xq,
     const float *__restrict__ xscale,
     float *__restrict__ gate_y,
@@ -709,8 +774,8 @@ __global__ __launch_bounds__(128, 4) void iq3_xxs_wim32_topk_pair_x1_kernel(
     const int expert = blockIdx.y;
     const int row = blockIdx.x * kWarpsPerMatrix + matrix_warp;
     constexpr int row_bytes = kBlocks * kIQ3XXSBlockBytes;
-    const uint8_t *matrix_weights = matrix ? up_weights[expert]
-                                            : gate_weights[expert];
+    const uint8_t *matrix_weights = matrix ? up_weights.weights[expert]
+                                            : gate_weights.weights[expert];
     const uint8_t *row_weights =
         matrix_weights + static_cast<size_t>(row) * row_bytes;
     const auto *scales = reinterpret_cast<const __half *>(row_weights);
@@ -913,10 +978,10 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_x1_kernel(
 }
 
 __global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_topk_x1_kernel(
-    uint8_t *const *__restrict__ weight_pointers,
+    IQPointerTable weight_pointers,
     const float *__restrict__ gate,
     const float *__restrict__ up,
-    const float *__restrict__ combine,
+    IQCombineTable combine,
     int expert_count,
     float *__restrict__ y,
     int rows) {
@@ -976,7 +1041,7 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_topk_x1_kernel(
         __syncthreads();
 
         const auto *weights = reinterpret_cast<const IQ4XSBlock *>(
-            weight_pointers[expert]);
+            weight_pointers.weights[expert]);
 #pragma unroll
         for (int pass = 0; pass < kPasses; ++pass) {
             const int row = blockIdx.x * 32 + pass * 8 + warp;
@@ -1016,7 +1081,7 @@ __global__ __launch_bounds__(256, 2) void iq4_xs_swiglu_topk_x1_kernel(
             for (int offset = 16; offset; offset >>= 1)
                 sum += __shfl_down_sync(0xffffffffu, sum, offset);
             if (!lane)
-                totals[pass] = fmaf(sum, __ldg(combine + expert), totals[pass]);
+                totals[pass] = fmaf(sum, combine.weights[expert], totals[pass]);
         }
         __syncthreads();
     }
@@ -2373,6 +2438,30 @@ cudaError_t iq3_xxs_gemv2_wim32_fused_quant_x1(
     return cudaPeekAtLastError();
 }
 
+cudaError_t iq3_xxs_gemv2_topk_x1(
+    uint8_t *const *gate_weights, uint8_t *const *up_weights,
+    const void *workspace, int expert_count, float *gate_y, float *up_y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
+        expert_count <= 0 || expert_count > 8 || rows <= 0 || (rows & 1) ||
+        cols != 4096)
+        return cudaErrorInvalidValue;
+    IQPointerTable gate_table{}, up_table{};
+    for (int expert = 0; expert < expert_count; ++expert) {
+        if (!gate_weights[expert] || !up_weights[expert])
+            return cudaErrorInvalidValue;
+        gate_table.weights[expert] = gate_weights[expert];
+        up_table.weights[expert] = up_weights[expert];
+    }
+    const auto *base = static_cast<const uint8_t *>(workspace);
+    const auto *xq = reinterpret_cast<const uint32_t *>(base);
+    const auto *xscale = reinterpret_cast<const float *>(base + cols);
+    iq3_xxs_topk_pair_x1_kernel
+        <<<dim3(rows / 2, expert_count), 128, 0, stream>>>(
+            gate_table, up_table, xq, xscale, gate_y, up_y, rows);
+    return cudaPeekAtLastError();
+}
+
 cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
     uint8_t *const *gate_weights, uint8_t *const *up_weights,
     const void *workspace, int expert_count, float *gate_y, float *up_y,
@@ -2381,12 +2470,19 @@ cudaError_t iq3_xxs_gemv2_wim32_topk_x1(
         expert_count <= 0 || expert_count > 8 || rows <= 0 || (rows & 1) ||
         cols != 4096)
         return cudaErrorInvalidValue;
+    IQPointerTable gate_table{}, up_table{};
+    for (int expert = 0; expert < expert_count; ++expert) {
+        if (!gate_weights[expert] || !up_weights[expert])
+            return cudaErrorInvalidValue;
+        gate_table.weights[expert] = gate_weights[expert];
+        up_table.weights[expert] = up_weights[expert];
+    }
     const auto *base = static_cast<const uint8_t *>(workspace);
     const auto *xq = reinterpret_cast<const uint32_t *>(base);
     const auto *xscale = reinterpret_cast<const float *>(base + cols);
     iq3_xxs_wim32_topk_pair_x1_kernel
         <<<dim3(rows / 2, expert_count), 128, 0, stream>>>(
-            gate_weights, up_weights, xq, xscale, gate_y, up_y, rows);
+            gate_table, up_table, xq, xscale, gate_y, up_y, rows);
     return cudaPeekAtLastError();
 }
 
@@ -2463,8 +2559,15 @@ cudaError_t iq4_xs_swiglu_gemv_acc_topk_x1(
     if (!weights || !gate || !up || !combine || !y || expert_count <= 0 ||
         expert_count > 8 || rows <= 0 || (rows & 31) || cols != 2048)
         return cudaErrorInvalidValue;
+    IQPointerTable weight_table{};
+    IQCombineTable combine_table{};
+    for (int expert = 0; expert < expert_count; ++expert) {
+        if (!weights[expert]) return cudaErrorInvalidValue;
+        weight_table.weights[expert] = weights[expert];
+        combine_table.weights[expert] = combine[expert];
+    }
     iq4_xs_swiglu_topk_x1_kernel<<<rows / 32, 256, 0, stream>>>(
-        weights, gate, up, combine, expert_count, y, rows);
+        weight_table, gate, up, combine_table, expert_count, y, rows);
     return cudaPeekAtLastError();
 }
 

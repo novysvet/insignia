@@ -1124,6 +1124,12 @@ public:
             }
             const int window = take_window(layer, key);
             const bool disk_read = start_read(window, key, layer, expert, true);
+            // This batch owns the newly allocated window even if a memory-tier
+            // restore completes synchronously. Without the claim, the next
+            // same-batch miss can evict/refill it before upload(slot) consumes
+            // the bytes. Disk latency merely hid the same race by leaving
+            // ordinary misses `done == false` during victim selection.
+            windows_[size_t(window)].claimed = true;
             batch_window_[slot] = window;
             if (disk_read) started_bytes += windows_[size_t(window)].source_bytes;
             // TinyLFU-style door: a record may enter the tier only once its

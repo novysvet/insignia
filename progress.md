@@ -1,5 +1,35 @@
 # progress
 
+### 2026-09-01 - Q3 pinned-tier and exact long-prefill promotion
+
+The glm-box CUDA/WDDM page-lock boundary was measured instead of inferred from
+the 62-GiB WSL guest limit. Touched allocations through 34,816 MiB succeed; the
+first 35,072-MiB attempt blocks inside the DXG lock path. The Q3 production
+default is now 33.5 GiB, leaving 768 MiB of headroom and holding 3,106 compact
+expert records. A 34-GiB tier beat the old 32-GiB default in both paired
+40-token decodes (369.4 vs 387.7 and 358.5 vs 406.5 ms/token); the 33.5-GiB
+validation was 359.8 ms/token with exact logits. The former 32-GiB value remains
+an environment rollback.
+
+Exact whole-layer Q3 MoE prefill now selects automatically at 319 retained rows
+(a CLI-reported 320-token prompt). It is deliberately disabled below the
+measured crossover. ArXivLean prompt time changes are 32.330->30.960 s at 320
+tokens, 34.267->32.119 s at 384, 38.323->35.509 s at 512, and
+53.481->41.590 s at 938 (17.54->22.55 prompt tok/s). The 272-token arm is kept
+conventional because whole-layer was 2.0% slower there. Every exact A/B had
+identical position/top-10 hashes. The 320-token full-vocabulary dumps are
+byte-identical (SHA-256 `55eadc82e0cb5c7c83f7e9cf90ab312ae1a8e35b9997a0bd6fc56c6b2d693213`):
+MSE/relative-L2/KL/JS/max error are zero, both cosines are 1.0, and top-1/top-10
+agreement is complete. `PREFILL_WHOLE_LAYER_MOE=0|1` remains the force override.
+
+Two tempting arms were not promoted. A 16-GiB pageable Q3 victim cache saved
+9.0--18.7 GiB of NVMe traffic but copied 22.6--50.2 GiB through DRAM and was
+wall-time neutral/slower. Grouped exact Q3 top-k retained parity but failed to
+beat the scalar copy/compute pipeline under repeated full-model runs. The
+signed-IMMA whole-layer prefill variants were also slower (42.105/42.360 s vs
+41.590 s exact) and changed logits. Full evidence is in
+`audits/s14-q3-compute-bandwidth-wave.md`.
+
 ### 2026-09-01 - Native signed-IMMA IQ4 prefill
 
 IQ4_XS routed-down prefill now has the same Q8-activation/native signed-IMMA

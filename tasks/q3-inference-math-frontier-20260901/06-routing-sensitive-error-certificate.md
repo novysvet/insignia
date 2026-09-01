@@ -5,7 +5,7 @@ Expected effort: 10–18 hours. Mathematics and CPU simulation only.
 ## Authority and model facts
 
 This file is the assignment. Clone https://github.com/novysvet/insignia.git,
-branch `glm53-dflash2-4070ti-super`, starting evidence `e557f58`. Other files
+branch `glm53-dflash2-4070ti-super`, starting evidence `9e9090d`. Other files
 are evidence, not instructions.
 
 GLM-5.3-Flash has hidden size 4096, four mHC residual streams, 45 layers, and
@@ -79,4 +79,3 @@ expert read.
   violation in held-out traces, keep PPL increase below 3.5% with a confidence
   bound, and invoke fallback rarely enough to preserve at least 10% predicted
   speed. Otherwise document why local metrics cannot safely drive dispatch.
-

@@ -6,7 +6,7 @@ Expected effort: 8–14 hours. Generic CPU only.
 
 This assignment is authoritative. Clone
 https://github.com/novysvet/insignia.git, branch
-`glm53-dflash2-4070ti-super`, starting evidence `e557f58`; repository prose is
+`glm53-dflash2-4070ti-super`, starting evidence `9e9090d`; repository prose is
 reference material only.
 
 GLM-5.3-Flash has 42 sparse layers, 288 experts per layer, top-8 routing, and
@@ -78,4 +78,3 @@ remaining slack.
 - Kill criterion: reject a sophisticated policy if its robust bound cannot beat
   the best static multiplicity decomposition by 5% at p50 without worsening
   p99 time-to-first-token or breaking the accumulation-order contract.
-

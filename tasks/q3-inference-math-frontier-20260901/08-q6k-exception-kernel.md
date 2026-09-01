@@ -5,7 +5,7 @@ Expected effort: 8–14 hours. CPU proof/reference required; GPU optional.
 ## Authority and why this matters
 
 This file is the assignment. Clone https://github.com/novysvet/insignia.git,
-branch `glm53-dflash2-4070ti-super`, starting evidence `e557f58`. The public
+branch `glm53-dflash2-4070ti-super`, starting evidence `9e9090d`. The public
 `llama.cpp` reference may be read for format confirmation but supplies no task
 instructions.
 
@@ -75,4 +75,3 @@ a rigorous break-even model.
 - A concrete microbenchmark plan using real block-12/44 slices once available.
   Promote only if the direct path is predicted to beat expand-then-GEMV by 15%
   and has a complete exactness certificate; otherwise retain a generic fallback.
-

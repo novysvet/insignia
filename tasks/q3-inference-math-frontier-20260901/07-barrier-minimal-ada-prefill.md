@@ -5,7 +5,7 @@ Expected effort: 8–16 hours. CPU schedule search; GPU optional, not required.
 ## Authority and current kernel
 
 This file is the assignment. Clone https://github.com/novysvet/insignia.git,
-branch `glm53-dflash2-4070ti-super`, starting evidence `e557f58`. Inspect
+branch `glm53-dflash2-4070ti-super`, starting evidence `9e9090d`. Inspect
 `iq3_xxs_wmma32_kernel` and `iq4_xs_wmma32_kernel` in `src/glm53_iq.cu` only as
 the baseline to improve.
 
@@ -81,4 +81,3 @@ per expert should share a weight tile.
 - Predicted performance against 91.668/67.711 us, clearly labeled unmeasured.
   Promotion requires a race proof, identical arithmetic order, no spill, and a
   robust predicted gain above 7%; otherwise preserve the simpler kernel.
-

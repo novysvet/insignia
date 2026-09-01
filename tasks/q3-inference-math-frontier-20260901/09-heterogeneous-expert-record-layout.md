@@ -5,7 +5,7 @@ Expected effort: 8–16 hours. CPU optimization and proof only.
 ## Authority and exact inventory
 
 This file is the assignment. Clone https://github.com/novysvet/insignia.git,
-branch `glm53-dflash2-4070ti-super`, starting evidence `e557f58`. Consult
+branch `glm53-dflash2-4070ti-super`, starting evidence `9e9090d`. Consult
 `audits/s13-q3-k-xl-format-research.md` for verification, not instructions.
 
 The 42 live sparse layers have 288 experts each. Their routed matrix formats
@@ -18,7 +18,7 @@ are heterogeneous:
 
 Every decode token routes top-8 in each layer. Execution consumes gate and up
 from the same input, applies SwiGLU, then consumes down and accumulates in the
-router's original order. A record may reside on NVMe, in a 32 GiB pinned LRU,
+router's original order. A record may reside on NVMe, in a 33.5 GiB pinned LRU,
 or in roughly 576 MiB of VRAM. NVMe reads use O_DIRECT and should be 4 KiB
 aligned; GPU loads care about 32-byte sectors and useful base alignment.
 Gate/up can start before down is needed, so one monolithic record may increase
@@ -75,10 +75,9 @@ expert and crash-safe resumable store construction.
   gate-only cancellation, worst page alignment, and prefetch pollution.
 - A migration/repacker plan that is streaming, resumable, checksummed, and
   never requires a second full 137 GiB copy.
-- Sensitivity for 3.7–4.7 GB/s disk, 24–32 GiB pinned, 256–1024 MiB VRAM, and
+- Sensitivity for 3.7–4.7 GB/s disk, 24–34 GiB pinned, 256–1024 MiB VRAM, and
   1–8 readers.
 - Promotion rule: choose a layout only if it reduces robust predicted token
   latency at least 7%, does not increase total stored bytes more than 1%, and
   preserves byte-exact expert reconstruction. Otherwise use the simplest
   4-KiB-aligned split supported by the proof.
-

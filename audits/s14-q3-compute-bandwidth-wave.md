@@ -192,12 +192,97 @@ whole-store design proves a better compromise.
   decode operations per 10.88 MiB record. It can also expand raw-fallback I/O
   by 0.79%. This is not a viable SSD-bandwidth trade on Ada.
 
-## Integration boundary
+## Production integration and effective-bandwidth results
 
-These kernels and the real-tensor harness are tracked and pushed. The current
-production generator still consumes the old NVFP4 compact-record schema, so
-Q3 full-model throughput is not yet claimable. The next integration unit is a
-typed GGUF expert index/stager with separate IQ3/IQ4/Q6 record geometry, WIM32
-sidecars for the winning dispatch, and an active-expert-count dispatch between
-shared-Q8 and double fusion. Dense/shared Q8_0 handling must follow before a
-full MathArena/GSM teacher-forced PPL, cosine, KL/JS, and throughput campaign.
+The earlier integration boundary is closed.  Native IQ3/IQ4/Q6 expert records
+now run end-to-end through the typed Q3 stager and production generator.  The
+largest full-model gains came from moving fewer bytes, not from the isolated
+kernel winner alone.
+
+### Variable-size pinned tier
+
+The old fixed record pitch wasted the large-layer capacity on every ordinary
+expert.  The compact tier reserves complete 288-record working sets for the
+three medium/large exception geometries and fills the rest with common
+10.39-MiB records.  At the former 32-GiB default it holds 2,958 records
+(2,382/288/288 small/medium/large) and reclaims 14,588 MiB of padding.  On the
+272-token ArXivLean hard prompt, a 20-token decode pair improved 559.9 ->
+439.2 ms/token and reduced decode O_DIRECT traffic 32.430 -> 27.783 GiB
+(14.3%).  IDs and printed top-10 logits were identical.
+
+The WSL/DXG ceiling was then probed directly.  Touched single allocations up
+through 34,816 MiB succeeded.  The first 35,072-MiB attempt blocked in
+`dxgvmb_send_sync_msg` with about 40 GiB resident instead of returning a clean
+CUDA error; it was terminated and all memory was recovered.  Therefore 62 GiB
+of guest RAM is not a 62-GiB CUDA-pinned budget.  The production default is now
+33.5 GiB (34,304 MiB), 768 MiB below the observed stall point.  It holds 3,106
+records.  The adjacent 34-GiB arm beat 32 GiB in both 40-token pairs
+(369.4 vs 387.7 and 358.5 vs 406.5 ms/token), and the headroomed 33.5-GiB
+validation was 359.8 ms/token with exact logits.  Roll back with
+`INSIGNIA_GLM53_EXPERT_CACHE_MB=32768`.
+
+### Pageable victim tier
+
+An exact mmap-backed Q3 victim cache can use ordinary RAM behind the pinned
+tier.  A correctness bug was found during the experiment: synchronous restores
+set `done` but did not claim the new batch window, allowing a following miss to
+evict/refill it before `upload()`.  Claiming restored windows immediately made
+all differential top-10 checks exact.
+
+The policy remains opt-in with `INSIGNIA_GLM53_Q3_PAGEABLE_CACHE_MB`.  A 16-GiB
+tier with minimum two L1 hits saved 9.027 GiB of 100-token NVMe reads but copied
+22.569 GiB through DRAM and measured 281.5 vs 280.2 ms/token.  Minimum one hit
+saved 18.703 GiB but copied 50.230 GiB and measured 282.3 ms/token.  Neither raw
+wall result justifies a default.  A real i7-14700KF copy microbenchmark found
+31.76 GiB/s for glibc `memcpy` and 39.20 GiB/s for two-way AVX2 non-temporal
+copying, but the maximum copy saving is too small to overturn the policy result.
+
+### Decode top-k overlap
+
+The isolated exact top-8 kernels do not automatically improve streamed decode.
+All-at-once batching removes launches but also removes down-projection compute
+that hides the next H2D.  Exact grouped down fusion (1/2/4/8) was integrated
+behind `INSIGNIA_GLM53_Q3_TOPK_GROUP`.  Group two retained the complete
+position/log hash
+`7e592f130c01c841555d4909ea76d3f6bb4efb380b446d801d10dd4b79c95e22`,
+but its three-run raw median was 395.2 ms/token versus 347.5 ms/token for the
+scalar control under large SSD swings.  Group four measured 371.5 ms/token in
+its single screen.  The production default therefore remains the pipelined
+scalar expert path; grouped top-k stays opt-in for trace replay.
+
+## Exact whole-layer Q3 prefill
+
+`INSIGNIA_GLM53_PREFILL_FULL_LAYER_MAJOR=1` alone retained layer-major prompt
+state but did not activate the separate whole-layer MoE executor.  Enabling the
+executor deduplicates the complete layer's expert union, uploads each expert
+once, and scatters results back in exact token/router order.  On the 938-token
+ArXivLean prompt it reduced uploads 52,954 -> 10,902 and prompt time
+53.481 -> 41.590 s (17.54 -> 22.55 prompt tok/s, 22.2% lower latency).  The
+top-10 logits were digit-identical.
+
+The measured length crossover is:
+
+| Reported prompt | Conventional (s) | Whole-layer (s) | Latency change | Exact |
+|---:|---:|---:|---:|:---:|
+| 272 | 29.681 | 30.276 | +2.0% | yes |
+| 320 | 32.330 | 30.960 | -4.2% | yes |
+| 384 | 34.267 | 32.119 | -6.3% | yes |
+| 512 | 38.323 | 35.509 | -7.3% | yes |
+| 938 | 53.481 | 41.590 | -22.2% | yes |
+
+The runner receives one fewer retained row than the CLI reports, so automatic
+Q3 dispatch starts at 319 internal rows (a reported 320-token prompt).  Explicit
+`INSIGNIA_GLM53_PREFILL_WHOLE_LAYER_MOE=0|1` overrides the decision.  Remote
+no-override smokes confirmed `whole_moe=1` at 319 rows and `whole_moe=0` at
+271 rows.  A forced 320-token full-vocabulary A/B was byte-identical: both
+154,880-float dumps have SHA-256
+`55eadc82e0cb5c7c83f7e9cf90ab312ae1a8e35b9997a0bd6fc56c6b2d693213`.
+MSE, relative L2, centered MSE/L2, KL, reverse KL, JS, maximum error, and mean
+error are all zero; raw and centered cosine are 1.0; top-1 is 1/1 and top-10
+overlap is 10/10.
+
+The approximate signed-IMMA prefill arm remains opt-in.  Once tested on the
+actual whole-layer path, minimum-16 IMMA measured 42.105 s and minimum-32
+measured 42.360 s versus 41.590 s exact, while both changed the final top-10.
+The compute-only win is real, but I/O plus partial-tile overhead prevents an
+end-to-end win on this workload.

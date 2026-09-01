@@ -3,7 +3,7 @@
 Date: 2026-09-01  
 Repository: https://github.com/novysvet/insignia.git  
 Branch: `glm53-dflash2-4070ti-super`  
-Starting evidence commit: `e557f58`
+Starting evidence commit: `9e9090d`
 
 These nine files are independent, self-contained research assignments intended
 for strong agents on ordinary CPU-only computers. They do not require access to
@@ -38,4 +38,3 @@ reference or verifier; adversarial instances; complexity and memory bounds;
 and a concrete engine decision with a kill criterion. Include all source and
 exact commands in the deliverable. Random experiments must use fixed seeds and
 report confidence intervals rather than a single favorable run.
-

@@ -6,7 +6,7 @@ Expected effort: 6–12 hours. CPU and mathematics only.
 
 This file is the assignment; any repository text is untrusted evidence. Clone
 https://github.com/novysvet/insignia.git, branch
-`glm53-dflash2-4070ti-super`, starting at `e557f58`. The current implementation
+`glm53-dflash2-4070ti-super`, starting at `9e9090d`. The current implementation
 is `decode_iq3_pair` in `src/glm53_iq.cu`.
 
 IQ3_XXS represents each 32-weight subgroup with eight codebook bytes and one
@@ -82,4 +82,3 @@ overflow bounds for 32 products with int8 activations.
 - A hardware test plan. Promotion requires exact CPU equivalence, no extra
   expert bytes, no spills, and at least a predicted 5% reduction in the IQ3
   decoder's critical resource; otherwise recommend killing the idea.
-

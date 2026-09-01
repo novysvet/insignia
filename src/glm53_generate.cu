@@ -1645,6 +1645,43 @@ private:
         target.payload = host_ + window_offsets_[size_t(window)];
         target.source_bytes = source.source_bytes;
         target.error = nullptr;
+        if (const char *verify = std::getenv("INSIGNIA_GLM53_Q3_PAGEABLE_VERIFY")) {
+            const int limit = std::max(1, std::atoi(verify));
+            if (q3_pageable_verify_count_ < uint64_t(limit)) {
+                void *raw = nullptr;
+                require(::posix_memalign(&raw, kAlignment, kQ3SmallWindowBytes) == 0,
+                        "[DEBUG-q3-pageable] reference allocation failed");
+                Layout reference_layout{};
+                std::array<float, 3> reference_globals{};
+                uint8_t *reference_payload = nullptr;
+                const int layer = int(key / 4096u), expert = int(key % 4096u);
+                stage_q3(reference_layout, reference_globals, reference_payload,
+                         static_cast<uint8_t *>(raw), kQ3SmallWindowBytes,
+                         layer, expert);
+                const bool layout_equal = target.layout.body == reference_layout.body &&
+                    target.layout.types == reference_layout.types &&
+                    target.layout.bytes == reference_layout.bytes;
+                size_t mismatch = target.layout.bytes;
+                if (layout_equal) {
+                    const uint8_t *actual = host_ + window_offsets_[size_t(window)];
+                    const uint8_t *expected = static_cast<const uint8_t *>(raw);
+                    for (size_t byte = 0; byte < target.layout.bytes; ++byte)
+                        if (actual[byte] != expected[byte]) {
+                            mismatch = byte;
+                            break;
+                        }
+                }
+                std::printf("[DEBUG-q3-pageable] restore %llu key=%u layer=%d expert=%d "
+                            "bytes=%zu reference=%zu layout=%d mismatch=%zu\n",
+                            (unsigned long long)q3_pageable_verify_count_, key, layer, expert,
+                            target.layout.bytes, reference_layout.bytes,
+                            layout_equal ? 1 : 0, mismatch);
+                std::free(raw);
+                ++q3_pageable_verify_count_;
+                require(layout_equal && mismatch == target.layout.bytes,
+                        "[DEBUG-q3-pageable] restored record differs from direct source");
+            }
+        }
         target.end = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -2919,6 +2956,7 @@ private:
     uint64_t q3_pageable_hits_ = 0, q3_pageable_lookups_ = 0;
     uint64_t q3_pageable_stores_ = 0, q3_pageable_hit_bytes_ = 0;
     uint64_t q3_pageable_copy_bytes_ = 0;
+    uint64_t q3_pageable_verify_count_ = 0;
     uint64_t prefetch_started_ = 0, prefetch_useful_ = 0, prefetch_wasted_ = 0, prefetch_bytes_ = 0;
     double io_seconds_ = 0.0;
     uint64_t io_bytes_ = 0;

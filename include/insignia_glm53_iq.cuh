@@ -51,16 +51,6 @@ cudaError_t iq4_xs_gemm_prefill32(
     int cols,
     cudaStream_t stream = nullptr);
 
-cudaError_t iq4_xs_swiglu_gemm_prefill32(
-    const uint8_t *weights,
-    const float *gate,
-    const float *up,
-    int tokens,
-    float *y,
-    int rows,
-    int cols,
-    cudaStream_t stream = nullptr);
-
 cudaError_t q6_k_gemm_prefill32(
     const uint8_t *weights,
     const float *x,

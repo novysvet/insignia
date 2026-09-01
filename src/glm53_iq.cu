@@ -1421,89 +1421,6 @@ __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
 }
 
 template <int BLOCKS>
-__global__ __launch_bounds__(64, 8) void iq4_xs_swiglu_wmma32_kernel(
-    const IQ4XSBlock *__restrict__ weights,
-    const float *__restrict__ gate,
-    const float *__restrict__ up,
-    float *__restrict__ y,
-    int rows,
-    int cols) {
-    using namespace nvcuda;
-    __shared__ __align__(128) __half shared_a[16 * 32];
-    __shared__ __align__(128) __half shared_b[2][16 * 32];
-    const int thread = threadIdx.x;
-    const int warp = thread >> 5;
-    const int row_start = blockIdx.x * 16;
-    const int token_start = blockIdx.y * 32;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulator;
-    wmma::fill_fragment(accumulator, 0.0f);
-
-    for (int k0 = 0; k0 < cols; k0 += 32) {
-        const int local_row = thread >> 2;
-        const int local_word = thread & 3;
-        const int block_id = k0 >> 8;
-        const int subgroup = (k0 >> 5) & 7;
-        const IQ4XSBlock &block =
-            weights[static_cast<size_t>(row_start + local_row) * BLOCKS +
-                    block_id];
-        const int low =
-            (block.scales_l[subgroup >> 1] >> (4 * (subgroup & 1))) & 15;
-        const int high = (block.scales_h >> (2 * subgroup)) & 3;
-        const float scale = __half2float(block.d) *
-                            float((low | (high << 4)) - 32);
-        const int2 decoded8 = iq4_lookup8(__ldcs(
-            reinterpret_cast<const uint32_t *>(block.qs + 16 * subgroup) +
-            local_word));
-        const uint32_t low_decoded = uint32_t(decoded8.x);
-        const uint32_t high_decoded = uint32_t(decoded8.y);
-        auto *low_destination = reinterpret_cast<__half2 *>(
-            shared_a + local_row * 32 + 4 * local_word);
-        auto *high_destination = reinterpret_cast<__half2 *>(
-            shared_a + local_row * 32 + 16 + 4 * local_word);
-        low_destination[0] = __floats2half2_rn(
-            float(int8_t(low_decoded)) * scale,
-            float(int8_t(low_decoded >> 8)) * scale);
-        low_destination[1] = __floats2half2_rn(
-            float(int8_t(low_decoded >> 16)) * scale,
-            float(int8_t(low_decoded >> 24)) * scale);
-        high_destination[0] = __floats2half2_rn(
-            float(int8_t(high_decoded)) * scale,
-            float(int8_t(high_decoded >> 8)) * scale);
-        high_destination[1] = __floats2half2_rn(
-            float(int8_t(high_decoded >> 16)) * scale,
-            float(int8_t(high_decoded >> 24)) * scale);
-#pragma unroll
-        for (int item = thread; item < 32 * 32; item += 64) {
-            const int local_token = item >> 5;
-            const int local_k = item & 31;
-            const size_t input =
-                static_cast<size_t>(token_start + local_token) * cols +
-                k0 + local_k;
-            const float g = fminf(gate[input], 10.0f);
-            const float u = fminf(fmaxf(up[input], -10.0f), 10.0f);
-            const float value = (g / (1.0f + __expf(-g))) * u;
-            shared_b[local_token >> 4][local_k + (local_token & 15) * 32] =
-                __float2half_rn(value);
-        }
-        __syncthreads();
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                           wmma::row_major> a_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                           wmma::col_major> b_fragment;
-            wmma::load_matrix_sync(a_fragment, shared_a + 16 * half, 32);
-            wmma::load_matrix_sync(b_fragment, shared_b[warp] + 16 * half, 32);
-            wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
-        }
-        __syncthreads();
-    }
-    wmma::store_matrix_sync(
-        y + static_cast<size_t>(token_start + warp * 16) * rows + row_start,
-        accumulator, rows, wmma::mem_col_major);
-}
-
-template <int BLOCKS>
 __global__ __launch_bounds__(128, 4) void q6_k_wmma32_kernel(
     const Q6KBlock *__restrict__ weights,
     const float *__restrict__ x,
@@ -1869,25 +1786,6 @@ cudaError_t iq4_xs_gemm_prefill32(
     else
         iq4_xs_wmma32_kernel<8><<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
             reinterpret_cast<const IQ4XSBlock *>(weights), x, y, rows, cols);
-    return cudaPeekAtLastError();
-}
-
-cudaError_t iq4_xs_swiglu_gemm_prefill32(
-    const uint8_t *weights, const float *gate, const float *up, int tokens,
-    float *y, int rows, int cols, cudaStream_t stream) {
-    if (!weights || !gate || !up || !y || rows <= 0 || (rows & 15) ||
-        tokens <= 0 || (tokens & 31) || (cols != 2048 && cols != 4096))
-        return cudaErrorInvalidValue;
-    if (cols == 4096)
-        iq4_xs_swiglu_wmma32_kernel<16>
-            <<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
-                reinterpret_cast<const IQ4XSBlock *>(weights), gate, up, y,
-                rows, cols);
-    else
-        iq4_xs_swiglu_wmma32_kernel<8>
-            <<<dim3(rows / 16, tokens / 32), 64, 0, stream>>>(
-                reinterpret_cast<const IQ4XSBlock *>(weights), gate, up, y,
-                rows, cols);
     return cudaPeekAtLastError();
 }
 

@@ -102,6 +102,20 @@ by tens of microseconds as CPU submission gaps repeatedly drained the GPU.
 
 ## Prefill and exception formats
 
+The 32-token IQ3 gate/up pair now shares one FP32-to-FP16 activation conversion
+and one launch while preserving the two independent HMMA accumulator chains.
+Seven-run medians improve 182.215 -> 101.346 us (1.798x by median times;
+1.795x paired-ratio median). Both gate and up are bit-exact against separate
+tensor-core launches: MSE 0, relative L2 0, cosine 1.0, max error 0. The pair
+kernel uses 53 registers, one barrier, 4 KiB shared memory, and no spills.
+
+A more aggressive prefill arm regenerated clamped SwiGLU inside every IQ4
+down-row CTA to remove the 256 KiB intermediate. It was also bit-exact, but
+duplicating the sigmoid work across CTAs regressed the seven-run median
+69.152 -> 83.369 us (20.6% slower). That kernel and API were removed. The
+profitable boundary is activation conversion shared across two weight matrices,
+not nonlinear activation recomputation across output-row tiles.
+
 Q6_K support is complete for the routed down projections in blocks 11, 12,
 and 44. The direct decode kernel sustains about 10.07 us / 683 GB/s on the real
 block-11 tensor. The 32-token tensor-core path improves 130.337 -> 48.728 us

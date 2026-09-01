@@ -16,19 +16,6 @@ namespace {
 constexpr int kTokens = insignia::glm53::kIQMaxRows;
 constexpr int kPrefillTokens = 32;
 
-__global__ void prefill_swiglu_reference_kernel(
-    const float *__restrict__ gate,
-    const float *__restrict__ up,
-    float *__restrict__ output,
-    int count) {
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
-         index += blockDim.x * gridDim.x) {
-        const float g = fminf(gate[index], 10.0f);
-        const float u = fminf(fmaxf(up[index], -10.0f), 10.0f);
-        output[index] = (g / (1.0f + __expf(-g))) * u;
-    }
-}
-
 [[noreturn]] void die(const char *message) {
     std::fprintf(stderr, "%s\n", message);
     std::exit(1);
@@ -278,8 +265,6 @@ int main(int argc, char **argv) {
         device_alloc<float>(size_t(kPrefillTokens) * gate.rows);
     auto *up_prefill_output_device =
         device_alloc<float>(size_t(kPrefillTokens) * gate.rows);
-    auto *swiglu_prefill_device =
-        device_alloc<float>(size_t(kPrefillTokens) * down.cols);
     auto *down_prefill_output_device =
         device_alloc<float>(size_t(kPrefillTokens) * down.rows);
     const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
@@ -449,37 +434,6 @@ int main(int argc, char **argv) {
     print_metrics("IQ3 pair prefill up", paired_up_prefill_metrics);
     failed |= paired_gate_prefill_metrics.maximum != 0.0 ||
               paired_up_prefill_metrics.maximum != 0.0;
-
-    prefill_swiglu_reference_kernel<<<256, 256>>>(
-        gate_prefill_output_device, up_prefill_output_device,
-        swiglu_prefill_device, kPrefillTokens * down.cols);
-    check(insignia::glm53::iq4_xs_gemm_prefill32(
-              down.weights_device, swiglu_prefill_device, kPrefillTokens,
-              down_prefill_output_device, down.rows, down.cols),
-          "separate SwiGLU IQ4 WMMA32 correctness");
-    check(cudaDeviceSynchronize(),
-          "separate SwiGLU IQ4 WMMA32 synchronize");
-    std::vector<float> swiglu_down_reference(
-        size_t(kPrefillTokens) * down.rows);
-    check(cudaMemcpy(swiglu_down_reference.data(), down_prefill_output_device,
-                     swiglu_down_reference.size() * sizeof(float),
-                     cudaMemcpyDeviceToHost),
-          "copy separate SwiGLU IQ4 prefill");
-    check(insignia::glm53::iq4_xs_swiglu_gemm_prefill32(
-              down.weights_device, gate_prefill_output_device,
-              up_prefill_output_device, kPrefillTokens,
-              down_prefill_output_device, down.rows, down.cols),
-          "fused SwiGLU IQ4 WMMA32 correctness");
-    check(cudaDeviceSynchronize(), "fused SwiGLU IQ4 WMMA32 synchronize");
-    std::vector<float> swiglu_down_output(size_t(kPrefillTokens) * down.rows);
-    check(cudaMemcpy(swiglu_down_output.data(), down_prefill_output_device,
-                     swiglu_down_output.size() * sizeof(float),
-                     cudaMemcpyDeviceToHost),
-          "copy fused SwiGLU IQ4 prefill");
-    const Metrics swiglu_down_metrics =
-        compare(swiglu_down_output, swiglu_down_reference);
-    print_metrics("IQ4 fused prefill", swiglu_down_metrics);
-    failed |= swiglu_down_metrics.maximum != 0.0;
 
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
@@ -1347,24 +1301,6 @@ int main(int argc, char **argv) {
                       up_prefill_output_device, gate.rows, gate.cols),
                   "timed paired gate/up WMMA32");
         };
-        const auto launch_swiglu_down_wmma32_separate = [&] {
-            prefill_swiglu_reference_kernel<<<256, 256>>>(
-                gate_prefill_output_device, up_prefill_output_device,
-                swiglu_prefill_device, kPrefillTokens * down.cols);
-            check(cudaPeekAtLastError(), "timed separate prefill SwiGLU");
-            check(insignia::glm53::iq4_xs_gemm_prefill32(
-                      down.weights_device, swiglu_prefill_device,
-                      kPrefillTokens, down_prefill_output_device,
-                      down.rows, down.cols),
-                  "timed separate SwiGLU/down WMMA32");
-        };
-        const auto launch_swiglu_down_wmma32_fused = [&] {
-            check(insignia::glm53::iq4_xs_swiglu_gemm_prefill32(
-                      down.weights_device, gate_prefill_output_device,
-                      up_prefill_output_device, kPrefillTokens,
-                      down_prefill_output_device, down.rows, down.cols),
-                  "timed fused SwiGLU/down WMMA32");
-        };
         const float gate_q8_compute32_us = benchmark_us(launch_gate_q8_compute32);
         const float gate_q8_pipeline32_us = benchmark_us(launch_gate_q8_pipeline32);
         const float gate_wmma32_us = benchmark_us(launch_gate_wmma32);
@@ -1375,10 +1311,6 @@ int main(int argc, char **argv) {
             benchmark_us(launch_gate_up_wmma32_separate);
         const float gate_up_wmma32_pair_us =
             benchmark_us(launch_gate_up_wmma32_pair);
-        const float swiglu_down_wmma32_separate_us =
-            benchmark_us(launch_swiglu_down_wmma32_separate);
-        const float swiglu_down_wmma32_fused_us =
-            benchmark_us(launch_swiglu_down_wmma32_fused);
         std::printf("IQ3 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
                     "%.3fx pipe speedup\n",
                     gate_q8_compute32_us, gate_q8_pipeline32_us, gate_wmma32_us,
@@ -1391,12 +1323,6 @@ int main(int argc, char **argv) {
                     "%8.3f/%8.3f us %.3fx\n",
                     gate_up_wmma32_separate_us, gate_up_wmma32_pair_us,
                     gate_up_wmma32_separate_us / gate_up_wmma32_pair_us);
-        std::printf("IQ4 prefill32 SwiGLU+down separate/fused "
-                    "%8.3f/%8.3f us %.3fx\n",
-                    swiglu_down_wmma32_separate_us,
-                    swiglu_down_wmma32_fused_us,
-                    swiglu_down_wmma32_separate_us /
-                        swiglu_down_wmma32_fused_us);
         for (int batch = 0; batch < 4; ++batch) {
             cudaFree(gate_prefill_workspace[batch]);
             cudaFree(down_prefill_workspace[batch]);
@@ -1425,6 +1351,6 @@ int main(int argc, char **argv) {
     cudaFree(gate_wim32_device); cudaFree(up_wim32_device);
     cudaFree(gate_prefill_device); cudaFree(down_prefill_device);
     cudaFree(gate_prefill_output_device); cudaFree(up_prefill_output_device);
-    cudaFree(swiglu_prefill_device); cudaFree(down_prefill_output_device);
+    cudaFree(down_prefill_output_device);
     return failed ? 3 : 0;
 }

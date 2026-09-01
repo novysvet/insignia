@@ -1,5 +1,19 @@
 # progress
 
+### 2026-09-01 - Paired IQ3 tensor-core prefill
+
+The real 32-token IQ3 gate/up path now converts the shared activation tile once
+and feeds two independent HMMA accumulator pairs in one CTA. Seven-run medians
+improve 182.215->101.346 us (1.798x by median times; 1.795x paired-ratio
+median), with MSE 0, relative L2 0, cosine 1.0, and max error 0 against the two
+separate tensor-core launches. The sm_89 kernel uses 53 registers, 4 KiB shared
+memory, and no spills.
+
+The adjacent compute-for-bandwidth experiment--recomputing clamped SwiGLU in
+every IQ4 down-row CTA--was exact but regressed 69.152->83.369 us (20.6%). It
+was removed. Full evidence is in
+`audits/s14-q3-compute-bandwidth-wave.md`.
+
 ### 2026-09-01 - Exact Q3 top-k launch collapse
 
 The resident IQ3/IQ4 decode group now has an exact two-launch top-k path.

@@ -59,6 +59,7 @@ cudaError_t iq3_xxs_gemm2_prefill32_imma(
     float *up_y,
     int rows,
     int cols,
+    int decode_pairs_per_thread = 1,
     cudaStream_t stream = nullptr);
 
 cudaError_t iq4_xs_gemm_prefill32(

@@ -474,6 +474,46 @@ int main(int argc, char **argv) {
               imma_gate_metrics.cosine < 0.99980 ||
               imma_up_metrics.relative > 2.0e-2 ||
               imma_up_metrics.cosine < 0.99980;
+    for (int decode_pairs : {2, 4}) {
+        check(insignia::glm53::iq3_xxs_gemm2_prefill32_imma(
+                  gate.weights_device, up_device, iq_prefill_workspace,
+                  kPrefillTokens, gate_prefill_output_device,
+                  up_prefill_output_device, gate.rows, gate.cols,
+                  decode_pairs),
+              "IQ3 IMMA32 decode-pair correctness");
+        check(cudaDeviceSynchronize(),
+              "IQ3 IMMA32 decode-pair synchronize");
+        std::vector<float> variant_gate(size_t(kPrefillTokens) * gate.rows);
+        std::vector<float> variant_up(size_t(kPrefillTokens) * gate.rows);
+        check(cudaMemcpy(variant_gate.data(), gate_prefill_output_device,
+                         variant_gate.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy IQ3 IMMA32 decode-pair gate");
+        check(cudaMemcpy(variant_up.data(), up_prefill_output_device,
+                         variant_up.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "copy IQ3 IMMA32 decode-pair up");
+        const Metrics variant_gate_metrics =
+            compare(variant_gate, gate_prefill_reference);
+        const Metrics variant_up_metrics =
+            compare(variant_up, up_prefill_reference);
+        const Metrics variant_gate_exact =
+            compare(variant_gate, imma_gate_prefill);
+        const Metrics variant_up_exact = compare(variant_up, imma_up_prefill);
+        char gate_label[64], up_label[64];
+        std::snprintf(gate_label, sizeof(gate_label),
+                      "IQ3 IMMA p%d gate", decode_pairs);
+        std::snprintf(up_label, sizeof(up_label),
+                      "IQ3 IMMA p%d up", decode_pairs);
+        print_metrics(gate_label, variant_gate_metrics);
+        print_metrics(up_label, variant_up_metrics);
+        failed |= variant_gate_metrics.relative > 2.0e-2 ||
+                  variant_gate_metrics.cosine < 0.99980 ||
+                  variant_up_metrics.relative > 2.0e-2 ||
+                  variant_up_metrics.cosine < 0.99980 ||
+                  variant_gate_exact.maximum != 0.0 ||
+                  variant_up_exact.maximum != 0.0;
+    }
 
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
@@ -1347,17 +1387,6 @@ int main(int argc, char **argv) {
                       iq_prefill_workspace),
                   "timed IQ3 IMMA prefill quantize");
         };
-        const auto launch_gate_up_imma32_compute = [&] {
-            check(insignia::glm53::iq3_xxs_gemm2_prefill32_imma(
-                      gate.weights_device, up_device, iq_prefill_workspace,
-                      kPrefillTokens, gate_prefill_output_device,
-                      up_prefill_output_device, gate.rows, gate.cols),
-                  "timed paired gate/up IMMA32 compute");
-        };
-        const auto launch_gate_up_imma32_pipeline = [&] {
-            launch_iq3_prefill_quantize();
-            launch_gate_up_imma32_compute();
-        };
         const float gate_q8_compute32_us = benchmark_us(launch_gate_q8_compute32);
         const float gate_q8_pipeline32_us = benchmark_us(launch_gate_q8_pipeline32);
         const float gate_wmma32_us = benchmark_us(launch_gate_wmma32);
@@ -1370,10 +1399,29 @@ int main(int argc, char **argv) {
             benchmark_us(launch_gate_up_wmma32_pair);
         const float iq3_prefill_quantize_us =
             benchmark_us(launch_iq3_prefill_quantize);
-        const float gate_up_imma32_compute_us =
-            benchmark_us(launch_gate_up_imma32_compute);
-        const float gate_up_imma32_pipeline_us =
-            benchmark_us(launch_gate_up_imma32_pipeline);
+        float gate_up_imma32_compute_us[3]{};
+        float gate_up_imma32_pipeline_us[3]{};
+        int imma_index = 0;
+        for (int decode_pairs : {1, 2, 4}) {
+            const auto launch_gate_up_imma32_compute = [&] {
+                check(insignia::glm53::iq3_xxs_gemm2_prefill32_imma(
+                          gate.weights_device, up_device,
+                          iq_prefill_workspace, kPrefillTokens,
+                          gate_prefill_output_device,
+                          up_prefill_output_device, gate.rows, gate.cols,
+                          decode_pairs),
+                      "timed paired gate/up IMMA32 compute");
+            };
+            const auto launch_gate_up_imma32_pipeline = [&] {
+                launch_iq3_prefill_quantize();
+                launch_gate_up_imma32_compute();
+            };
+            gate_up_imma32_compute_us[imma_index] =
+                benchmark_us(launch_gate_up_imma32_compute);
+            gate_up_imma32_pipeline_us[imma_index] =
+                benchmark_us(launch_gate_up_imma32_pipeline);
+            ++imma_index;
+        }
         std::printf("IQ3 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
                     "%.3fx pipe speedup\n",
                     gate_q8_compute32_us, gate_q8_pipeline32_us, gate_wmma32_us,
@@ -1386,11 +1434,17 @@ int main(int argc, char **argv) {
                     "%8.3f/%8.3f us %.3fx\n",
                     gate_up_wmma32_separate_us, gate_up_wmma32_pair_us,
                     gate_up_wmma32_separate_us / gate_up_wmma32_pair_us);
-        std::printf("IQ3 prefill32 gate+up FP16pair/Q8/IMMA/pipe "
-                    "%8.3f/%8.3f/%8.3f/%8.3f us %.3fx pipe\n",
-                    gate_up_wmma32_pair_us, iq3_prefill_quantize_us,
-                    gate_up_imma32_compute_us, gate_up_imma32_pipeline_us,
-                    gate_up_wmma32_pair_us / gate_up_imma32_pipeline_us);
+        for (int index = 0; index < 3; ++index) {
+            const int decode_pairs = 1 << index;
+            std::printf("IQ3 prefill32 IMMA p%d FP16pair/Q8/compute/pipe "
+                        "%8.3f/%8.3f/%8.3f/%8.3f us %.3fx pipe\n",
+                        decode_pairs, gate_up_wmma32_pair_us,
+                        iq3_prefill_quantize_us,
+                        gate_up_imma32_compute_us[index],
+                        gate_up_imma32_pipeline_us[index],
+                        gate_up_wmma32_pair_us /
+                            gate_up_imma32_pipeline_us[index]);
+        }
         for (int batch = 0; batch < 4; ++batch) {
             cudaFree(gate_prefill_workspace[batch]);
             cudaFree(down_prefill_workspace[batch]);

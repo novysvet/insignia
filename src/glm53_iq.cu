@@ -98,6 +98,29 @@ __device__ __forceinline__ void decode_iq3_pair(
     decoded1 = apply_iq3_signs(grid1, signs, 0x80402010u);
 }
 
+struct IQI8A {
+    uint32_t x[4];
+};
+struct IQI8B {
+    uint32_t x[2];
+};
+struct IQI32C {
+    int x[4];
+};
+
+__device__ __forceinline__ IQI32C iq_imma_m16n8k32(
+    const IQI8A &a, const IQI8B &b) {
+    IQI32C c{{0, 0, 0, 0}};
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+r"(c.x[0]), "+r"(c.x[1]), "+r"(c.x[2]), "+r"(c.x[3])
+        : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]),
+          "r"(b.x[0]), "r"(b.x[1]));
+    return c;
+}
+
 __device__ __forceinline__ int2 iq4_lookup8(uint32_t q4) {
     constexpr uint32_t table0 = 0xbfad9881u;
     constexpr uint32_t table1 = 0xf6eaddcfu;
@@ -163,6 +186,45 @@ __global__ __launch_bounds__(128, 4) void iq_quantize_x32_rows_kernel(
         for (int byte = 0; byte < 4; ++byte)
             packed |= uint32_t(uint8_t(__float2int_rn(values[4 * word + byte] * inverse)))
                       << (8 * byte);
+        row_q[group * 8 + word] = packed;
+    }
+}
+
+__global__ __launch_bounds__(128, 4) void iq_quantize_x32_prefill_kernel(
+    const float *__restrict__ x,
+    uint32_t *__restrict__ xq,
+    float *__restrict__ xscale,
+    int groups,
+    int words_per_row) {
+    const int group = threadIdx.x;
+    if (group >= groups) return;
+    const int row = blockIdx.x;
+    const float4 *source = reinterpret_cast<const float4 *>(
+        x + static_cast<size_t>(row) * groups * 32 + group * 32);
+    uint32_t *row_q = xq + static_cast<size_t>(row) * words_per_row;
+    float *row_scale = xscale + static_cast<size_t>(row) * groups;
+    float values[32];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int word = 0; word < 8; ++word) {
+        const float4 value = __ldg(source + word);
+        values[4 * word + 0] = value.x;
+        values[4 * word + 1] = value.y;
+        values[4 * word + 2] = value.z;
+        values[4 * word + 3] = value.w;
+        maximum = fmaxf(maximum, fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                       fmaxf(fabsf(value.z), fabsf(value.w))));
+    }
+    const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+    row_scale[group] = maximum * (1.0f / 127.0f);
+#pragma unroll
+    for (int word = 0; word < 8; ++word) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int byte = 0; byte < 4; ++byte)
+            packed |= uint32_t(uint8_t(__float2int_rn(
+                          values[4 * word + byte] * inverse))) <<
+                      (8 * byte);
         row_q[group * 8 + word] = packed;
     }
 }
@@ -1345,6 +1407,129 @@ __global__ __launch_bounds__(128, 4) void iq3_xxs_wmma32_pair_kernel(
 }
 
 template <int BLOCKS>
+__global__ __launch_bounds__(256, 2) void iq3_xxs_imma32_pair_kernel(
+    const uint8_t *__restrict__ gate_weights,
+    const uint8_t *__restrict__ up_weights,
+    const uint32_t *__restrict__ xq,
+    const float *__restrict__ xscale,
+    float *__restrict__ gate_y,
+    float *__restrict__ up_y,
+    int rows,
+    int words_per_row) {
+    __shared__ __align__(128) uint32_t shared_a[2][16][8];
+    __shared__ __align__(128) uint32_t shared_b[2][16][8];
+    __shared__ __align__(128) float shared_weight_scale[2][16];
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5;
+    const int lane = thread & 31;
+    const int matrix = warp >> 2;
+    const int row_tile = (warp >> 1) & 1;
+    const int token_half = warp & 1;
+    const int row_start = blockIdx.x * 16;
+    const int token_start = blockIdx.y * 32;
+    const int token_low = lane >> 2;
+    const int token_high = token_low + 8;
+    const int out_even = (lane & 3) * 2;
+    const int out_odd = out_even + 1;
+    constexpr int row_bytes = BLOCKS * kIQ3XXSBlockBytes;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+    float result2 = 0.0f;
+    float result3 = 0.0f;
+
+    for (int group = 0; group < BLOCKS * 8; ++group) {
+        const int activation_item = thread;
+        const int activation_token = activation_item >> 3;
+        const int activation_word = activation_item & 7;
+        shared_a[activation_token >> 4][activation_token & 15]
+                [activation_word] =
+            __ldg(xq +
+                  static_cast<size_t>(token_start + activation_token) *
+                      words_per_row +
+                  group * 8 + activation_word);
+
+        if (thread < 128) {
+            const int decode_matrix = thread >> 6;
+            const int decode_item = thread & 63;
+            const int local_row = decode_item >> 2;
+            const int pair = decode_item & 3;
+            const uint8_t *matrix_weights =
+                decode_matrix ? up_weights : gate_weights;
+            const auto *blocks = reinterpret_cast<const IQ3XXSBlock *>(
+                matrix_weights +
+                static_cast<size_t>(row_start + local_row) * row_bytes);
+            const IQ3XXSBlock &block = blocks[group >> 3];
+            const int subgroup = group & 7;
+            const uint32_t indices0 =
+                load_u32_any(block.qs + 8 * subgroup);
+            const uint32_t indices1 =
+                load_u32_any(block.qs + 8 * subgroup + 4);
+            const uint32_t auxiliary =
+                load_u32_any(block.qs + 64 + 4 * subgroup);
+            uint32_t decoded0, decoded1;
+            decode_iq3_pair(pair < 2 ? indices0 : indices1,
+                            auxiliary, pair, decoded0, decoded1);
+            shared_b[decode_matrix][local_row][2 * pair + 0] = decoded0;
+            shared_b[decode_matrix][local_row][2 * pair + 1] = decoded1;
+            if (!pair)
+                shared_weight_scale[decode_matrix][local_row] =
+                    __half2float(block.d) *
+                    (0.25f + 0.5f * float(auxiliary >> 28));
+        }
+        __syncthreads();
+
+        IQI8A a{};
+        const uint32_t *a_address =
+            &shared_a[token_half][lane & 15][(lane >> 4) * 4];
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(a.x[0]), "=r"(a.x[1]), "=r"(a.x[2]), "=r"(a.x[3])
+            : "l"(a_address));
+        const int b_row = row_tile * 8 + (lane >> 2);
+        const int b_quarter = lane & 3;
+        const IQI8B b{{
+            shared_b[matrix][b_row][2 * b_quarter + 0],
+            shared_b[matrix][b_row][2 * b_quarter + 1],
+        }};
+        const IQI32C dots = iq_imma_m16n8k32(a, b);
+        const float weight_even =
+            shared_weight_scale[matrix][row_tile * 8 + out_even];
+        const float weight_odd =
+            shared_weight_scale[matrix][row_tile * 8 + out_odd];
+        const float activation_low = __ldg(
+            xscale +
+            static_cast<size_t>(token_start + token_half * 16 + token_low) *
+                (BLOCKS * 8) +
+            group);
+        const float activation_high = __ldg(
+            xscale +
+            static_cast<size_t>(token_start + token_half * 16 + token_high) *
+                (BLOCKS * 8) +
+            group);
+        result0 = fmaf(float(dots.x[0]), weight_even * activation_low, result0);
+        result1 = fmaf(float(dots.x[1]), weight_odd * activation_low, result1);
+        result2 = fmaf(float(dots.x[2]), weight_even * activation_high, result2);
+        result3 = fmaf(float(dots.x[3]), weight_odd * activation_high, result3);
+        __syncthreads();
+    }
+
+    float *destination = matrix ? up_y : gate_y;
+    const int output_base = row_start + row_tile * 8;
+    destination[static_cast<size_t>(token_start + token_half * 16 + token_low) *
+                    rows +
+                output_base + out_even] = result0;
+    destination[static_cast<size_t>(token_start + token_half * 16 + token_low) *
+                    rows +
+                output_base + out_odd] = result1;
+    destination[static_cast<size_t>(token_start + token_half * 16 + token_high) *
+                    rows +
+                output_base + out_even] = result2;
+    destination[static_cast<size_t>(token_start + token_half * 16 + token_high) *
+                    rows +
+                output_base + out_odd] = result3;
+}
+
+template <int BLOCKS>
 __global__ __launch_bounds__(64, 8) void iq4_xs_wmma32_kernel(
     const IQ4XSBlock *__restrict__ weights,
     const float *__restrict__ x,
@@ -1740,6 +1925,30 @@ size_t iq_workspace_rows_bytes(int cols, int count) {
            (aligned + static_cast<size_t>(cols / kIQActivationGroup) * sizeof(float));
 }
 
+size_t iq_prefill_workspace_bytes(int cols, int tokens) {
+    if ((cols != 2048 && cols != 4096) || tokens <= 0)
+        return 0;
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    return static_cast<size_t>(tokens) *
+           (aligned + static_cast<size_t>(cols / kIQActivationGroup) *
+                          sizeof(float));
+}
+
+cudaError_t iq_quantize_activation_prefill(
+    const float *x, int cols, int tokens, void *workspace,
+    cudaStream_t stream) {
+    if (!x || !workspace || (cols != 2048 && cols != 4096) || tokens <= 0)
+        return cudaErrorInvalidValue;
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    auto *xq = reinterpret_cast<uint32_t *>(workspace);
+    auto *xscale = reinterpret_cast<float *>(
+        reinterpret_cast<uint8_t *>(workspace) +
+        static_cast<size_t>(tokens) * aligned);
+    iq_quantize_x32_prefill_kernel<<<tokens, 128, 0, stream>>>(
+        x, xq, xscale, cols / kIQActivationGroup, int(aligned / 4));
+    return cudaPeekAtLastError();
+}
+
 cudaError_t iq3_xxs_gemm_prefill32(
     const uint8_t *weights, const float *x, int tokens, float *y,
     int rows, int cols, cudaStream_t stream) {
@@ -1771,6 +1980,32 @@ cudaError_t iq3_xxs_gemm2_prefill32(
         iq3_xxs_wmma32_pair_kernel<8>
             <<<dim3(rows / 16, tokens / 32), 128, 0, stream>>>(
                 gate_weights, up_weights, x, gate_y, up_y, rows, cols);
+    return cudaPeekAtLastError();
+}
+
+cudaError_t iq3_xxs_gemm2_prefill32_imma(
+    const uint8_t *gate_weights, const uint8_t *up_weights,
+    const void *workspace, int tokens, float *gate_y, float *up_y,
+    int rows, int cols, cudaStream_t stream) {
+    if (!gate_weights || !up_weights || !workspace || !gate_y || !up_y ||
+        rows <= 0 || (rows & 15) || tokens <= 0 || (tokens & 31) ||
+        (cols != 2048 && cols != 4096))
+        return cudaErrorInvalidValue;
+    const size_t aligned = (static_cast<size_t>(cols) + 255) & ~size_t(255);
+    const auto *xq = reinterpret_cast<const uint32_t *>(workspace);
+    const auto *xscale = reinterpret_cast<const float *>(
+        reinterpret_cast<const uint8_t *>(workspace) +
+        static_cast<size_t>(tokens) * aligned);
+    if (cols == 4096)
+        iq3_xxs_imma32_pair_kernel<16>
+            <<<dim3(rows / 16, tokens / 32), 256, 0, stream>>>(
+                gate_weights, up_weights, xq, xscale, gate_y, up_y, rows,
+                int(aligned / 4));
+    else
+        iq3_xxs_imma32_pair_kernel<8>
+            <<<dim3(rows / 16, tokens / 32), 256, 0, stream>>>(
+                gate_weights, up_weights, xq, xscale, gate_y, up_y, rows,
+                int(aligned / 4));
     return cudaPeekAtLastError();
 }
 

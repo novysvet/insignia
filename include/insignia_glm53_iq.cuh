@@ -17,6 +17,14 @@ constexpr int kIQMaxRows = 8;
 // formats.  One packed activation row is followed by one FP32 scale per 32
 // values; count is specialized from one through eight at dispatch.
 size_t iq_workspace_rows_bytes(int cols, int count);
+size_t iq_prefill_workspace_bytes(int cols, int tokens);
+
+cudaError_t iq_quantize_activation_prefill(
+    const float *x,
+    int cols,
+    int tokens,
+    void *workspace,
+    cudaStream_t stream = nullptr);
 
 // Tensor-core prefill path.  Tokens are routed in 32-row batches: one packed
 // expert pass feeds two 16-token HMMA warps.  Inputs and outputs are row-major
@@ -35,6 +43,17 @@ cudaError_t iq3_xxs_gemm2_prefill32(
     const uint8_t *gate_weights,
     const uint8_t *up_weights,
     const float *x,
+    int tokens,
+    float *gate_y,
+    float *up_y,
+    int rows,
+    int cols,
+    cudaStream_t stream = nullptr);
+
+cudaError_t iq3_xxs_gemm2_prefill32_imma(
+    const uint8_t *gate_weights,
+    const uint8_t *up_weights,
+    const void *workspace,
     int tokens,
     float *gate_y,
     float *up_y,

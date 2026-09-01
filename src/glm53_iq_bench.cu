@@ -239,6 +239,10 @@ int main(int argc, char **argv) {
         gate.weights, gate.rows, gate.cols, gate.block_bytes,
         insignia::glm53::iq3_xxs_dequantize_row_cpu, gate_prefill,
         kPrefillTokens);
+    const std::vector<float> up_prefill_reference = cpu_reference(
+        up_weights, gate.rows, gate.cols, gate.block_bytes,
+        insignia::glm53::iq3_xxs_dequantize_row_cpu, gate_prefill,
+        kPrefillTokens);
     const std::vector<float> down_prefill_reference = cpu_reference(
         down.weights, down.rows, down.cols, down.block_bytes,
         insignia::glm53::iq4_xs_dequantize_row_cpu, down_prefill,
@@ -265,6 +269,11 @@ int main(int argc, char **argv) {
         device_alloc<float>(size_t(kPrefillTokens) * gate.rows);
     auto *up_prefill_output_device =
         device_alloc<float>(size_t(kPrefillTokens) * gate.rows);
+    void *iq_prefill_workspace = nullptr;
+    check(cudaMalloc(&iq_prefill_workspace,
+                     insignia::glm53::iq_prefill_workspace_bytes(
+                         gate.cols, kPrefillTokens)),
+          "cudaMalloc IQ prefill workspace");
     auto *down_prefill_output_device =
         device_alloc<float>(size_t(kPrefillTokens) * down.rows);
     const int row_ids[kTokens] = {7, 0, 5, 1, 6, 2, 4, 3};
@@ -434,6 +443,37 @@ int main(int argc, char **argv) {
     print_metrics("IQ3 pair prefill up", paired_up_prefill_metrics);
     failed |= paired_gate_prefill_metrics.maximum != 0.0 ||
               paired_up_prefill_metrics.maximum != 0.0;
+
+    check(insignia::glm53::iq_quantize_activation_prefill(
+              gate_prefill_device, gate.cols, kPrefillTokens,
+              iq_prefill_workspace),
+          "quantize IQ3 IMMA prefill");
+    check(insignia::glm53::iq3_xxs_gemm2_prefill32_imma(
+              gate.weights_device, up_device, iq_prefill_workspace,
+              kPrefillTokens, gate_prefill_output_device,
+              up_prefill_output_device, gate.rows, gate.cols),
+          "IQ3 IMMA32 pair correctness");
+    check(cudaDeviceSynchronize(), "IQ3 IMMA32 pair synchronize");
+    std::vector<float> imma_gate_prefill(size_t(kPrefillTokens) * gate.rows);
+    std::vector<float> imma_up_prefill(size_t(kPrefillTokens) * gate.rows);
+    check(cudaMemcpy(imma_gate_prefill.data(), gate_prefill_output_device,
+                     imma_gate_prefill.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy IQ3 IMMA32 gate prefill");
+    check(cudaMemcpy(imma_up_prefill.data(), up_prefill_output_device,
+                     imma_up_prefill.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy IQ3 IMMA32 up prefill");
+    const Metrics imma_gate_metrics =
+        compare(imma_gate_prefill, gate_prefill_reference);
+    const Metrics imma_up_metrics =
+        compare(imma_up_prefill, up_prefill_reference);
+    print_metrics("IQ3 IMMA prefill gate", imma_gate_metrics);
+    print_metrics("IQ3 IMMA prefill up", imma_up_metrics);
+    failed |= imma_gate_metrics.relative > 2.0e-2 ||
+              imma_gate_metrics.cosine < 0.99980 ||
+              imma_up_metrics.relative > 2.0e-2 ||
+              imma_up_metrics.cosine < 0.99980;
 
     if (run_benchmark) {
         std::puts("serialized CUDA-event timings (weights resident in VRAM):");
@@ -1301,6 +1341,23 @@ int main(int argc, char **argv) {
                       up_prefill_output_device, gate.rows, gate.cols),
                   "timed paired gate/up WMMA32");
         };
+        const auto launch_iq3_prefill_quantize = [&] {
+            check(insignia::glm53::iq_quantize_activation_prefill(
+                      gate_prefill_device, gate.cols, kPrefillTokens,
+                      iq_prefill_workspace),
+                  "timed IQ3 IMMA prefill quantize");
+        };
+        const auto launch_gate_up_imma32_compute = [&] {
+            check(insignia::glm53::iq3_xxs_gemm2_prefill32_imma(
+                      gate.weights_device, up_device, iq_prefill_workspace,
+                      kPrefillTokens, gate_prefill_output_device,
+                      up_prefill_output_device, gate.rows, gate.cols),
+                  "timed paired gate/up IMMA32 compute");
+        };
+        const auto launch_gate_up_imma32_pipeline = [&] {
+            launch_iq3_prefill_quantize();
+            launch_gate_up_imma32_compute();
+        };
         const float gate_q8_compute32_us = benchmark_us(launch_gate_q8_compute32);
         const float gate_q8_pipeline32_us = benchmark_us(launch_gate_q8_pipeline32);
         const float gate_wmma32_us = benchmark_us(launch_gate_wmma32);
@@ -1311,6 +1368,12 @@ int main(int argc, char **argv) {
             benchmark_us(launch_gate_up_wmma32_separate);
         const float gate_up_wmma32_pair_us =
             benchmark_us(launch_gate_up_wmma32_pair);
+        const float iq3_prefill_quantize_us =
+            benchmark_us(launch_iq3_prefill_quantize);
+        const float gate_up_imma32_compute_us =
+            benchmark_us(launch_gate_up_imma32_compute);
+        const float gate_up_imma32_pipeline_us =
+            benchmark_us(launch_gate_up_imma32_pipeline);
         std::printf("IQ3 prefill32 Q8compute/Q8pipe/WMMA %8.3f/%8.3f/%8.3f us "
                     "%.3fx pipe speedup\n",
                     gate_q8_compute32_us, gate_q8_pipeline32_us, gate_wmma32_us,
@@ -1323,6 +1386,11 @@ int main(int argc, char **argv) {
                     "%8.3f/%8.3f us %.3fx\n",
                     gate_up_wmma32_separate_us, gate_up_wmma32_pair_us,
                     gate_up_wmma32_separate_us / gate_up_wmma32_pair_us);
+        std::printf("IQ3 prefill32 gate+up FP16pair/Q8/IMMA/pipe "
+                    "%8.3f/%8.3f/%8.3f/%8.3f us %.3fx pipe\n",
+                    gate_up_wmma32_pair_us, iq3_prefill_quantize_us,
+                    gate_up_imma32_compute_us, gate_up_imma32_pipeline_us,
+                    gate_up_wmma32_pair_us / gate_up_imma32_pipeline_us);
         for (int batch = 0; batch < 4; ++batch) {
             cudaFree(gate_prefill_workspace[batch]);
             cudaFree(down_prefill_workspace[batch]);
@@ -1351,6 +1419,7 @@ int main(int argc, char **argv) {
     cudaFree(gate_wim32_device); cudaFree(up_wim32_device);
     cudaFree(gate_prefill_device); cudaFree(down_prefill_device);
     cudaFree(gate_prefill_output_device); cudaFree(up_prefill_output_device);
+    cudaFree(iq_prefill_workspace);
     cudaFree(down_prefill_output_device);
     return failed ? 3 : 0;
 }

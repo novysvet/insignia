@@ -125,6 +125,17 @@ MSE 3.417566e-6, relative L2 0.006917408, cosine 0.9999760766, and max error
 2%/0.9998 gate, but full-model PPL/KL/JS and hard-prompt checks remain required
 before making it the unconditional production default.
 
+The routed IQ4_XS down projection now uses the same signed-IMMA strategy while
+retaining its nonlinear codebook exactly. Seven-run medians improve FP16 decode
+66.896 -> 40.981 us for the complete Q8-activation plus IMMA pipeline (1.632x
+by median times; 1.634x paired-ratio median). IMMA compute alone is about
+38.5 us. The kernel uses 54 registers, one barrier, 1,600 bytes of shared
+memory, and no spills. Against the independent FP64 CPU oracle it measures MSE
+1.581668e-6, relative L2 0.006984302, cosine 0.9999756095, and max error
+0.008243836. This gives native signed-IMMA prefill coverage to IQ3 gate/up,
+IQ4 down, and the existing Q6 exception rows; all live sparse-expert formats in
+Q3_K_XL now have compute-for-bandwidth tensor-core paths.
+
 A decoder-granularity sweep made each thread expand one, two, or four IQ3 code
 pairs to reduce redundant metadata reads. All variants were bit-identical, but
 seven-run pipeline medians were 64.189, 65.370, and 66.085 us respectively.

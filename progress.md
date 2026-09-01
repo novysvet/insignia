@@ -1,5 +1,22 @@
 # progress
 
+### 2026-09-01 - Native signed-IMMA IQ4 prefill
+
+IQ4_XS routed-down prefill now has the same Q8-activation/native signed-IMMA
+execution model as IQ3 gate/up.  The nonlinear IQ4 codebook is decoded directly
+into Ada `m16n8k32.s8` fragments; INT32 dots remain in registers and row/token
+scales are applied in FP32.  Seven-run medians improve 66.896->40.981 us
+including activation quantization (1.632x by median times; 1.634x paired-ratio
+median).  The kernel uses 54 registers, one barrier, 1,600 bytes shared memory,
+and has no spills.
+
+Against the independent FP64 CPU oracle, MSE is 1.581668e-6, relative L2 is
+0.006984302, cosine is 0.9999756095, and max absolute error is 0.008243836.
+This completes native IMMA prefill coverage for the real Q3_K_XL sparse expert
+formats: IQ3 gate/up, IQ4 down, and Q6 exception down rows.  Full-model
+PPL/KL/JS and hard-prompt gates remain required before unconditional dispatch.
+Evidence is in `audits/s14-q3-compute-bandwidth-wave.md`.
+
 ### 2026-09-01 - Native signed-IMMA IQ3 prefill
 
 IQ3 gate/up now has a Q8 activation plus native signed-int8 tensor-core path.
